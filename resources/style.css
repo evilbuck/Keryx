@@ -1,0 +1,50 @@
+.hermes-sidebar { background: @sidebar_bg_color; }
+.hermes-brand { font-size: 18px; font-weight: 800; letter-spacing: 3px; }
+.hermes-caption { font-size: 11px; letter-spacing: 1px; opacity: 0.58; }
+.session-row { padding: 13px 16px; border-radius: 10px; }
+.session-title { font-weight: 600; }
+.session-meta { font-size: 11px; opacity: 0.58; }
+.hermes-transcript { background: @window_bg_color; }
+.message { padding: 20px 8px; }
+.message-user { background: alpha(@accent_bg_color, 0.07); border-radius: 12px; }
+.speaker { font-size: 11px; font-weight: 800; letter-spacing: 1px; opacity: 0.65; }
+.message-prose { font-size: 15px; line-height: 1.5; }
+.message-copy { opacity: 0.45; }
+.message-copy:hover { opacity: 1; }
+.hermes-composer { border: 1px solid alpha(@window_fg_color, 0.16); border-radius: 14px; background: @view_bg_color; padding: 10px; }
+.composer-input { font-size: 15px; background: transparent; }
+.composer-hint { font-size: 11px; opacity: 0.5; }
+.connection-label { font-size: 12px; }
+.connection-error { color: @error_color; }
+.connection-live { color: @success_color; }
+.empty-title { font-size: 26px; font-weight: 700; }
+.empty-subtitle { opacity: 0.6; }
+.readonly-notice { background: alpha(@warning_color, 0.12); border-radius: 9px; padding: 12px; }
+.interaction-panel { background: alpha(@accent_bg_color, 0.10); border-radius: 10px; padding: 12px; }
+.activity-label { font-size: 12px; opacity: 0.72; }
+.md-codeblock { background: alpha(@window_fg_color, 0.06); border-radius: 8px; }
+.md-code-header { padding: 4px 8px; border-bottom: 1px solid alpha(@window_fg_color, 0.08); }
+.md-code-lang { font-size: 11px; opacity: 0.65; }
+.md-code-view, .md-code-view text { background: transparent; font-family: monospace; font-size: 13px; }
+.md-quote { border-left: 3px solid alpha(@accent_color, 0.6); padding-left: 12px; opacity: 0.85; }
+.md-th, .md-td { padding: 8px 12px; border-bottom: 1px solid alpha(@window_fg_color, 0.12); }
+.md-th { background: alpha(@window_fg_color, 0.04); }
+.md-h1 { font-size: 26px; margin-top: 12px; margin-bottom: 4px; }
+.md-h2 { font-size: 22px; margin-top: 10px; margin-bottom: 4px; }
+.md-h3 { font-size: 19px; margin-top: 8px; margin-bottom: 4px; }
+.md-h4 { font-size: 17px; margin-top: 6px; }
+.md-h5, .md-h6 { font-size: 15px; margin-top: 6px; }
+.md-html { font-family: monospace; font-size: 13px; }
+.md-p { margin-bottom: 2px; }
+.md-list, .md-list-ordered, .md-list-unordered { margin-top: 4px; margin-bottom: 4px; }
+.md-marker { font-weight: 700; min-width: 1.5em; }
+.md-task { margin-top: 2px; }
+.md-rule { margin-top: 8px; margin-bottom: 8px; opacity: 0.45; }
+.md-code-scroll, .md-table-scroll { border-radius: 8px; }
+.clarify-question { margin-top: 8px; }
+.clarify-locked { opacity: 0.72; }
+.md-item { margin-top: 2px; }
+.md-item-body { min-width: 0; }
+.md-code-copy { font-size: 12px; }
+.md-table { border-spacing: 0; }
+.interaction-scroll { min-height: 0; }
