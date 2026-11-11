@@ -9,7 +9,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use crate::model::{
     Catalog, ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event,
     InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, Role, SessionSummary,
-    TurnStatus,
+    SteerOutcome, TurnStatus,
 };
 
 const PAGE: usize = 50;
@@ -193,6 +193,30 @@ impl Turn {
     }
 }
 
+/// Where a busy Enter goes. Matches upstream canonical `interrupt` policy
+/// without the hard-interrupt fallback: `session.redirect` first, a queue-only
+/// submit on `rejected`, a plain submit only when no live turn is tracked.
+enum SteerRoute {
+    Drop,
+    Redirect,
+    Submit,
+}
+
+fn steer_route(turn: Option<&Turn>) -> SteerRoute {
+    match turn.map(|turn| turn.phase) {
+        Some(TurnPhase::Stopping) => SteerRoute::Drop,
+        Some(TurnPhase::Submitting | TurnPhase::Streaming | TurnPhase::AwaitingInput) => {
+            SteerRoute::Redirect
+        }
+        Some(TurnPhase::Terminal) | None => SteerRoute::Submit,
+    }
+}
+
+/// The `rejected` fallback shape: queue-only, never hard-interrupts.
+fn queued_submit_params(runtime_id: &str, text: &str) -> Value {
+    json!({"session_id": runtime_id, "text": text, "queued": true})
+}
+
 struct Job {
     kind: JobKind,
     deadline: Instant,
@@ -214,6 +238,16 @@ enum JobKind {
     Interrupt {
         runtime_id: String,
         generation: u64,
+    },
+    /// Busy-turn steer over `session.redirect`. Carries the text for the
+    /// `rejected` fallback, which re-submits it queue-only.
+    Steer {
+        runtime_id: String,
+        text: String,
+    },
+    /// Queue-only `prompt.submit` (`queued: true`). Never hard-interrupts.
+    Queue {
+        runtime_id: String,
     },
     Close {
         stored_id: String,
@@ -654,35 +688,36 @@ impl Link {
                 {
                     return;
                 }
-                self.next_turn_generation += 1;
-                let generation = self.next_turn_generation;
-                self.turns.insert(
-                    runtime_id.clone(),
-                    Turn::submitting(format!("turn-{runtime_id}-{generation}"), generation),
-                );
-                if let Err(fault) = self
-                    .send_rpc(
-                        "prompt.submit",
-                        json!({"session_id": runtime_id, "text": text}),
-                        JobKind::Submit {
-                            runtime_id: runtime_id.clone(),
-                            generation,
-                        },
-                        RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    if let Some(turn) = self.turns.get_mut(&runtime_id) {
-                        let _ = turn.fail_submit(generation);
-                    }
-                    self.fail(
-                        "submit",
-                        Some(runtime_id),
-                        send_fault_message("submit", fault),
-                    )
-                    .await;
-                }
+                self.begin_submit(runtime_id, text).await;
             }
+            Command::Steer { runtime_id, text } => match steer_route(self.turns.get(&runtime_id)) {
+                SteerRoute::Drop => {}
+                SteerRoute::Redirect => {
+                    if let Err(fault) = self
+                        .send_rpc(
+                            "session.redirect",
+                            json!({"session_id": runtime_id, "text": text}),
+                            JobKind::Steer {
+                                runtime_id: runtime_id.clone(),
+                                text,
+                            },
+                            RPC_TIMEOUT,
+                        )
+                        .await
+                    {
+                        // A failed steer must not end the live turn: the
+                        // "steer" operation is deliberately not "submit".
+                        self.fail(
+                            "steer",
+                            Some(runtime_id),
+                            send_fault_message("steer", fault),
+                        )
+                        .await;
+                    }
+                }
+                // Idle or already-settled turn: this is a normal next prompt.
+                SteerRoute::Submit => self.begin_submit(runtime_id, text).await,
+            },
             Command::Interrupt { runtime_id } => {
                 let generation = self
                     .turns
@@ -717,6 +752,37 @@ impl Link {
             Command::FetchModels | Command::SetModel { .. } => {
                 self.model_command(command).await;
             }
+        }
+    }
+
+    async fn begin_submit(&mut self, runtime_id: String, text: String) {
+        self.next_turn_generation += 1;
+        let generation = self.next_turn_generation;
+        self.turns.insert(
+            runtime_id.clone(),
+            Turn::submitting(format!("turn-{runtime_id}-{generation}"), generation),
+        );
+        if let Err(fault) = self
+            .send_rpc(
+                "prompt.submit",
+                json!({"session_id": runtime_id, "text": text}),
+                JobKind::Submit {
+                    runtime_id: runtime_id.clone(),
+                    generation,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            if let Some(turn) = self.turns.get_mut(&runtime_id) {
+                let _ = turn.fail_submit(generation);
+            }
+            self.fail(
+                "submit",
+                Some(runtime_id),
+                send_fault_message("submit", fault),
+            )
+            .await;
         }
     }
 
@@ -1144,35 +1210,14 @@ impl Link {
             return;
         }
         match event_type {
-            "message.start" => {
-                let message_id = payload
-                    .get("turn_id")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("turn-{runtime_id}"));
-                let turn = self.ensure_turn(&runtime_id, &message_id);
-                if turn.note_accepted() {
-                    self.retire_submit_jobs(&runtime_id);
-                }
-            }
+            "message.start" => self.on_message_start(&runtime_id, payload).await,
             "message.delta" => self.on_delta(&runtime_id, payload).await,
             "message.complete" => self.on_complete(&runtime_id, payload).await,
             "thinking.delta" | "reasoning.delta" => {
                 self.activity(&runtime_id, "Hermes is thinking…").await
             }
             "tool.start" | "tool.generating" | "tool.complete" => {
-                let name = payload
-                    .get("name")
-                    .or_else(|| payload.get("tool"))
-                    .or_else(|| payload.get("tool_name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool");
-                let label = match event_type {
-                    "tool.complete" => format!("Tool finished: {}", truncate(name, 80)),
-                    _ => format!("Using tool: {}", truncate(name, 80)),
-                };
-                self.activity(&runtime_id, &label).await;
+                self.on_tool_event(&runtime_id, event_type, payload).await
             }
             "request.cancel" => {
                 let Some(raw_id) = payload.get("id").or_else(|| payload.get("request_id")) else {
@@ -1237,6 +1282,42 @@ impl Link {
         }
     }
 
+    /// Turn-rollover handling for message.start, in the documented order:
+    /// ensure_turn first, then the rollover notice, then submit-job retirement.
+    async fn on_message_start(&mut self, runtime_id: &str, payload: &Value) {
+        let message_id = payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("turn-{runtime_id}"));
+        let (turn, server_started) = self.ensure_turn(runtime_id, &message_id);
+        let accepted = turn.note_accepted();
+        if server_started {
+            self.emit(Event::TurnRolled {
+                runtime_id: runtime_id.to_string(),
+            })
+            .await;
+        }
+        if accepted {
+            self.retire_submit_jobs(runtime_id);
+        }
+    }
+
+    async fn on_tool_event(&mut self, runtime_id: &str, event_type: &str, payload: &Value) {
+        let name = payload
+            .get("name")
+            .or_else(|| payload.get("tool"))
+            .or_else(|| payload.get("tool_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let label = match event_type {
+            "tool.complete" => format!("Tool finished: {}", truncate(name, 80)),
+            _ => format!("Using tool: {}", truncate(name, 80)),
+        };
+        self.activity(runtime_id, &label).await;
+    }
+
     async fn on_delta(&mut self, runtime_id: &str, payload: &Value) {
         let Some(text) = payload.get("text").and_then(Value::as_str) else {
             return;
@@ -1247,8 +1328,9 @@ impl Link {
         let turn_id = payload.get("turn_id").and_then(Value::as_str).unwrap_or("");
         let segment = payload.get("segment").and_then(Value::as_i64).unwrap_or(0);
         let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
-        let turn = self.ensure_turn(runtime_id, turn_id);
-        if !turn.note_accepted() {
+        let (turn, server_started) = self.ensure_turn(runtime_id, turn_id);
+        let accepted = turn.note_accepted();
+        if !accepted {
             return;
         }
         if segment != turn.segment {
@@ -1261,6 +1343,12 @@ impl Link {
         turn.applied_offset = offset.saturating_add(utf16_len(text) as i64);
         let message_id = turn.message_id.clone();
         self.retire_submit_jobs(runtime_id);
+        if server_started {
+            self.emit(Event::TurnRolled {
+                runtime_id: runtime_id.to_string(),
+            })
+            .await;
+        }
         self.emit(Event::MessageDelta {
             runtime_id: runtime_id.to_string(),
             message_id,
@@ -1279,7 +1367,8 @@ impl Link {
         }
         let status = turn_status(payload.get("status").and_then(Value::as_str).unwrap_or(""));
         let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
-        let message_id = self.ensure_turn(runtime_id, "").message_id.clone();
+        let (turn, _) = self.ensure_turn(runtime_id, "");
+        let message_id = turn.message_id.clone();
         if let Some(turn) = self.turns.get_mut(runtime_id) {
             let _ = turn.finish();
         }
@@ -1311,7 +1400,8 @@ impl Link {
         }
     }
 
-    fn ensure_turn(&mut self, runtime_id: &str, message_id: &str) -> &mut Turn {
+    fn ensure_turn(&mut self, runtime_id: &str, message_id: &str) -> (&mut Turn, bool) {
+        let mut server_started = false;
         if !self.turns.contains_key(runtime_id) {
             self.next_turn_generation += 1;
             let id = if message_id.is_empty() {
@@ -1323,12 +1413,37 @@ impl Link {
                 runtime_id.to_string(),
                 Turn::streaming(id, self.next_turn_generation),
             );
+            // A turn nobody tracked just started: a server-initiated message
+            // (a queued follow-up that survived a reconnect), never a client
+            // submit. The UI must hear about it to leave its settled state.
+            server_started = !message_id.is_empty();
+        } else {
+            // A server-initiated follow-up (FIFO-drained queued prompt) starts
+            // a new message after the live turn settled with no client submit.
+            // Roll the tracking to the new message; the fresh generation keeps
+            // late frames of the old turn from affecting it.
+            let rolls = {
+                let turn = &self.turns[runtime_id];
+                turn.phase == TurnPhase::Terminal
+                    && !message_id.is_empty()
+                    && message_id != turn.message_id
+            };
+            if rolls {
+                self.next_turn_generation += 1;
+                let generation = self.next_turn_generation;
+                self.turns.insert(
+                    runtime_id.to_string(),
+                    Turn::streaming(message_id.to_string(), generation),
+                );
+                self.retire_turn_jobs(runtime_id);
+                server_started = true;
+            }
         }
         let turn = self.turns.get_mut(runtime_id).expect("inserted turn");
         if !message_id.is_empty() && turn.phase != TurnPhase::Terminal {
             turn.message_id = message_id.to_string();
         }
-        turn
+        (turn, server_started)
     }
 
     fn retire_submit_jobs(&mut self, runtime_id: &str) {
@@ -1450,7 +1565,8 @@ impl Link {
         };
         if !runtime_id.is_empty() {
             self.retire_submit_jobs(&runtime_id);
-            self.ensure_turn(&runtime_id, "").await_input();
+            let (turn, _) = self.ensure_turn(&runtime_id, "");
+            turn.await_input();
         }
         self.asks.insert(
             id.clone(),
@@ -1510,6 +1626,57 @@ impl Link {
                 if accepted {
                     self.emit(Event::Interrupting { runtime_id }).await;
                 }
+            }
+            JobKind::Steer { runtime_id, text } => {
+                let status = result
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("rejected");
+                match status {
+                    "redirected" => {
+                        self.emit(Event::SteerAccepted {
+                            runtime_id,
+                            outcome: SteerOutcome::Redirected,
+                        })
+                        .await;
+                    }
+                    "queued" => {
+                        self.emit(Event::SteerAccepted {
+                            runtime_id,
+                            outcome: SteerOutcome::Queued,
+                        })
+                        .await;
+                    }
+                    // Not running or inapplicable: queue as the next prompt,
+                    // mirroring the upstream TUI fallback.
+                    _ => {
+                        if let Err(fault) = self
+                            .send_rpc(
+                                "prompt.submit",
+                                queued_submit_params(&runtime_id, &text),
+                                JobKind::Queue {
+                                    runtime_id: runtime_id.clone(),
+                                },
+                                RPC_TIMEOUT,
+                            )
+                            .await
+                        {
+                            self.fail(
+                                "steer",
+                                Some(runtime_id),
+                                send_fault_message("steer", fault),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+            JobKind::Queue { runtime_id } => {
+                self.emit(Event::SteerAccepted {
+                    runtime_id,
+                    outcome: SteerOutcome::Queued,
+                })
+                .await;
             }
             JobKind::Catalog => match Catalog::parse(result) {
                 Ok(catalog) => self.emit(Event::Catalog { catalog }).await,
@@ -1652,6 +1819,11 @@ impl Link {
                     return;
                 }
                 self.fail("interrupt", Some(runtime_id), message).await
+            }
+            // A failed steer must not end the live turn: "steer" is not
+            // "submit" in `operation_failed`, so the status stays busy.
+            JobKind::Steer { runtime_id, .. } | JobKind::Queue { runtime_id, .. } => {
+                self.fail("steer", Some(runtime_id), message).await
             }
             kind @ (JobKind::Catalog | JobKind::Prime { .. } | JobKind::Switch { .. }) => {
                 self.fail_model_request(kind, code, message).await;
@@ -3172,6 +3344,322 @@ mod tests {
             .await;
             assert_eq!(link.turns["rt"].phase, TurnPhase::Terminal);
             assert!(incoming.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn steer_routes_drop_only_while_stopping() {
+        fn turn_with(phase: TurnPhase) -> Turn {
+            let mut turn = Turn::streaming("m".into(), 1);
+            turn.phase = phase;
+            turn
+        }
+        assert!(matches!(steer_route(None), SteerRoute::Submit));
+        for phase in [
+            TurnPhase::Submitting,
+            TurnPhase::Streaming,
+            TurnPhase::AwaitingInput,
+        ] {
+            let turn = turn_with(phase);
+            assert!(matches!(steer_route(Some(&turn)), SteerRoute::Redirect));
+        }
+        let mut stopping = turn_with(TurnPhase::Streaming);
+        stopping.accept_interrupt(1);
+        assert!(matches!(steer_route(Some(&stopping)), SteerRoute::Drop));
+        let mut terminal = turn_with(TurnPhase::Streaming);
+        terminal.finish();
+        assert!(matches!(steer_route(Some(&terminal)), SteerRoute::Submit));
+    }
+
+    #[test]
+    fn rejected_fallback_sends_queue_only_submit() {
+        let params = queued_submit_params("rt", "hold on");
+        assert_eq!(params["session_id"], "rt");
+        assert_eq!(params["text"], "hold on");
+        assert_eq!(params["queued"], true);
+        let mut keys: Vec<&str> = params
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["queued", "session_id", "text"]);
+    }
+
+    #[test]
+    fn steer_accept_events_leave_turn_and_generations_untouched() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(4);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.next_turn_generation = 4;
+            link.turns
+                .insert("rt".into(), Turn::streaming("m".into(), 4));
+            link.jobs.insert(
+                5,
+                Job {
+                    kind: JobKind::Submit {
+                        runtime_id: "rt".into(),
+                        generation: 4,
+                    },
+                    deadline: Instant::now(),
+                },
+            );
+            link.on_job(
+                Job {
+                    kind: JobKind::Steer {
+                        runtime_id: "rt".into(),
+                        text: "go left".into(),
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"result": {"status": "redirected"}}),
+            )
+            .await;
+            assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt"].generation, 4);
+            assert!(link.jobs.contains_key(&5));
+            match incoming.try_recv().expect("redirect accept") {
+                Event::SteerAccepted {
+                    runtime_id,
+                    outcome,
+                } => {
+                    assert_eq!(runtime_id, "rt");
+                    assert_eq!(outcome, SteerOutcome::Redirected);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+
+            link.on_job(
+                Job {
+                    kind: JobKind::Steer {
+                        runtime_id: "rt".into(),
+                        text: "and queue this".into(),
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"result": {"status": "queued"}}),
+            )
+            .await;
+            match incoming.try_recv().expect("queue accept") {
+                Event::SteerAccepted { outcome, .. } => {
+                    assert_eq!(outcome, SteerOutcome::Queued);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt"].generation, 4);
+        });
+    }
+
+    #[test]
+    fn fifo_followup_rolls_terminal_turn_and_ignores_late_interrupt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(4);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.next_turn_generation = 7;
+            let mut old = Turn::streaming("m1".into(), 7);
+            old.finish();
+            link.turns.insert("rt".into(), old);
+            link.jobs.insert(
+                8,
+                Job {
+                    kind: JobKind::Interrupt {
+                        runtime_id: "rt".into(),
+                        generation: 7,
+                    },
+                    deadline: Instant::now(),
+                },
+            );
+            // Server-initiated follow-up: no client submit involved.
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "message.start",
+                    "session_id": "rt",
+                    "payload": {"turn_id": "m2"}
+                }
+            }))
+            .await;
+            assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt"].generation, 8);
+            assert_eq!(link.turns["rt"].message_id, "m2");
+            assert_eq!(link.turns["rt"].segment, 0);
+            assert_eq!(link.turns["rt"].applied_offset, 0);
+            match incoming.try_recv().expect("rollover notice") {
+                Event::TurnRolled { runtime_id } => assert_eq!(runtime_id, "rt"),
+                other => panic!("unexpected event: {other:?}"),
+            }
+
+            // A late interrupt ack for the old generation must not reopen stopping.
+            link.on_job(
+                Job {
+                    kind: JobKind::Interrupt {
+                        runtime_id: "rt".into(),
+                        generation: 7,
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"result": {}}),
+            )
+            .await;
+            assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt"].generation, 8);
+            assert!(incoming.try_recv().is_err());
+
+            // Deltas of the new turn route under its own message id.
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "message.delta",
+                    "session_id": "rt",
+                    "payload": {"turn_id": "m2", "text": "next turn", "offset": 0}
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("rolled delta") {
+                Event::MessageDelta {
+                    runtime_id,
+                    message_id,
+                    delta,
+                } => {
+                    assert_eq!(runtime_id, "rt");
+                    assert_eq!(message_id, "m2");
+                    assert_eq!(delta, "next turn");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn delta_first_followup_rolls_an_untracked_turn_and_notifies() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(4);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.next_turn_generation = 3;
+            // No tracked turn: a queued follow-up that survived a reconnect.
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "message.delta",
+                    "session_id": "rt",
+                    "payload": {"turn_id": "m9", "text": "first", "offset": 0}
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("rollover notice") {
+                Event::TurnRolled { runtime_id } => assert_eq!(runtime_id, "rt"),
+                other => panic!("unexpected event: {other:?}"),
+            }
+            match incoming.try_recv().expect("first delta") {
+                Event::MessageDelta {
+                    message_id, delta, ..
+                } => {
+                    assert_eq!(message_id, "m9");
+                    assert_eq!(delta, "first");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt"].generation, 4);
+            assert_eq!(link.turns["rt"].message_id, "m9");
+            // Continuation deltas of the same turn emit no further notice.
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "message.delta",
+                    "session_id": "rt",
+                    "payload": {"turn_id": "m9", "text": "more", "offset": 5}
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("second delta") {
+                Event::MessageDelta { delta, .. } => assert_eq!(delta, "more"),
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(incoming.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn steer_failure_surfaces_without_ending_the_live_turn() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(4);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.next_turn_generation = 4;
+            link.turns
+                .insert("rt".into(), Turn::streaming("m".into(), 4));
+            // No socket: the `rejected` fallback submit cannot be sent, which
+            // exercises the steer failure path.
+            link.on_job(
+                Job {
+                    kind: JobKind::Steer {
+                        runtime_id: "rt".into(),
+                        text: "steer".into(),
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"result": {"status": "rejected"}}),
+            )
+            .await;
+            match incoming.try_recv().expect("steer failure") {
+                Event::Error {
+                    operation,
+                    session_id,
+                    ..
+                } => {
+                    assert_eq!(operation, "steer");
+                    assert_eq!(session_id.as_deref(), Some("rt"));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt"].generation, 4);
         });
     }
 }

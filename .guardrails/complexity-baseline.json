@@ -5,19 +5,19 @@
     "complexity": 11
   },
   {
+    "file": "src/markdown.rs",
+    "function": "nested_lists_quotes_and_tables_keep_boundaries",
+    "complexity": 17
+  },
+  {
     "file": "src/ui.rs",
     "function": "build",
-    "complexity": 14
+    "complexity": 12
   },
   {
     "file": "src/ui.rs",
     "function": "connect_actions",
     "complexity": 24
-  },
-  {
-    "file": "src/ui.rs",
-    "function": "apply",
-    "complexity": 20
   },
   {
     "file": "src/ui.rs",
@@ -35,11 +35,6 @@
     "complexity": 14
   },
   {
-    "file": "src/markdown.rs",
-    "function": "nested_lists_quotes_and_tables_keep_boundaries",
-    "complexity": 17
-  },
-  {
     "file": "src/backend.rs",
     "function": "connect",
     "complexity": 13
@@ -51,18 +46,13 @@
   },
   {
     "file": "src/backend.rs",
-    "function": "on_event",
-    "complexity": 15
-  },
-  {
-    "file": "src/backend.rs",
     "function": "maintain",
     "complexity": 11
   },
   {
     "file": "examples/remote_smoke.rs",
     "function": "run",
-    "complexity": 23
+    "complexity": 22
   },
   {
     "file": "examples/remote_smoke.rs",

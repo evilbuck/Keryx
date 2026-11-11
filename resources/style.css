@@ -5,9 +5,18 @@
 .session-title { font-weight: 600; }
 .session-meta { font-size: 11px; opacity: 0.58; }
 .hermes-transcript { background: @window_bg_color; }
-.message { padding: 20px 8px; }
-.message-user { background: alpha(@accent_bg_color, 0.07); border-radius: 12px; }
+.message { padding: 16px 12px; border-radius: 12px; }
+.message-user { background: alpha(@accent_bg_color, 0.12); }
+.message-assistant { background: alpha(@window_fg_color, 0.05); }
+.message-tool { padding: 6px 12px; }
+.message-system { background: alpha(@warning_color, 0.10); }
 .speaker { font-size: 11px; font-weight: 800; letter-spacing: 1px; opacity: 0.65; }
+.speaker-user { color: @blue_2; opacity: 1; }
+.speaker-assistant { color: @success_color; opacity: 1; }
+.speaker-tool { color: @warning_color; opacity: 1; }
+.tool-chip { background: alpha(@window_fg_color, 0.06); border-radius: 8px; padding: 6px 10px; }
+.tool-icon { opacity: 0.75; }
+.tool-label { font-family: monospace; font-size: 12px; opacity: 0.85; }
 .message-prose { font-size: 15px; line-height: 1.5; }
 .message-copy { opacity: 0.45; }
 .message-copy:hover { opacity: 1; }

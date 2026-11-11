@@ -131,6 +131,23 @@ impl TurnStatus {
             Self::Submitting | Self::Streaming | Self::AwaitingInput | Self::Stopping
         )
     }
+
+    /// Busy enough to steer, but not yet Stopping. Stopping stays closed to steers.
+    pub fn steerable(&self) -> bool {
+        matches!(
+            self,
+            Self::Submitting | Self::Streaming | Self::AwaitingInput
+        )
+    }
+}
+
+/// What the gateway did with a steer. Neither outcome ends the live turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// Folded into the live turn; the same stream continues.
+    Redirected,
+    /// Queued for after the current response.
+    Queued,
 }
 
 #[derive(Clone, Debug)]
@@ -486,6 +503,11 @@ pub enum Command {
     Interrupt {
         runtime_id: String,
     },
+    /// Busy-turn steer. The backend routes it to `session.redirect`.
+    Steer {
+        runtime_id: String,
+        text: String,
+    },
     Respond {
         runtime_id: String,
         request_id: String,
@@ -563,6 +585,16 @@ pub enum Event {
     },
     /// Interrupt accepted. Not a terminal completion; the turn stays live until message completion.
     Interrupting {
+        runtime_id: String,
+    },
+    /// The gateway accepted a busy-turn steer. The live turn continues untouched.
+    SteerAccepted {
+        runtime_id: String,
+        outcome: SteerOutcome,
+    },
+    /// The gateway started a server-initiated turn (a FIFO-drained queued
+    /// prompt, possibly after a reconnect). No client submit is involved.
+    TurnRolled {
         runtime_id: String,
     },
     Deleted {
@@ -693,6 +725,38 @@ impl Conversation {
             self.status = TurnStatus::Streaming;
             self.activity = "Hermes is thinking…".into();
         }
+    }
+
+    /// Record a steer outcome. The live turn keeps its status and generation:
+    /// a steer never reopens Stopping and never claims Submitting.
+    pub fn steer_acknowledged(&mut self, outcome: SteerOutcome) {
+        if !self.status.steerable() {
+            return;
+        }
+        match outcome {
+            SteerOutcome::Redirected => {
+                if self.status == TurnStatus::Submitting {
+                    self.status = TurnStatus::Streaming;
+                }
+                self.activity = "Steer received. Hermes is adjusting…".into();
+            }
+            SteerOutcome::Queued => {
+                self.activity = "Queued. Waiting for this response to finish…".into();
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// The gateway rolled the settled turn into a server-initiated follow-up.
+    /// Restores Streaming without claiming a client submit; Stopping and a
+    /// pending submit are never overridden.
+    pub fn turn_rolled(&mut self) {
+        if self.status.busy() {
+            return;
+        }
+        self.status = TurnStatus::Streaming;
+        self.activity = "Hermes is starting the queued follow-up…".into();
+        self.revision += 1;
     }
 
     /// Record an interrupt acknowledgement. Draft, history, and runtime identity stay put.
@@ -907,6 +971,98 @@ mod tests {
             Config::validate_url(&url::Url::parse("http://100.64.0.2:9119").unwrap(), true).is_ok()
         );
     }
+    #[test]
+    fn steers_are_allowed_exactly_when_not_stopping() {
+        use TurnStatus::*;
+        assert!(Streaming.steerable());
+        assert!(Submitting.steerable());
+        assert!(AwaitingInput.steerable());
+        assert!(!Stopping.steerable());
+        assert!(!Idle.steerable());
+        assert!(!Complete.steerable());
+        assert!(!Unknown.steerable());
+    }
+
+    #[test]
+    fn steer_acknowledged_keeps_turn_state_and_never_reopens_stopping() {
+        let mut conversation = Conversation {
+            status: TurnStatus::Streaming,
+            ..Default::default()
+        };
+        conversation.steer_acknowledged(SteerOutcome::Redirected);
+        assert_eq!(conversation.status, TurnStatus::Streaming);
+        assert!(conversation.activity.contains("Steer"));
+
+        conversation.status = TurnStatus::AwaitingInput;
+        conversation.steer_acknowledged(SteerOutcome::Redirected);
+        assert_eq!(conversation.status, TurnStatus::AwaitingInput);
+
+        conversation.status = TurnStatus::Submitting;
+        conversation.steer_acknowledged(SteerOutcome::Redirected);
+        assert_eq!(conversation.status, TurnStatus::Streaming);
+
+        conversation.status = TurnStatus::Stopping;
+        conversation.activity = "Stopping response…".into();
+        conversation.steer_acknowledged(SteerOutcome::Redirected);
+        assert_eq!(conversation.status, TurnStatus::Stopping);
+
+        conversation.steer_acknowledged(SteerOutcome::Queued);
+        assert_eq!(conversation.status, TurnStatus::Stopping);
+        assert!(conversation.activity.contains("Stopping"));
+
+        conversation.status = TurnStatus::Streaming;
+        conversation.steer_acknowledged(SteerOutcome::Queued);
+        assert_eq!(conversation.status, TurnStatus::Streaming);
+        assert!(conversation.activity.contains("Queued"));
+    }
+
+    #[test]
+    fn steer_optimistic_rows_do_not_shift_server_history_cursor() {
+        let mut conversation = Conversation {
+            history_before: 50,
+            ..Default::default()
+        };
+        conversation.status = TurnStatus::Streaming;
+        conversation.record_message(ChatMessage {
+            id: "client-steer".into(),
+            role: Role::User,
+            text: "steer text".into(),
+        });
+        // The optimistic row is display-only: the server-row cursor stays put.
+        assert_eq!(conversation.history_before, 50);
+        assert_eq!(
+            conversation.messages.last().map(|m| m.text.as_str()),
+            Some("steer text")
+        );
+    }
+
+    #[test]
+    fn turn_rolled_restores_streaming_only_from_settled_states() {
+        let mut conversation = Conversation {
+            status: TurnStatus::Complete,
+            ..Default::default()
+        };
+        conversation.turn_rolled();
+        assert_eq!(conversation.status, TurnStatus::Streaming);
+        assert!(conversation.activity.contains("follow-up"));
+
+        conversation.status = TurnStatus::Stopping;
+        conversation.activity = "Stopping response…".into();
+        conversation.turn_rolled();
+        assert_eq!(conversation.status, TurnStatus::Stopping);
+        assert!(conversation.activity.contains("Stopping"));
+
+        conversation.status = TurnStatus::Submitting;
+        conversation.turn_rolled();
+        assert_eq!(conversation.status, TurnStatus::Submitting);
+
+        conversation.status = TurnStatus::Streaming;
+        conversation.activity = "Receiving response…".into();
+        conversation.turn_rolled();
+        assert_eq!(conversation.status, TurnStatus::Streaming);
+        assert_eq!(conversation.activity, "Receiving response…");
+    }
+
     #[test]
     fn disconnect_never_replays_or_completes_uncertain_turns() {
         let mut state = AppState::default();

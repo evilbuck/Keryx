@@ -65,6 +65,22 @@ struct PendingModel {
     prime: Option<ModelIdentity>,
 }
 
+/// The activity text a terminal completion collapses to. Non-terminal
+/// statuses mean the completion was not a confirmed end.
+fn completion_activity(status: &TurnStatus) -> String {
+    match status {
+        TurnStatus::Complete => String::new(),
+        TurnStatus::Interrupted => "Response stopped. Partial text may be incomplete.".into(),
+        TurnStatus::Failed => "The server reported a failed response.".into(),
+        TurnStatus::Idle
+        | TurnStatus::Submitting
+        | TurnStatus::Streaming
+        | TurnStatus::AwaitingInput
+        | TurnStatus::Stopping
+        | TurnStatus::Unknown => "Response ended without a confirmed completion.".into(),
+    }
+}
+
 /// The collapsed trigger caption. Never claims an unconfirmed pair.
 fn model_caption(model: &ModelState) -> String {
     match model {
@@ -125,6 +141,20 @@ fn model_tooltip(model: &ModelState, catalog: &Catalog) -> String {
             "The last change was never confirmed. Pick again to be sure.".into()
         }
     }
+}
+
+/// Run `apply` against the conversation owning `runtime_id`, if tracked.
+fn with_conversation(
+    state: &mut AppState,
+    runtime_id: &str,
+    apply: impl FnOnce(&mut Conversation),
+) -> bool {
+    state
+        .conversation_for_runtime_mut(runtime_id)
+        .is_some_and(|c| {
+            apply(c);
+            true
+        })
 }
 
 pub fn build(app: &adw::Application, config: Result<Config, String>) {
@@ -265,19 +295,14 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
             .and_downcast::<glib::BoxedAnyObject>()
             .expect("message item");
         let message = value.borrow::<ChatMessage>();
+        let (speaker_label, row_class, speaker_class) = role_style(&message.role);
         let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
         row.add_css_class("message");
-        if message.role == Role::User {
-            row.add_css_class("message-user");
-        }
+        row.add_css_class(row_class);
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let speaker = gtk::Label::new(Some(match message.role {
-            Role::User => "YOU",
-            Role::Assistant => "HERMES",
-            Role::Tool => "TOOL",
-            Role::System => "SYSTEM",
-        }));
+        let speaker = gtk::Label::new(Some(speaker_label));
         speaker.add_css_class("speaker");
+        speaker.add_css_class(speaker_class);
         speaker.set_hexpand(true);
         speaker.set_xalign(0.0);
         heading.append(&speaker);
@@ -292,9 +317,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         });
         heading.append(&copy);
         row.append(&heading);
-        let rendered = markdown::render(&message.text);
-        rendered.add_css_class("message-prose");
-        row.append(&rendered);
+        row.append(&message_body(&message));
         let column = adw::Clamp::builder()
             .maximum_size(860)
             .tightening_threshold(600)
@@ -1018,6 +1041,17 @@ impl Ui {
         if text.is_empty() {
             return;
         }
+        let busy = {
+            let state = self.state.borrow();
+            state
+                .conversations
+                .get(&id)
+                .is_some_and(|c| c.status.steerable())
+        };
+        if busy {
+            self.steer(id, runtime_id, text);
+            return;
+        }
         if !self.command(Command::Submit {
             runtime_id,
             text: text.clone(),
@@ -1036,6 +1070,35 @@ impl Ui {
             c.draft.clear();
             c.status = TurnStatus::Submitting;
             c.activity = "Sending…".into();
+        }
+        drop(state);
+        self.changing_draft.set(true);
+        self.editor.buffer().set_text("");
+        self.changing_draft.set(false);
+        self.follow_bottom.set(true);
+        self.refresh();
+    }
+
+    /// Busy-turn steer: optimistic row now, live turn untouched until the
+    /// gateway answers. Multiple steers stack, one row each.
+    fn steer(&self, id: String, runtime_id: String, text: String) {
+        if !self.command(Command::Steer {
+            runtime_id,
+            text: text.clone(),
+        }) {
+            self.refresh();
+            return;
+        }
+        self.sequence.set(self.sequence.get() + 1);
+        let mut state = self.state.borrow_mut();
+        if let Some(c) = state.conversations.get_mut(&id) {
+            c.record_message(ChatMessage {
+                id: format!("client-{}", self.sequence.get()),
+                role: Role::User,
+                text,
+            });
+            c.draft.clear();
+            c.activity = "Steering…".into();
         }
         drop(state);
         self.changing_draft.set(true);
@@ -1363,75 +1426,22 @@ impl Ui {
                     c.receive_history_page(before, next_before, messages);
                 }
             }
-            Event::Submitted { runtime_id } => {
-                if let Some(c) = state.conversation_for_runtime_mut(&runtime_id) {
-                    c.submit_acknowledged();
+            other => {
+                if !self.apply_history(&mut state, &other) {
+                    self.apply_stream(&mut state, other);
                 }
             }
-            Event::MessageDelta {
-                runtime_id,
-                message_id,
-                delta,
-            } => {
-                if let Some(c) = state.conversation_for_runtime_mut(&runtime_id) {
-                    c.receive_delta(message_id, delta);
-                }
-            }
-            Event::MessageComplete {
-                runtime_id,
-                message,
-                status,
-            } => {
-                if let Some(c) = state.conversation_for_runtime_mut(&runtime_id) {
-                    c.finish_message(message);
-                    c.activity = match status {
-                        TurnStatus::Complete => String::new(),
-                        TurnStatus::Interrupted => {
-                            "Response stopped. Partial text may be incomplete.".into()
-                        }
-                        TurnStatus::Failed => "The server reported a failed response.".into(),
-                        TurnStatus::Idle
-                        | TurnStatus::Submitting
-                        | TurnStatus::Streaming
-                        | TurnStatus::AwaitingInput
-                        | TurnStatus::Stopping
-                        | TurnStatus::Unknown => {
-                            "Response ended without a confirmed completion.".into()
-                        }
-                    };
-                    c.status = status;
-                    c.interaction = None;
-                }
-            }
-            Event::Activity { runtime_id, text } => {
-                if let Some(c) = state.conversation_for_runtime_mut(&runtime_id) {
-                    c.activity = text;
-                }
-            }
-            Event::Interaction {
-                runtime_id,
-                request,
-            } => {
-                if let Some(c) = state.conversation_for_runtime_mut(&runtime_id) {
-                    c.receive_interaction(request);
-                }
-            }
-            Event::InteractionCancelled {
-                runtime_id,
-                request_id,
-            } => {
-                if let Some(c) = state.conversation_for_runtime_mut(&runtime_id) {
-                    c.withdraw_interaction(&request_id);
-                }
-            }
-            Event::Interrupting { runtime_id } => {
-                if let Some(c) = state.conversation_for_runtime_mut(&runtime_id) {
-                    c.begin_stopping();
-                }
-            }
+        }
+    }
+
+    /// Session-list and failure events. Returns true when the event was handled.
+    /// Live-turn and history-page events are consumed by `apply` directly.
+    fn apply_history(&self, state: &mut AppState, event: &Event) -> bool {
+        match event {
             Event::Deleted { stored_id } => {
-                state.sessions.retain(|s| s.stored_id != stored_id);
-                state.conversations.remove(&stored_id);
+                state.sessions.retain(|s| &s.stored_id != stored_id);
+                state.conversations.remove(stored_id);
+                true
             }
             Event::Error {
                 operation,
@@ -1442,20 +1452,88 @@ impl Ui {
                 state.creating = false;
                 state.list_loading = false;
                 if let Some(id) = session_id {
-                    self.pending_resumes.borrow_mut().remove(&id);
-                    let stored = if state.conversations.contains_key(&id) {
-                        Some(id)
+                    self.pending_resumes.borrow_mut().remove(id);
+                    let stored = if state.conversations.contains_key(id) {
+                        Some(id.clone())
                     } else {
-                        state.stored_for_runtime(&id)
+                        state.stored_for_runtime(id)
                     };
                     if let Some(id) = stored {
                         let c = state.conversations.get_mut(&id).unwrap();
                         c.history_loading = false;
-                        c.operation_failed(&operation, message);
+                        c.operation_failed(operation, message.clone());
                     }
                 }
+                true
             }
-            _ => {}
+            _ => false,
+        }
+    }
+
+    /// Live-turn events. Returns true when the event was handled.
+    fn apply_stream(&self, state: &mut AppState, event: Event) -> bool {
+        match event {
+            Event::Submitted { runtime_id } => {
+                with_conversation(state, &runtime_id, |c| c.submit_acknowledged());
+                true
+            }
+            Event::MessageDelta {
+                runtime_id,
+                message_id,
+                delta,
+            } => {
+                with_conversation(state, &runtime_id, |c| c.receive_delta(message_id, delta));
+                true
+            }
+            Event::MessageComplete {
+                runtime_id,
+                message,
+                status,
+            } => {
+                with_conversation(state, &runtime_id, |c| {
+                    c.finish_message(message);
+                    c.activity = completion_activity(&status);
+                    c.status = status;
+                    c.interaction = None;
+                });
+                true
+            }
+            Event::Activity { runtime_id, text } => {
+                with_conversation(state, &runtime_id, |c| c.activity = text);
+                true
+            }
+            Event::Interrupting { runtime_id } => {
+                with_conversation(state, &runtime_id, |c| c.begin_stopping());
+                true
+            }
+            Event::SteerAccepted {
+                runtime_id,
+                outcome,
+            } => {
+                with_conversation(state, &runtime_id, |c| c.steer_acknowledged(outcome));
+                true
+            }
+            Event::TurnRolled { runtime_id } => {
+                with_conversation(state, &runtime_id, |c| c.turn_rolled());
+                true
+            }
+            Event::Interaction {
+                runtime_id,
+                request,
+            } => {
+                with_conversation(state, &runtime_id, |c| {
+                    c.receive_interaction(request);
+                });
+                true
+            }
+            Event::InteractionCancelled {
+                runtime_id,
+                request_id,
+            } => {
+                with_conversation(state, &runtime_id, |c| c.withdraw_interaction(&request_id));
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1644,7 +1722,9 @@ impl Ui {
         self.send.set_sensitive(
             writable
                 && !reload_pending
-                && conversation.is_some_and(|c| !c.status.busy() && !c.draft.trim().is_empty()),
+                && conversation.is_some_and(|c| {
+                    c.status != TurnStatus::Stopping && !c.draft.trim().is_empty()
+                }),
         );
         self.stop
             .set_visible(conversation.is_some_and(|c| c.status.busy()));
@@ -1972,6 +2052,39 @@ fn icon_button(icon: &str, label: &str) -> gtk::Button {
     button.set_tooltip_text(Some(label));
     button.update_property(&[gtk::accessible::Property::Label(label)]);
     button
+}
+
+/// Speaker label, row class, and speaker class for a message role, so each
+/// role reads differently in the transcript.
+fn role_style(role: &Role) -> (&'static str, &'static str, &'static str) {
+    match role {
+        Role::User => ("YOU", "message-user", "speaker-user"),
+        Role::Assistant => ("HERMES", "message-assistant", "speaker-assistant"),
+        Role::Tool => ("TOOL", "message-tool", "speaker-tool"),
+        Role::System => ("SYSTEM", "message-system", "speaker-system"),
+    }
+}
+
+/// Tool rows are compact single-line chips; every other role renders Markdown.
+fn message_body(message: &ChatMessage) -> gtk::Widget {
+    if message.role == Role::Tool {
+        let chip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        chip.add_css_class("tool-chip");
+        let icon = gtk::Image::from_icon_name("system-run-symbolic");
+        icon.add_css_class("tool-icon");
+        icon.set_valign(gtk::Align::Center);
+        chip.append(&icon);
+        let label = gtk::Label::new(Some(&message.text));
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.add_css_class("tool-label");
+        chip.append(&label);
+        chip.upcast()
+    } else {
+        let rendered = markdown::render(&message.text);
+        rendered.add_css_class("message-prose");
+        rendered
+    }
 }
 
 fn set_margins(widget: &impl IsA<gtk::Widget>, amount: i32) {

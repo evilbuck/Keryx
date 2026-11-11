@@ -16,7 +16,7 @@
     "patch_coverage_min": 90
   },
   "ratchet": {
-    "baseline_coverage": 39.5,
+    "baseline_coverage": 43.2,
     "baseline_complexity_inventory": [],
     "complexity_baseline_file": ".guardrails/complexity-baseline.json",
     "baseline_lint_clean": true
@@ -34,7 +34,10 @@
       "lint_accepts_paths": false,
       "functional_test_cmd": "cargo run --release --example remote_smoke -- --trusted-tunnel",
       "configured_not_installed": [],
-      "detection_signals": ["Cargo.toml", "*.rs"]
+      "detection_signals": [
+        "Cargo.toml",
+        "*.rs"
+      ]
     }
   ],
   "git_compare_branch": null,
