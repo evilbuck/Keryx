@@ -7,8 +7,9 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::model::{
-    ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event, InteractionAnswer,
-    InteractionKind, InteractionRequest, Role, SessionSummary, TurnStatus,
+    Catalog, ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event,
+    InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, Role, SessionSummary,
+    TurnStatus,
 };
 
 const PAGE: usize = 50;
@@ -200,13 +201,42 @@ struct Job {
 enum JobKind {
     Capabilities,
     Ping,
-    Create { title: String },
-    Resume { stored_id: String },
-    Submit { runtime_id: String, generation: u64 },
-    Interrupt { runtime_id: String, generation: u64 },
-    Close { stored_id: String, retried: bool },
-    Delete { stored_id: String, retried: bool },
-    DeleteResume { stored_id: String },
+    Create {
+        title: String,
+    },
+    Resume {
+        stored_id: String,
+    },
+    Submit {
+        runtime_id: String,
+        generation: u64,
+    },
+    Interrupt {
+        runtime_id: String,
+        generation: u64,
+    },
+    Close {
+        stored_id: String,
+        retried: bool,
+    },
+    Delete {
+        stored_id: String,
+        retried: bool,
+    },
+    DeleteResume {
+        stored_id: String,
+    },
+    Catalog,
+    /// Provider-less prime on a chat whose agent is not built yet.
+    Prime {
+        runtime_id: String,
+        target: ModelIdentity,
+        confirm_expensive: bool,
+    },
+    Switch {
+        runtime_id: String,
+        target: ModelIdentity,
+    },
 }
 
 struct Link {
@@ -544,6 +574,7 @@ impl Link {
         }
         self.emit(Event::Connection(ConnectionState::Connected))
             .await;
+        self.fetch_models().await;
         while self.ready && self.write.is_some() {
             let Some(command) = self.queued.pop_front() else {
                 break;
@@ -683,6 +714,146 @@ impl Link {
                 answer,
             } => self.respond(runtime_id, request_id, answer).await,
             Command::Delete { stored_id } => self.begin_delete(stored_id).await,
+            Command::FetchModels | Command::SetModel { .. } => {
+                self.model_command(command).await;
+            }
+        }
+    }
+
+    async fn model_command(&mut self, command: Command) {
+        match command {
+            Command::FetchModels => self.fetch_models().await,
+            Command::SetModel {
+                runtime_id,
+                prime,
+                target,
+                confirm_expensive,
+            } => {
+                if let Some(prime) = prime {
+                    self.begin_prime(runtime_id, prime, target, confirm_expensive)
+                        .await;
+                } else {
+                    self.begin_switch(runtime_id, target, confirm_expensive)
+                        .await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn fetch_models(&mut self) {
+        if let Err(fault) = self
+            .send_rpc(
+                "model.options",
+                json!({
+                    "explicit_only": true,
+                    "include_unconfigured": false,
+                    "refresh": false
+                }),
+                JobKind::Catalog,
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            let _ = fault;
+            self.emit(Event::Catalog {
+                catalog: Catalog {
+                    error: Some("The model catalog could not be requested.".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        }
+    }
+
+    /// The gateway skips waiting for an in-progress agent build when the switch names
+    /// an explicit provider, so a lazy chat needs a provider-less call first: that one
+    /// starts and waits for the build the real switch then applies to.
+    async fn begin_prime(
+        &mut self,
+        runtime_id: String,
+        prime: ModelIdentity,
+        target: ModelIdentity,
+        confirm_expensive: bool,
+    ) {
+        if let Err(fault) = self
+            .send_rpc(
+                "config.set",
+                json!({
+                    "session_id": runtime_id,
+                    "key": "model",
+                    "value": prime.prime_value(),
+                    "confirm_expensive_model": false
+                }),
+                JobKind::Prime {
+                    runtime_id: runtime_id.clone(),
+                    target,
+                    confirm_expensive,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            let _ = fault;
+            self.emit(Event::ModelAmbiguous { runtime_id }).await;
+        }
+    }
+
+    async fn begin_switch(
+        &mut self,
+        runtime_id: String,
+        target: ModelIdentity,
+        confirm_expensive: bool,
+    ) {
+        if let Err(fault) = self
+            .send_rpc(
+                "config.set",
+                json!({
+                    "session_id": runtime_id,
+                    "key": "model",
+                    "value": target.switch_value(),
+                    "confirm_expensive_model": confirm_expensive
+                }),
+                JobKind::Switch {
+                    runtime_id: runtime_id.clone(),
+                    target,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            let _ = fault;
+            self.emit(Event::ModelAmbiguous { runtime_id }).await;
+        }
+    }
+
+    /// One switch reply. Scope is mandatory: an unscoped reply may have written the
+    /// profile default, which this client never accepts as a per-chat change.
+    async fn model_reply(&mut self, runtime_id: String, target: ModelIdentity, result: &Value) {
+        match crate::model::interpret_switch(&target, result) {
+            crate::model::SwitchReply::Rejected(message) => {
+                self.emit(Event::ModelRejected {
+                    runtime_id,
+                    message,
+                })
+                .await;
+            }
+            crate::model::SwitchReply::NeedsConfirmation(message) => {
+                self.emit(Event::ModelConfirmation {
+                    runtime_id,
+                    target,
+                    message: self.clean(message),
+                })
+                .await;
+            }
+            crate::model::SwitchReply::Accepted { resolved, deferred } => {
+                self.emit(Event::ModelAck {
+                    runtime_id,
+                    resolved,
+                    deferred,
+                })
+                .await;
+            }
         }
     }
 
@@ -1124,6 +1295,20 @@ impl Link {
             status,
         })
         .await;
+        // The completion's usage names the model this inference actually ran on. That is
+        // the only direct evidence of an effective model, so it reconciles the display.
+        if let Some(model) = payload
+            .get("usage")
+            .and_then(|usage| usage.get("model"))
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        {
+            self.emit(Event::ModelObserved {
+                runtime_id: runtime_id.to_string(),
+                model: model.to_string(),
+            })
+            .await;
+        }
     }
 
     fn ensure_turn(&mut self, runtime_id: &str, message_id: &str) -> &mut Turn {
@@ -1326,6 +1511,31 @@ impl Link {
                     self.emit(Event::Interrupting { runtime_id }).await;
                 }
             }
+            JobKind::Catalog => match Catalog::parse(result) {
+                Ok(catalog) => self.emit(Event::Catalog { catalog }).await,
+                Err(error) => {
+                    self.emit(Event::Catalog {
+                        catalog: Catalog {
+                            error: Some(self.clean(error)),
+                            ..Default::default()
+                        },
+                    })
+                    .await
+                }
+            },
+            JobKind::Prime {
+                runtime_id,
+                target,
+                confirm_expensive,
+            } => {
+                // The agent build the prime waited for now exists, so the scoped switch
+                // applies to it. A failed prime means no switch was attempted.
+                self.begin_switch(runtime_id, target, confirm_expensive)
+                    .await;
+            }
+            JobKind::Switch {
+                runtime_id, target, ..
+            } => self.model_reply(runtime_id, target, result).await,
             JobKind::Delete { stored_id, .. } => {
                 self.runtime_of.remove(&stored_id);
                 self.emit(Event::Deleted { stored_id }).await;
@@ -1365,6 +1575,41 @@ impl Link {
                 self.request_delete(stored_id, true).await;
             }
         }
+    }
+
+    async fn fail_model_request(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
+            JobKind::Catalog => {
+                self.emit(Event::Catalog {
+                    catalog: Catalog {
+                        error: Some(self.clean(format!("The model catalog failed: {message}"))),
+                        ..Default::default()
+                    },
+                })
+                .await;
+            }
+            JobKind::Prime { runtime_id, .. } => {
+                self.emit(Event::ModelRejected {
+                    runtime_id,
+                    message: self.clean(message.to_string()),
+                })
+                .await;
+            }
+            JobKind::Switch { runtime_id, .. } => self.fail_switch(runtime_id, code, message).await,
+            _ => {}
+        }
+    }
+
+    async fn fail_switch(&mut self, runtime_id: String, code: i64, message: &str) {
+        if code == -32000 {
+            self.emit(Event::ModelAmbiguous { runtime_id }).await;
+            return;
+        }
+        self.emit(Event::ModelRejected {
+            runtime_id,
+            message: self.clean(message.to_string()),
+        })
+        .await;
     }
 
     async fn on_rpc_error(&mut self, job: Job, error: &Value) {
@@ -1407,6 +1652,9 @@ impl Link {
                     return;
                 }
                 self.fail("interrupt", Some(runtime_id), message).await
+            }
+            kind @ (JobKind::Catalog | JobKind::Prime { .. } | JobKind::Switch { .. }) => {
+                self.fail_model_request(kind, code, message).await;
             }
             JobKind::Close { stored_id, retried } => self.request_delete(stored_id, retried).await,
             JobKind::DeleteResume { stored_id } => {
@@ -1474,6 +1722,7 @@ impl Link {
         } else {
             title
         };
+        let model = model_identity(result);
         self.emit(Event::Created {
             session: SessionSummary {
                 stored_id,
@@ -1484,6 +1733,7 @@ impl Link {
                 message_count: 0,
             },
             runtime_id,
+            model,
         })
         .await;
     }
@@ -1539,6 +1789,7 @@ impl Link {
             messages,
             before,
             read_only_reason: None,
+            model: model_identity(result),
         })
         .await;
         if running && let Some(runtime_id) = runtime_id.clone() {
@@ -1626,6 +1877,7 @@ impl Link {
             } else {
                 reason
             }),
+            model: None,
         })
         .await;
     }
@@ -1933,10 +2185,25 @@ fn history_messages(body: &Value, limit: usize) -> Result<Vec<ChatMessage>, Stri
 fn messages_from(rows: &[Value]) -> Vec<ChatMessage> {
     rows.iter()
         .enumerate()
-        .map(|(index, row)| ChatMessage {
-            id: message_id(row, index),
-            role: role_of(row.get("role").and_then(Value::as_str).unwrap_or("")),
-            text: message_text(row),
+        .map(|(index, row)| {
+            let role = role_of(row.get("role").and_then(Value::as_str).unwrap_or(""));
+            let text = if role == Role::Tool {
+                match row
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(name) => format!("Used {name}"),
+                    None => "Tool called".to_string(),
+                }
+            } else {
+                message_text(row)
+            };
+            ChatMessage {
+                id: message_id(row, index),
+                role,
+                text,
+            }
         })
         .collect()
 }
@@ -1981,6 +2248,22 @@ fn role_of(role: &str) -> Role {
         "tool" | "function" => Role::Tool,
         _ => Role::System,
     }
+}
+
+/// The model a create or resume reply reports. `info` carries the live or restored pair;
+/// a lazy reply may only carry the top-level default, which is not proof of this chat.
+fn model_identity(result: &Value) -> Option<ModelIdentity> {
+    let info = result.get("info").unwrap_or(result);
+    ModelIdentity::parse(
+        info.get("provider").and_then(Value::as_str),
+        info.get("model").and_then(Value::as_str),
+    )
+    .or_else(|| {
+        ModelIdentity::parse(
+            result.get("provider").and_then(Value::as_str),
+            result.get("model").and_then(Value::as_str),
+        )
+    })
 }
 
 fn turn_status(status: &str) -> TurnStatus {
@@ -2475,20 +2758,22 @@ mod tests {
     }
 
     #[test]
-    fn history_pages_stay_chronological_and_keep_empty_tool_rows() {
+    fn history_pages_render_messages_and_summarize_tool_results() {
         let body = json!({
             "messages": [
                 {"id": 1, "role": "user", "content": "first"},
-                {"id": 2, "role": "tool", "content": ""},
-                {"id": 3, "role": "assistant", "content": "second"}
+                {"id": 2, "role": "tool", "tool_name": "terminal", "content": "{\"output\":\"private detail\"}"},
+                {"id": 3, "role": "assistant", "content": "## Result\n\n**Done**"},
+                {"id": 4, "role": "tool", "content": "unstructured details"}
             ],
-            "pagination": {"order": "oldest", "returned": 3}
+            "pagination": {"order": "oldest", "returned": 4}
         });
-        let rows = history_messages(&body, 3).unwrap();
+        let rows = history_messages(&body, 4).unwrap();
         assert_eq!(rows[0].text, "first");
         assert_eq!(rows[1].role, Role::Tool);
-        assert_eq!(rows[1].text, "");
-        assert_eq!(rows[2].text, "second");
+        assert_eq!(rows[1].text, "Used terminal");
+        assert_eq!(rows[2].text, "## Result\n\n**Done**");
+        assert_eq!(rows[3].text, "Tool called");
         let latest = json!({
             "messages": [
                 {"id": 1, "role": "assistant", "content": "second"},

@@ -14,6 +14,13 @@
 .hermes-composer { border: 1px solid alpha(@window_fg_color, 0.16); border-radius: 14px; background: @view_bg_color; padding: 10px; }
 .composer-input { font-size: 15px; background: transparent; }
 .composer-hint { font-size: 11px; opacity: 0.5; }
+.model-trigger { padding: 2px 8px; border-radius: 8px; }
+.model-caption { font-size: 12px; font-weight: 600; }
+.model-provider { font-size: 10px; opacity: 0.6; }
+.model-popover .model-row { padding: 6px 8px; border-radius: 7px; min-width: 0; }
+.model-name { font-size: 13px; font-weight: 600; }
+.model-current { background: alpha(@accent_bg_color, 0.14); }
+.picker-status { font-size: 11px; opacity: 0.7; }
 .connection-label { font-size: 12px; }
 .connection-error { color: @error_color; }
 .connection-live { color: @success_color; }

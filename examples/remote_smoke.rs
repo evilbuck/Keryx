@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use hermes_native::backend::{self, Backend};
 use hermes_native::model::{
-    ChatMessage, Command, Config, ConnectionState, Event, Role, TurnStatus,
+    Catalog, ChatMessage, Command, Config, ConnectionState, Event, ModelIdentity, Role, TurnStatus,
 };
 
 const WORD: &str = "lattice";
@@ -55,6 +55,28 @@ fn main() {
     }
 }
 
+fn expect_words(first: &str, second: &str, other: &str) -> Result<(), String> {
+    if first.trim() != WORD {
+        return Err(format!(
+            "first reply was not the expected word (len {})",
+            first.trim().len()
+        ));
+    }
+    if second.trim() != WORD {
+        return Err(format!(
+            "second reply lost context (len {})",
+            second.trim().len()
+        ));
+    }
+    if other.trim() != OTHER {
+        return Err(format!(
+            "second chat reply was not its own word (len {})",
+            other.trim().len()
+        ));
+    }
+    Ok(())
+}
+
 fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, String> {
     if TURN_TWO.to_ascii_lowercase().contains(WORD)
         || TURN_OTHER.to_ascii_lowercase().contains(WORD)
@@ -67,27 +89,10 @@ fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, Strin
     created.push(first.0.clone());
     let second = create(harness, "hn-smoke-b")?;
     created.push(second.0.clone());
-    let first_reply = submit(harness, &first.1, TURN_ONE)?;
-    if first_reply.trim() != WORD {
-        return Err(format!(
-            "first reply was not the expected word (len {})",
-            first_reply.trim().len()
-        ));
-    }
-    let second_reply = submit(harness, &first.1, TURN_TWO)?;
-    if second_reply.trim() != WORD {
-        return Err(format!(
-            "second reply lost context (len {})",
-            second_reply.trim().len()
-        ));
-    }
-    let other_reply = submit(harness, &second.1, TURN_OTHER)?;
-    if other_reply.trim() != OTHER {
-        return Err(format!(
-            "second chat reply was not its own word (len {})",
-            other_reply.trim().len()
-        ));
-    }
+    let first_reply = submit(harness, &first.1, TURN_ONE)?.0;
+    let second_reply = submit(harness, &first.1, TURN_TWO)?.0;
+    let other_reply = submit(harness, &second.1, TURN_OTHER)?.0;
+    expect_words(&first_reply, &second_reply, &other_reply)?;
     let saved = resume(harness, &second.0)?;
     assert_separate(&saved.1, "the second chat")?;
     let resumed = resume(harness, &first.0)?;
@@ -98,9 +103,74 @@ fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, Strin
     let cold_second = resume(harness, &second.0)?;
     assert_context(&cold_first.1)?;
     assert_separate(&cold_second.1, "cold resume of the second chat")?;
+
+    let switched = prove_model_switch(harness, created)?;
     Ok(format!(
-        "connected created=2 turn1={WORD} turn2_context=true second={OTHER} switched=true reconnect_history=true"
+        "connected created=3 turn1={WORD} turn2_context=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
     ))
+}
+
+fn confirm_switch(
+    reply: &str,
+    used: Option<&str>,
+    target: &str,
+    after: Option<&ModelIdentity>,
+    default: &ModelIdentity,
+) -> Result<(), String> {
+    if reply.trim() != OTHER {
+        return Err("the switched chat lost its own word".into());
+    }
+    if used != Some(target) {
+        return Err(format!(
+            "the first inference did not use the chosen model (reported {used:?})"
+        ));
+    }
+    if after != Some(default) {
+        return Err("the switch changed the server default".into());
+    }
+    Ok(())
+}
+
+fn prove_model_switch(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, String> {
+    let before = catalog(harness)?;
+    let default = before
+        .default
+        .clone()
+        .ok_or("the catalog did not report a default model")?;
+    let target = switch_target(&before, &default)?;
+    let switched = create(harness, "hn-smoke-model")?;
+    created.push(switched.0);
+    switch_model(harness, &switched.1, Some(default.clone()), &target)?;
+    let (reply, used) = submit(harness, &switched.1, TURN_OTHER)?;
+    let after = catalog(harness)?;
+    confirm_switch(
+        &reply,
+        used.as_deref(),
+        &target.model,
+        after.default.as_ref(),
+        &default,
+    )?;
+    Ok(target.model)
+}
+
+fn switch_target(before: &Catalog, default: &ModelIdentity) -> Result<ModelIdentity, String> {
+    before
+        .options
+        .iter()
+        .find(|option| {
+            option.selectable()
+                && option.identity.provider == default.provider
+                && option.identity != *default
+        })
+        .or_else(|| {
+            before.options.iter().find(|option| {
+                option.selectable()
+                    && option.identity != *default
+                    && option.identity.provider != default.provider
+            })
+        })
+        .map(|option| option.identity.clone())
+        .ok_or_else(|| "the catalog needs a second selectable model to prove switching".into())
 }
 
 fn cleanup(harness: &mut Harness, created: &[String]) -> Result<(), String> {
@@ -140,7 +210,12 @@ fn delete_one(harness: &mut Harness, id: &str) -> Result<(), String> {
                     session_id,
                     message,
                 } if operation == "delete" && session_id.as_deref() == Some(id) => {
-                    return Err(message);
+                    // A chat that never ran persists no row, so there is nothing left to delete.
+                    return if message.to_ascii_lowercase().contains("session not found") {
+                        Ok(())
+                    } else {
+                        Err(message)
+                    };
                 }
                 event => harness.events.push(event),
             }
@@ -162,6 +237,7 @@ fn create(harness: &mut Harness, title: &str) -> Result<(String, String), String
                 Event::Created {
                     session,
                     runtime_id,
+                    model: _,
                 } if session.title == title => {
                     return Ok((session.stored_id, runtime_id));
                 }
@@ -178,40 +254,154 @@ fn create(harness: &mut Harness, title: &str) -> Result<(String, String), String
     Err("create timed out".into())
 }
 
-fn submit(harness: &mut Harness, runtime_id: &str, text: &str) -> Result<String, String> {
-    harness.send(Command::Submit {
-        runtime_id: runtime_id.into(),
-        text: text.into(),
-    })?;
+fn catalog(harness: &mut Harness) -> Result<Catalog, String> {
+    harness.send(Command::FetchModels)?;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(180) {
+    while start.elapsed() < Duration::from_secs(45) {
         for event in harness.drain() {
             match event {
-                Event::MessageComplete {
-                    runtime_id: id,
-                    message,
-                    status,
-                } if id == runtime_id => {
-                    if status != TurnStatus::Complete {
-                        return Err(format!("turn ended as {status:?}"));
+                Event::Catalog { catalog } => {
+                    if let Some(error) = catalog.error {
+                        return Err(error);
                     }
-                    return Ok(message.text);
-                }
-                Event::Error {
-                    operation,
-                    session_id,
-                    message,
-                } if session_id.as_deref() == Some(runtime_id)
-                    && matches!(operation.as_str(), "submit" | "gateway") =>
-                {
-                    return Err(message);
+                    if catalog.is_empty() {
+                        return Err("the server has no configured models".into());
+                    }
+                    return Ok(catalog);
                 }
                 event => harness.events.push(event),
             }
         }
         std::thread::sleep(Duration::from_millis(30));
     }
+    Err("catalog timed out".into())
+}
+
+fn switch_model(
+    harness: &mut Harness,
+    runtime_id: &str,
+    prime: Option<ModelIdentity>,
+    target: &ModelIdentity,
+) -> Result<(), String> {
+    harness.send(Command::SetModel {
+        runtime_id: runtime_id.into(),
+        prime,
+        target: target.clone(),
+        confirm_expensive: false,
+    })?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(90) {
+        for event in harness.drain() {
+            match event {
+                Event::ModelAck { runtime_id: id, .. } if id == runtime_id => return Ok(()),
+                Event::ModelRejected {
+                    runtime_id: id,
+                    message,
+                } if id == runtime_id => return Err(message),
+                Event::ModelConfirmation {
+                    runtime_id: id,
+                    message,
+                    ..
+                } if id == runtime_id => {
+                    return Err(format!("the switch needed a confirmation: {message}"));
+                }
+                Event::ModelAmbiguous { runtime_id: id } if id == runtime_id => {
+                    return Err("the switch outcome was never reported".into());
+                }
+                event => harness.events.push(event),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("model switch timed out".into())
+}
+
+/// Submit a prompt and return its reply text plus the model the completion reported.
+fn note_submit(
+    event: Event,
+    runtime_id: &str,
+    reply: &mut Option<String>,
+    observed: &mut Option<String>,
+) -> Result<Option<Event>, String> {
+    match event {
+        Event::ModelObserved {
+            runtime_id: id,
+            model,
+        } if id == runtime_id => {
+            *observed = Some(model);
+            Ok(None)
+        }
+        Event::MessageComplete {
+            runtime_id: id,
+            message,
+            status,
+        } if id == runtime_id => {
+            if status != TurnStatus::Complete {
+                return Err(format!("turn ended as {status:?}"));
+            }
+            *reply = Some(message.text);
+            Ok(None)
+        }
+        Event::Error {
+            operation,
+            session_id,
+            message,
+        } if session_id.as_deref() == Some(runtime_id)
+            && matches!(operation.as_str(), "submit" | "gateway") =>
+        {
+            Err(message)
+        }
+        event => Ok(Some(event)),
+    }
+}
+
+fn submit(
+    harness: &mut Harness,
+    runtime_id: &str,
+    text: &str,
+) -> Result<(String, Option<String>), String> {
+    harness.send(Command::Submit {
+        runtime_id: runtime_id.into(),
+        text: text.into(),
+    })?;
+    let start = Instant::now();
+    let mut reply = None;
+    let mut observed = None;
+    while start.elapsed() < Duration::from_secs(180) {
+        for event in harness.drain() {
+            if let Some(event) = note_submit(event, runtime_id, &mut reply, &mut observed)? {
+                harness.events.push(event);
+            }
+        }
+        if let Some(reply) = reply.take() {
+            return Ok((reply, await_observed(harness, runtime_id, observed)));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
     Err("turn timed out; the prompt was not sent again".into())
+}
+
+fn await_observed(
+    harness: &mut Harness,
+    runtime_id: &str,
+    mut observed: Option<String>,
+) -> Option<String> {
+    let settle = Instant::now();
+    while observed.is_none() && settle.elapsed() < Duration::from_secs(5) {
+        for event in harness.drain() {
+            match event {
+                Event::ModelObserved {
+                    runtime_id: id,
+                    model,
+                } if id == runtime_id => {
+                    observed = Some(model);
+                }
+                event => harness.events.push(event),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    observed
 }
 
 fn resume(harness: &mut Harness, stored_id: &str) -> Result<(String, Vec<ChatMessage>), String> {

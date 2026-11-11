@@ -26,6 +26,17 @@ struct Ui {
     activity: gtk::Label,
     spinner: gtk::Spinner,
     editor: gtk::TextView,
+    model_menu: gtk::MenuButton,
+    model_label: gtk::Label,
+    model_provider: gtk::Label,
+    model_current: Rc<RefCell<Option<ModelIdentity>>>,
+    model_popover: gtk::Popover,
+    model_search: gtk::SearchEntry,
+    model_results: gio::ListStore,
+    model_list: gtk::ListView,
+    model_selection: gtk::SingleSelection,
+    model_status: gtk::Label,
+    model_pending: RefCell<Option<PendingModel>>,
     send: gtk::Button,
     stop: gtk::Button,
     new_chat: gtk::Button,
@@ -44,6 +55,76 @@ struct Ui {
     select_created: Cell<bool>,
     suppress_selection: Cell<bool>,
     sequence: Cell<u64>,
+}
+
+/// A switch awaiting an explicit confirmation, kept so the retry repeats the same target.
+struct PendingModel {
+    stored_id: String,
+    runtime_id: String,
+    target: ModelIdentity,
+    prime: Option<ModelIdentity>,
+}
+
+/// The collapsed trigger caption. Never claims an unconfirmed pair.
+fn model_caption(model: &ModelState) -> String {
+    match model {
+        ModelState::Unknown => "Choose a model".into(),
+        ModelState::Confirmed(identity) => identity.model.clone(),
+        ModelState::Switching { target, .. } => format!("Switching to {}…", target.model),
+        ModelState::Queued { target, .. } => format!("{} · next turn", target.model),
+        ModelState::Unresolved(Some(identity)) => format!("{} · unconfirmed", identity.model),
+        ModelState::Unresolved(None) => "Model unconfirmed".into(),
+    }
+}
+
+fn provider_name(identity: &ModelIdentity, catalog: &Catalog) -> String {
+    catalog
+        .options
+        .iter()
+        .find(|option| &option.identity == identity)
+        .map_or_else(
+            || identity.provider.clone(),
+            |option| option.provider_name.clone(),
+        )
+}
+
+/// The provider line under the model. Empty while nothing is known.
+fn model_provider_line(model: &ModelState, catalog: &Catalog) -> String {
+    match model {
+        ModelState::Unknown => "server default".into(),
+        ModelState::Confirmed(identity) | ModelState::Unresolved(Some(identity)) => {
+            provider_name(identity, catalog)
+        }
+        ModelState::Switching { target, .. } | ModelState::Queued { target, .. } => {
+            provider_name(target, catalog)
+        }
+        ModelState::Unresolved(None) => "unconfirmed".into(),
+    }
+}
+
+fn model_tooltip(model: &ModelState, catalog: &Catalog) -> String {
+    match model {
+        ModelState::Unknown => "Choose the model for this conversation".into(),
+        ModelState::Confirmed(identity) => format!(
+            "{} · {}\nChanging this affects only this conversation.",
+            identity.model,
+            provider_name(identity, catalog)
+        ),
+        ModelState::Switching { target, .. } => format!("Switching to {} …", target.model),
+        ModelState::Queued { target, .. } => format!(
+            "{} · {}\nApplies from the next message; the running turn keeps its model.",
+            target.model,
+            provider_name(target, catalog)
+        ),
+        ModelState::Unresolved(Some(identity)) => format!(
+            "{} · {}\nThe last change was never confirmed. Pick again to be sure.",
+            identity.model,
+            provider_name(identity, catalog)
+        ),
+        ModelState::Unresolved(None) => {
+            "The last change was never confirmed. Pick again to be sure.".into()
+        }
+    }
 }
 
 pub fn build(app: &adw::Application, config: Result<Config, String>) {
@@ -304,6 +385,65 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         .child(&editor)
         .build();
     composer.append(&editor_scroll);
+    let model_menu = gtk::MenuButton::new();
+    model_menu.add_css_class("flat");
+    model_menu.add_css_class("model-trigger");
+    model_menu.update_property(&[gtk::accessible::Property::Label("Model")]);
+    let trigger = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    let model_label = gtk::Label::new(Some("Choose a model"));
+    model_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    model_label.set_max_width_chars(38);
+    model_label.set_xalign(0.0);
+    model_label.add_css_class("model-caption");
+    trigger.append(&model_label);
+    let model_provider = gtk::Label::new(Some("server default"));
+    model_provider.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    model_provider.set_max_width_chars(38);
+    model_provider.set_xalign(0.0);
+    model_provider.add_css_class("model-provider");
+    trigger.append(&model_provider);
+    model_menu.set_child(Some(&trigger));
+
+    let model_popover = gtk::Popover::new();
+    model_popover.add_css_class("model-popover");
+    let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    set_margins(&panel, 10);
+    panel.set_width_request(380);
+    let model_search = gtk::SearchEntry::new();
+    model_search.set_placeholder_text(Some("Search provider or model"));
+    model_search.update_property(&[gtk::accessible::Property::Label("Search models")]);
+    panel.append(&model_search);
+    let model_status = gtk::Label::new(Some("Loading models…"));
+    model_status.set_xalign(0.0);
+    model_status.set_wrap(true);
+    model_status.add_css_class("picker-status");
+    panel.append(&model_status);
+    let model_results = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let model_selection = gtk::SingleSelection::new(Some(model_results.clone()));
+    model_selection.set_autoselect(false);
+    model_selection.set_can_unselect(true);
+    let model_factory = gtk::SignalListItemFactory::new();
+    let current_model = Rc::new(RefCell::new(None::<ModelIdentity>));
+    let current_for_factory = Rc::clone(&current_model);
+    model_factory.connect_bind(move |_, object| {
+        bind_model_row(current_for_factory.as_ref(), object);
+    });
+    let model_list = gtk::ListView::new(Some(model_selection.clone()), Some(model_factory));
+    // Hover must never choose a model; only an explicit activation commits.
+    model_list.set_single_click_activate(false);
+    model_list.add_css_class("model-list");
+    let model_scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(200)
+        .max_content_height(320)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&model_list)
+        .build();
+    panel.append(&model_scroll);
+    model_popover.set_child(Some(&panel));
+    model_menu.set_popover(Some(&model_popover));
+    let model_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    model_row.append(&model_menu);
+    composer.append(&model_row);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let hint = gtk::Label::new(Some("Enter to send · Shift+Enter for a new line"));
     hint.set_xalign(0.0);
@@ -363,6 +503,17 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         activity,
         spinner,
         editor,
+        model_menu,
+        model_label,
+        model_provider,
+        model_current: current_model,
+        model_popover,
+        model_search,
+        model_results,
+        model_list,
+        model_selection,
+        model_status,
+        model_pending: RefCell::new(None),
         send,
         stop,
         new_chat,
@@ -419,6 +570,136 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+fn bind_model_row(current: &RefCell<Option<ModelIdentity>>, object: &glib::Object) {
+    let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
+    let value = item
+        .item()
+        .and_downcast::<glib::BoxedAnyObject>()
+        .expect("model item");
+    let option = value.borrow::<ModelOption>();
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.add_css_class("model-row");
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    text.set_hexpand(true);
+    let model = gtk::Label::new(Some(&option.identity.model));
+    model.set_xalign(0.0);
+    model.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    model.add_css_class("model-name");
+    text.append(&model);
+    let provider = gtk::Label::new(Some(&option.provider_name));
+    provider.set_xalign(0.0);
+    provider.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    provider.add_css_class("model-provider");
+    text.append(&provider);
+    row.append(&text);
+    if !option.selectable() {
+        let note = gtk::Label::new(Some("unavailable"));
+        note.add_css_class("model-provider");
+        row.append(&note);
+    }
+    if current
+        .borrow()
+        .as_ref()
+        .is_some_and(|shown| *shown == option.identity)
+    {
+        row.add_css_class("model-current");
+        row.append(&gtk::Image::from_icon_name("object-select-symbolic"));
+    }
+    item.set_child(Some(&row));
+}
+
+fn connect_model_picker(ui: &Rc<Ui>) {
+    let weak = Rc::downgrade(ui);
+    ui.model_search.connect_search_changed(move |_| {
+        weak.upgrade().inspect(|ui| ui.refresh_model_results());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.model_search.connect_activate(move |_| {
+        weak.upgrade().inspect(|ui| ui.commit_model_selection());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.model_search.connect_stop_search(move |_| {
+        weak.upgrade().inspect(|ui| {
+            ui.model_popover.popdown();
+            ui.editor.grab_focus();
+        });
+    });
+    let arrows = gtk::EventControllerKey::new();
+    let weak = Rc::downgrade(ui);
+    arrows.connect_key_pressed(move |_, key, _, _| model_arrow(weak.upgrade().as_ref(), key));
+    ui.model_search.add_controller(arrows);
+    let weak = Rc::downgrade(ui);
+    ui.model_menu
+        .connect_notify_local(Some("active"), move |menu, _| {
+            open_model_picker(weak.upgrade().as_ref(), menu.is_active());
+        });
+    let weak = Rc::downgrade(ui);
+    ui.model_results.connect_items_changed(move |_, _, _, _| {
+        weak.upgrade().inspect(|ui| select_first_model(ui));
+    });
+    let weak = Rc::downgrade(ui);
+    ui.model_list.connect_activate(move |_, _| {
+        weak.upgrade().inspect(|ui| ui.commit_model_selection());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.model_popover.connect_show(move |_| {
+        weak.upgrade().inspect(|ui| {
+            ui.refresh_model_results();
+            ui.model_search.grab_focus();
+        });
+    });
+}
+
+fn model_arrow(ui: Option<&Rc<Ui>>, key: gdk::Key) -> glib::Propagation {
+    let step = match key {
+        gdk::Key::Down | gdk::Key::KP_Down => 1,
+        gdk::Key::Up | gdk::Key::KP_Up => -1,
+        _ => return glib::Propagation::Proceed,
+    };
+    let Some(ui) = ui else {
+        return glib::Propagation::Proceed;
+    };
+    move_model_highlight(ui, step);
+    glib::Propagation::Stop
+}
+
+fn move_model_highlight(ui: &Ui, step: i64) {
+    let count = i64::from(ui.model_selection.n_items());
+    if count == 0 {
+        return;
+    }
+    let current = ui.model_selection.selected();
+    let current = if current == gtk::INVALID_LIST_POSITION {
+        0
+    } else {
+        i64::from(current)
+    };
+    let next = (current + step).clamp(0, count - 1);
+    ui.model_selection.set_selected(next as u32);
+    ui.model_list
+        .scroll_to(next as u32, gtk::ListScrollFlags::NONE, None);
+}
+
+fn open_model_picker(ui: Option<&Rc<Ui>>, active: bool) {
+    if !active {
+        return;
+    }
+    let Some(ui) = ui else {
+        return;
+    };
+    ui.model_search.set_text("");
+    ui.refresh_model_results();
+    ui.model_search.grab_focus();
+}
+
+fn select_first_model(ui: &Ui) {
+    if ui.model_selection.n_items() > 0
+        && ui.model_selection.selected() == gtk::INVALID_LIST_POSITION
+    {
+        ui.model_selection.set_selected(0);
+    }
 }
 
 fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click: &Rc<Cell<bool>>) {
@@ -626,6 +907,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
         glib::Propagation::Proceed
     });
     ui.window.add_controller(shortcuts);
+    connect_model_picker(ui);
     let adjustment = ui.transcript.vadjustment();
     let weak = Rc::downgrade(ui);
     adjustment.connect_value_changed(move |adjustment| {
@@ -763,13 +1045,252 @@ impl Ui {
         self.refresh();
     }
 
-    fn apply(&self, event: Event) {
+    /// Rebuild the result list from the cached catalog and current query. No network.
+    fn refresh_model_results(&self) {
+        let (options, status) = {
+            let state = self.state.borrow();
+            let catalog = &state.catalog;
+            let query = self.model_search.text().to_string();
+            let options: Vec<glib::BoxedAnyObject> = catalog
+                .search(&query)
+                .into_iter()
+                .filter_map(|index| catalog.options.get(index))
+                .cloned()
+                .map(glib::BoxedAnyObject::new)
+                .collect();
+            let status = if let Some(error) = &catalog.error {
+                error.clone()
+            } else if catalog.loading {
+                "Loading models…".into()
+            } else if catalog.is_empty() {
+                "No models are configured on this server.".into()
+            } else if options.is_empty() {
+                "No model matches that search.".into()
+            } else {
+                String::new()
+            };
+            (options, status)
+        };
+        self.model_results
+            .splice(0, self.model_results.n_items(), &options);
+        self.model_status.set_text(&status);
+        self.model_status.set_visible(!status.is_empty());
+    }
+
+    fn commit_model_selection(&self) {
+        let Some(selected) = self.model_selection.selected_item() else {
+            return;
+        };
+        let Some(value) = selected.downcast::<glib::BoxedAnyObject>().ok() else {
+            return;
+        };
+        let (identity, selectable) = {
+            let option = value.borrow::<ModelOption>();
+            (option.identity.clone(), option.selectable())
+        };
+        if !selectable {
+            self.model_status
+                .set_text("This catalog entry cannot be sent to the gateway.");
+            self.model_status.set_visible(true);
+            return;
+        }
+        self.model_popover.popdown();
+        self.editor.grab_focus();
+        self.choose_model(identity, false);
+    }
+
+    /// Ask the backend to switch the open conversation. `confirm` is only ever true after
+    /// the user accepted an explicit confirmation prompt.
+    fn choose_model(&self, target: ModelIdentity, confirm: bool) {
+        let request = {
+            let state = self.state.borrow();
+            let Some(stored) = state.selected.clone() else {
+                return;
+            };
+            let Some(conversation) = state.conversations.get(&stored) else {
+                return;
+            };
+            // An unresolved earlier attempt must be settled before another one starts.
+            if conversation.read_only_reason.is_some() || conversation.model.switching() {
+                return;
+            }
+            let Some(runtime) = conversation.runtime_id.clone() else {
+                return;
+            };
+            // A chat that never ran has no agent yet: the gateway's scoped switch would be
+            // acknowledged without taking effect, so the conversation's own pair primes it
+            // first. A chat that already ran is initialized.
+            let prime = if conversation.messages.is_empty() {
+                conversation.model.confirmed().cloned()
+            } else {
+                None
+            };
+            (stored, runtime, prime)
+        };
+        let (stored, runtime, prime) = request;
+        if !self.command(Command::SetModel {
+            runtime_id: runtime.clone(),
+            prime: prime.clone(),
+            target: target.clone(),
+            confirm_expensive: confirm,
+        }) {
+            return;
+        }
+        if let Some(conversation) = self.state.borrow_mut().conversations.get_mut(&stored) {
+            conversation.begin_model_switch(target.clone());
+        }
+        *self.model_pending.borrow_mut() = Some(PendingModel {
+            stored_id: stored,
+            runtime_id: runtime,
+            target,
+            prime,
+        });
+        self.refresh();
+        // Rebind the rows so the current-pair mark follows the request.
+        self.refresh_model_results();
+    }
+
+    /// The gateway wants an explicit confirmation. Nothing changed yet.
+    fn ask_model_confirmation(self: &Rc<Self>, runtime_id: &str, message: String) {
+        let pending = self
+            .model_pending
+            .borrow()
+            .as_ref()
+            .filter(|pending| pending.runtime_id == runtime_id)
+            .map(|pending| PendingModel {
+                stored_id: pending.stored_id.clone(),
+                runtime_id: pending.runtime_id.clone(),
+                target: pending.target.clone(),
+                prime: pending.prime.clone(),
+            });
+        let Some(pending) = pending else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(Some("Use this model?"), Some(&message));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("switch", "Switch");
+        dialog.set_response_appearance("switch", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |dialog, response| {
+            if response != "switch" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let _ = &pending.prime;
+            ui.choose_model(pending.target.clone(), true);
+            let _ = dialog;
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn apply_model(self: &Rc<Self>, event: &Event) -> bool {
+        match event {
+            Event::Catalog { catalog } => {
+                self.state.borrow_mut().catalog = catalog.clone();
+                self.refresh_model_results();
+            }
+            Event::ModelAck {
+                runtime_id,
+                resolved,
+                deferred,
+            } => {
+                let primed = self.model_pending.borrow().as_ref().is_some_and(|pending| {
+                    pending.runtime_id == *runtime_id && pending.prime.is_some()
+                });
+                self.settle_model(runtime_id, |conversation| {
+                    conversation.model_acknowledged(resolved.clone(), *deferred, !primed);
+                });
+            }
+            Event::ModelRejected {
+                runtime_id,
+                message,
+            } => {
+                self.settle_model(runtime_id, |conversation| conversation.model_rejected());
+                self.state.borrow_mut().notice = message.clone();
+            }
+            Event::ModelConfirmation {
+                runtime_id,
+                message,
+                ..
+            } => {
+                self.settle_model(runtime_id, |conversation| conversation.model_rejected());
+                self.ask_model_confirmation(runtime_id, message.clone());
+            }
+            Event::ModelAmbiguous { runtime_id } => {
+                self.settle_model(runtime_id, |conversation| conversation.model_ambiguous());
+                self.state.borrow_mut().notice = "The model change was accepted for delivery but never answered. It stays unconfirmed and will not be retried.".into();
+            }
+            Event::ModelObserved { runtime_id, model } => {
+                let identity = self.state.borrow().catalog.identity_for_model(model);
+                if let Some(identity) = identity {
+                    self.settle_model(runtime_id, |conversation| {
+                        conversation.observe_model(identity)
+                    });
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn settle_model(&self, runtime_id: &str, update: impl FnOnce(&mut Conversation)) {
+        *self.model_pending.borrow_mut() = None;
+        if let Some(conversation) = self
+            .state
+            .borrow_mut()
+            .conversation_for_runtime_mut(runtime_id)
+        {
+            update(conversation);
+        }
+    }
+
+    fn note_created(
+        &self,
+        session: SessionSummary,
+        runtime_id: String,
+        model: Option<ModelIdentity>,
+    ) {
+        let id = session.stored_id.clone();
+        {
+            let mut state = self.state.borrow_mut();
+            state.sessions.insert(0, session);
+            state.conversations.insert(
+                id.clone(),
+                Conversation {
+                    runtime_id: Some(runtime_id),
+                    loaded: true,
+                    ..Default::default()
+                },
+            );
+            if let Some(model) = model
+                && let Some(conversation) = state.conversations.get_mut(&id)
+            {
+                conversation.confirm_model(model);
+            }
+            state.creating = false;
+        }
+        self.refresh_sessions();
+        if self.select_created.replace(false) {
+            self.select(&id, true);
+        }
+    }
+
+    fn apply(self: &Rc<Self>, event: Event) {
+        if self.apply_model(&event) {
+            return;
+        }
         let mut state = self.state.borrow_mut();
         match event {
             Event::Connection(connection) => {
                 let connected = connection == ConnectionState::Connected;
                 if !connected {
                     state.disconnect();
+                    // A catalog belongs to one connection; keep no stale rows across a reconnect.
+                    state.catalog = Catalog::default();
                     self.pending_resumes.borrow_mut().clear();
                 }
                 state.connection = Some(connection);
@@ -803,23 +1324,10 @@ impl Ui {
             Event::Created {
                 session,
                 runtime_id,
+                model,
             } => {
-                let id = session.stored_id.clone();
-                state.sessions.insert(0, session);
-                state.conversations.insert(
-                    id.clone(),
-                    Conversation {
-                        runtime_id: Some(runtime_id),
-                        loaded: true,
-                        ..Default::default()
-                    },
-                );
-                state.creating = false;
                 drop(state);
-                self.refresh_sessions();
-                if self.select_created.replace(false) {
-                    self.select(&id, true);
-                }
+                self.note_created(session, runtime_id, model);
             }
             Event::Resumed {
                 stored_id,
@@ -827,6 +1335,7 @@ impl Ui {
                 messages,
                 before,
                 read_only_reason,
+                model,
             } => {
                 self.pending_resumes.borrow_mut().remove(&stored_id);
                 let c = state.conversations.entry(stored_id).or_default();
@@ -839,6 +1348,9 @@ impl Ui {
                 c.status = TurnStatus::Idle;
                 c.activity.clear();
                 c.interaction = None;
+                // Resume metadata is the restored stored pair; it replaces any stale claim.
+                c.model = model.map_or(ModelState::Unknown, ModelState::Confirmed);
+                *self.model_pending.borrow_mut() = None;
                 c.revision += 1;
             }
             Event::History {
@@ -943,6 +1455,7 @@ impl Ui {
                     }
                 }
             }
+            _ => {}
         }
     }
 
@@ -1096,6 +1609,23 @@ impl Ui {
         self.refresh_controls();
     }
 
+    fn refresh_model_trigger(
+        &self,
+        conversation: Option<&Conversation>,
+        catalog: &Catalog,
+        writable: bool,
+    ) {
+        let model = conversation.map_or(&ModelState::Unknown, |c| &c.model);
+        self.model_label.set_text(&model_caption(model));
+        self.model_provider
+            .set_text(&model_provider_line(model, catalog));
+        self.model_menu
+            .set_tooltip_text(Some(&model_tooltip(model, catalog)));
+        self.model_menu
+            .set_sensitive(writable && !model.switching());
+        *self.model_current.borrow_mut() = model.confirmed().or_else(|| model.target()).cloned();
+    }
+
     fn refresh_controls(&self) {
         let state = self.state.borrow();
         let connected = state.connection.as_ref() == Some(&ConnectionState::Connected);
@@ -1130,6 +1660,7 @@ impl Ui {
             self.backend.is_some()
                 && !matches!(state.connection, Some(ConnectionState::Connecting)),
         );
+        self.refresh_model_trigger(conversation, &state.catalog, writable);
         self.connection.remove_css_class("connection-live");
         self.connection.remove_css_class("connection-error");
         match &state.connection {
@@ -1556,4 +2087,74 @@ fn is_primary_button(event: &gdk::Event, kind: gdk::EventType) -> bool {
         && event
             .downcast_ref::<gdk::ButtonEvent>()
             .is_some_and(|button| button.button() == gdk::BUTTON_PRIMARY)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(model: &str) -> ModelIdentity {
+        ModelIdentity {
+            provider: "custom:acme".into(),
+            model: model.into(),
+        }
+    }
+
+    fn catalog() -> Catalog {
+        Catalog::parse(&serde_json::json!({"providers": [
+            {"slug": "acme", "name": "Acme", "is_user_defined": true, "models": ["one", "two"]}
+        ]}))
+        .expect("catalog")
+    }
+
+    #[test]
+    fn trigger_text_never_claims_an_unconfirmed_selection() {
+        let catalog = catalog();
+        assert_eq!(model_caption(&ModelState::Unknown), "Choose a model");
+        assert_eq!(
+            model_provider_line(&ModelState::Unknown, &catalog),
+            "server default"
+        );
+        assert_eq!(model_caption(&ModelState::Confirmed(pair("one"))), "one");
+        assert_eq!(
+            model_provider_line(&ModelState::Confirmed(pair("one")), &catalog),
+            "Acme"
+        );
+        assert_eq!(
+            model_caption(&ModelState::Switching {
+                from: Some(pair("one")),
+                target: pair("two")
+            }),
+            "Switching to two…"
+        );
+        assert_eq!(
+            model_caption(&ModelState::Queued {
+                from: Some(pair("one")),
+                target: pair("two")
+            }),
+            "two · next turn"
+        );
+        assert_eq!(
+            model_caption(&ModelState::Unresolved(None)),
+            "Model unconfirmed"
+        );
+        assert_eq!(
+            model_caption(&ModelState::Unresolved(Some(pair("one")))),
+            "one · unconfirmed"
+        );
+    }
+
+    #[test]
+    fn queued_switch_says_it_applies_from_the_next_message() {
+        let catalog = catalog();
+        let tooltip = model_tooltip(
+            &ModelState::Queued {
+                from: Some(pair("one")),
+                target: pair("two"),
+            },
+            &catalog,
+        );
+        assert!(tooltip.contains("next message"), "{tooltip}");
+        assert!(tooltip.contains("Acme"), "{tooltip}");
+    }
 }

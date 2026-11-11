@@ -1,0 +1,42 @@
+{
+  "version": 2,
+  "enforcement": {
+    "unit_test_gate": "required",
+    "functional_test_gate": "advisory",
+    "lint_gate": "advisory",
+    "patch_gate": "disabled",
+    "global_ratchet": "required",
+    "complexity_gate": "required"
+  },
+  "targets": {
+    "coverage_min": 60,
+    "coverage_target": 75,
+    "cyclomatic_max": 10,
+    "cyclomatic_hard_ceiling": 15,
+    "patch_coverage_min": 90
+  },
+  "ratchet": {
+    "baseline_coverage": 39.5,
+    "baseline_complexity_inventory": [],
+    "complexity_baseline_file": ".guardrails/complexity-baseline.json",
+    "baseline_lint_clean": true
+  },
+  "ecosystems": [
+    {
+      "name": "rust",
+      "detected": true,
+      "test_runner": "cargo test",
+      "coverage_tool": ".guardrails/coverage.sh",
+      "coverage_format": "lcov",
+      "complexity_tool": "lizard",
+      "complexity_cmd": "lizard -C 10 -w --csv -x \"*/.git/*\" -x \"*/.context/*\" -x \"*/.venv/*\" -x \"*/coverage/*\" -x \"*/dist/*\" -x \"*/build/*\" -x \"*/node_modules/*\" -x \"*/vendor/*\" -x \"*/target/*\" -x \"*/.next/*\" -x \"*/.nuxt/*\" -x \"*/.turbo/*\" .",
+      "lint_cmd": "cargo clippy --all-targets -- -D warnings",
+      "lint_accepts_paths": false,
+      "functional_test_cmd": "cargo run --release --example remote_smoke -- --trusted-tunnel",
+      "configured_not_installed": [],
+      "detection_signals": ["Cargo.toml", "*.rs"]
+    }
+  ],
+  "git_compare_branch": null,
+  "complexity_baseline": []
+}

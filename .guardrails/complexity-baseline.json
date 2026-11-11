@@ -1,0 +1,72 @@
+[
+  {
+    "file": "src/model.rs",
+    "function": "validate_url",
+    "complexity": 11
+  },
+  {
+    "file": "src/ui.rs",
+    "function": "build",
+    "complexity": 14
+  },
+  {
+    "file": "src/ui.rs",
+    "function": "connect_actions",
+    "complexity": 24
+  },
+  {
+    "file": "src/ui.rs",
+    "function": "apply",
+    "complexity": 20
+  },
+  {
+    "file": "src/ui.rs",
+    "function": "refresh",
+    "complexity": 17
+  },
+  {
+    "file": "src/ui.rs",
+    "function": "refresh_controls",
+    "complexity": 13
+  },
+  {
+    "file": "src/ui.rs",
+    "function": "collect_clarification",
+    "complexity": 14
+  },
+  {
+    "file": "src/markdown.rs",
+    "function": "nested_lists_quotes_and_tables_keep_boundaries",
+    "complexity": 17
+  },
+  {
+    "file": "src/backend.rs",
+    "function": "connect",
+    "complexity": 13
+  },
+  {
+    "file": "src/backend.rs",
+    "function": "handle",
+    "complexity": 13
+  },
+  {
+    "file": "src/backend.rs",
+    "function": "on_event",
+    "complexity": 15
+  },
+  {
+    "file": "src/backend.rs",
+    "function": "maintain",
+    "complexity": 11
+  },
+  {
+    "file": "examples/remote_smoke.rs",
+    "function": "run",
+    "complexity": 23
+  },
+  {
+    "file": "examples/remote_smoke.rs",
+    "function": "assert_context",
+    "complexity": 12
+  }
+]
