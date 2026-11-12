@@ -1,9 +1,32 @@
 .hermes-sidebar { background: @sidebar_bg_color; }
 .hermes-brand { font-size: 18px; font-weight: 800; letter-spacing: 3px; }
 .hermes-caption { font-size: 11px; letter-spacing: 1px; opacity: 0.58; }
-.session-row { padding: 13px 16px; border-radius: 10px; }
+.session-row { padding: 11px 14px; border-radius: 10px; }
 .session-title { font-weight: 600; }
-.session-meta { font-size: 11px; opacity: 0.58; }
+.session-meta { font-size: 11px; opacity: 0.62; }
+.palette-trigger { padding: 4px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.05); }
+.palette-trigger:hover { background: alpha(@window_fg_color, 0.10); }
+.palette-trigger-label { font-size: 12px; font-weight: 600; }
+.kbd-badge { font-family: monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 5px; background: alpha(@window_fg_color, 0.08); border: 1px solid alpha(@window_fg_color, 0.14); opacity: 0.85; }
+.triage-bar { background: alpha(@window_fg_color, 0.05); border-radius: 9px; padding: 3px; }
+.triage-pill { font-size: 11px; font-weight: 700; padding: 4px 6px; border-radius: 7px; min-height: 24px; opacity: 0.72; }
+.triage-pill:checked { background: alpha(@accent_bg_color, 0.24); color: @accent_color; opacity: 1; }
+.sidebar-search { min-height: 30px; font-size: 12px; border-radius: 8px; }
+.triage-empty { font-size: 12px; opacity: 0.58; padding: 8px 4px; }
+.source-badge { font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: 0.6px; padding: 1px 6px; border-radius: 5px; background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.source-auto { background: alpha(@warning_color, 0.15); color: @warning_color; }
+.shortcut-strip { margin-top: 6px; }
+.shortcut-chip { padding: 4px 8px; border-radius: 8px; background: alpha(@window_fg_color, 0.04); }
+.shortcut-desc { font-size: 11px; opacity: 0.68; }
+.palette-search { font-size: 14px; min-height: 36px; border-radius: 10px; }
+.palette-list { background: transparent; }
+.palette-row { padding: 9px 12px; border-radius: 9px; }
+.palette-row-active { background: alpha(@accent_bg_color, 0.12); }
+.palette-icon { opacity: 0.8; }
+.palette-title { font-size: 13px; font-weight: 600; }
+.palette-subtitle { font-size: 11px; opacity: 0.62; }
+.palette-destructive { color: @error_color; }
+.palette-footer { padding-top: 6px; border-top: 1px solid alpha(@window_fg_color, 0.08); }
 .hermes-transcript { background: @window_bg_color; }
 .message { padding: 16px 12px; border-radius: 12px; }
 .message-user { background: alpha(@accent_bg_color, 0.12); }

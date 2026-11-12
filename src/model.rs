@@ -84,7 +84,7 @@ pub enum ConnectionState {
     AuthenticationFailed(String),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionSummary {
     pub stored_id: String,
     pub title: String,
@@ -92,6 +92,129 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub read_only_reason: Option<String>,
     pub message_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionFilter {
+    #[default]
+    All,
+    Chats,
+    Auto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    Interactive,
+    Automated,
+}
+
+pub fn classify_source(source: &str) -> SourceKind {
+    let trimmed = source.trim();
+    let automated = [
+        "cron",
+        "heartbeat",
+        "webhook",
+        "schedule",
+        "scheduler",
+        "kanban",
+        "subagent",
+        "background",
+    ]
+    .iter()
+    .any(|candidate| trimmed.eq_ignore_ascii_case(candidate));
+    if automated {
+        SourceKind::Automated
+    } else {
+        SourceKind::Interactive
+    }
+}
+
+impl SessionFilter {
+    pub fn matches(&self, session: &SessionSummary) -> bool {
+        match self {
+            Self::All => true,
+            Self::Chats => classify_source(&session.source) == SourceKind::Interactive,
+            Self::Auto => classify_source(&session.source) == SourceKind::Automated,
+        }
+    }
+}
+
+pub fn source_badge(source: &str) -> String {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return "CHAT".into();
+    }
+    if trimmed.eq_ignore_ascii_case("api_server") {
+        return "API".into();
+    }
+    trimmed.chars().take(10).collect::<String>().to_uppercase()
+}
+
+pub fn format_relative_age(updated_at: &str, now_epoch_secs: i64) -> Option<String> {
+    let raw = updated_at
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .map(|f| f as i64)?;
+    let epoch = if raw > 1_000_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    };
+    let delta = (now_epoch_secs - epoch).max(0);
+    Some(relative_bucket(delta))
+}
+
+fn relative_bucket(delta: i64) -> String {
+    if delta < 60 {
+        "just now".into()
+    } else if delta < 3_600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86_400 {
+        format!("{}h ago", delta / 3_600)
+    } else if delta < 604_800 {
+        format!("{}d ago", delta / 86_400)
+    } else {
+        format!("{}w ago", delta / 604_800)
+    }
+}
+
+pub fn session_meta_line(session: &SessionSummary, now_epoch_secs: i64) -> String {
+    let mut parts = vec![message_count_label(session.message_count)];
+    if let Some(age) = format_relative_age(&session.updated_at, now_epoch_secs) {
+        parts.push(age);
+    }
+    if session.read_only_reason.is_some() {
+        parts.push("read-only".into());
+    }
+    parts.join(" · ")
+}
+
+fn message_count_label(count: usize) -> String {
+    match count {
+        0 => "empty".into(),
+        1 => "1 msg".into(),
+        many => format!("{many} msgs"),
+    }
+}
+
+pub fn derive_launch_title(prompt: &str) -> String {
+    let first = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let cleaned = first.trim_start_matches(['#', '>', '-', '*', ' ']).trim();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "New conversation".into();
+    }
+    if collapsed.chars().count() <= 48 {
+        return collapsed;
+    }
+    let prefix: String = collapsed.chars().take(47).collect();
+    format!("{}…", prefix.trim_end())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,31 +484,18 @@ impl Catalog {
     /// Indices in display order. An empty query keeps catalog order; otherwise every
     /// whitespace-separated token must match, ranked by contiguity then position.
     pub fn search(&self, query: &str) -> Vec<usize> {
-        let tokens: Vec<String> = query
-            .split_whitespace()
-            .map(normalize)
-            .filter(|token| !token.is_empty())
-            .collect();
+        let tokens = query_tokens(query);
         if tokens.is_empty() {
             return (0..self.options.len()).collect();
         }
-        let mut ranked: Vec<(usize, usize)> = Vec::new();
-        for (index, option) in self.options.iter().enumerate() {
-            let mut total = 0usize;
-            let mut matched = true;
-            for token in &tokens {
-                match token_score(&option.search_key, token) {
-                    Some(score) => total += score,
-                    None => {
-                        matched = false;
-                        break;
-                    }
-                }
-            }
-            if matched {
-                ranked.push((total, index));
-            }
-        }
+        let mut ranked: Vec<(usize, usize)> = self
+            .options
+            .iter()
+            .enumerate()
+            .filter_map(|(index, option)| {
+                match_tokens(&option.search_key, &tokens).map(|score| (score, index))
+            })
+            .collect();
         ranked.sort_by_key(|&(score, index)| (score, index));
         ranked.into_iter().map(|(_, index)| index).collect()
     }
@@ -401,6 +511,22 @@ impl Catalog {
     pub fn is_empty(&self) -> bool {
         self.options.is_empty()
     }
+}
+
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(normalize)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn match_tokens(haystack: &str, tokens: &[String]) -> Option<usize> {
+    let mut total = 0usize;
+    for token in tokens {
+        total += token_score(haystack, token)?;
+    }
+    Some(total)
 }
 
 fn normalize(text: &str) -> String {
@@ -599,6 +725,11 @@ pub enum Event {
     },
     Deleted {
         stored_id: String,
+    },
+    /// Live title update broadcast by the gateway for a conversation.
+    SessionTitle {
+        session_id: String,
+        title: String,
     },
     /// The configured catalog, or the failure that prevented loading it.
     Catalog {
@@ -900,6 +1031,57 @@ impl Conversation {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaletteAction {
+    NewChat,
+    SwitchModel,
+    ToggleSidebar,
+    FocusFilter,
+    FilterSessions(SessionFilter),
+    ReloadHistory,
+    LoadMoreSessions,
+    Reconnect,
+    DeleteCurrent,
+    OpenSession(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaletteEntry {
+    pub action: PaletteAction,
+    pub icon: &'static str,
+    pub title: String,
+    pub subtitle: String,
+    pub shortcut: &'static str,
+    pub badge: String,
+    pub active: bool,
+    pub destructive: bool,
+}
+
+impl PaletteEntry {
+    fn command(
+        action: PaletteAction,
+        icon: &'static str,
+        title: impl Into<String>,
+        subtitle: impl Into<String>,
+        shortcut: &'static str,
+    ) -> Self {
+        Self {
+            action,
+            icon,
+            title: title.into(),
+            subtitle: subtitle.into(),
+            shortcut,
+            badge: String::new(),
+            active: false,
+            destructive: false,
+        }
+    }
+
+    fn search_key(&self) -> String {
+        normalize(&format!("{} {} {}", self.title, self.subtitle, self.badge))
+    }
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub sessions: Vec<SessionSummary>,
@@ -911,6 +1093,10 @@ pub struct AppState {
     pub creating: bool,
     pub notice: String,
     pub catalog: Catalog,
+    pub session_filter: SessionFilter,
+    pub session_query: String,
+    pub launch_draft: String,
+    pub pending_launch: Option<String>,
 }
 
 impl AppState {
@@ -938,7 +1124,123 @@ impl AppState {
         }
     }
 
+    pub fn filter_counts(&self) -> (usize, usize, usize) {
+        let chats = self
+            .sessions
+            .iter()
+            .filter(|s| classify_source(&s.source) == SourceKind::Interactive)
+            .count();
+        let all = self.sessions.len();
+        (all, chats, all.saturating_sub(chats))
+    }
+
+    /// Indices into `self.sessions` matching the active filter and sidebar search query.
+    pub fn visible_sessions(&self) -> Vec<usize> {
+        let tokens = query_tokens(&self.session_query);
+        let filtered = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| self.session_filter.matches(s));
+        if tokens.is_empty() {
+            return filtered.map(|(index, _)| index).collect();
+        }
+        let mut ranked: Vec<(usize, usize)> = filtered
+            .filter_map(|(index, s)| {
+                let key = normalize(&format!("{} {} {}", s.title, s.source, s.stored_id));
+                match_tokens(&key, &tokens).map(|score| (score, index))
+            })
+            .collect();
+        ranked.sort_by_key(|&(score, index)| (score, index));
+        ranked.into_iter().map(|(_, index)| index).collect()
+    }
+
+    pub fn active_draft(&self) -> &str {
+        match &self.selected {
+            Some(id) => self.conversations.get(id).map_or("", |c| c.draft.as_str()),
+            None => &self.launch_draft,
+        }
+    }
+
+    pub fn set_active_draft(&mut self, text: String) {
+        if let Some(id) = self.selected.clone() {
+            self.conversations.entry(id).or_default().draft = text;
+        } else {
+            self.launch_draft = text;
+        }
+    }
+
+    /// Begin creating a conversation from the launch composer (`selected == None`).
+    /// Keeps `launch_draft` intact until `Created` succeeds so a failure never loses text.
+    pub fn begin_launch_submit(&mut self) -> Option<(String, String)> {
+        if self.selected.is_some() || self.creating || self.pending_launch.is_some() {
+            return None;
+        }
+        let trimmed = self.launch_draft.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let title = derive_launch_title(&trimmed);
+        self.creating = true;
+        self.pending_launch = Some(trimmed.clone());
+        Some((title, trimmed))
+    }
+
+    pub fn cancel_pending_launch(&mut self) {
+        self.pending_launch = None;
+        self.creating = false;
+    }
+
+    pub fn take_pending_launch(&mut self) -> Option<String> {
+        let prompt = self.pending_launch.take()?;
+        self.launch_draft.clear();
+        Some(prompt)
+    }
+
+    pub fn take_launch_draft_for_blank_chat(&mut self) -> String {
+        if self.pending_launch.is_some() {
+            return String::new();
+        }
+        std::mem::take(&mut self.launch_draft)
+    }
+
+    pub fn apply_session_title(&mut self, id: &str, title: &str) -> bool {
+        let clean = title.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        let target = if self.sessions.iter().any(|s| s.stored_id == id) {
+            Some(id.to_string())
+        } else {
+            self.stored_for_runtime(id)
+        };
+        let Some(stored_id) = target else {
+            return false;
+        };
+        let Some(session) = self.sessions.iter_mut().find(|s| s.stored_id == stored_id) else {
+            return false;
+        };
+        if session.title == clean {
+            return false;
+        }
+        session.title = clean.to_string();
+        true
+    }
+
+    /// Remove a deleted session and report whether it was the open conversation.
+    pub fn remove_session(&mut self, stored_id: &str) -> bool {
+        self.sessions.retain(|s| s.stored_id != stored_id);
+        self.conversations.remove(stored_id);
+        if self.selected.as_deref() == Some(stored_id) {
+            self.selected = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn disconnect(&mut self) {
+        self.cancel_pending_launch();
         for conversation in self.conversations.values_mut() {
             if conversation.status.busy() {
                 conversation.status = TurnStatus::Unknown;
@@ -950,6 +1252,191 @@ impl AppState {
             conversation.history_loading = false;
         }
     }
+}
+
+pub fn build_palette_entries(
+    state: &AppState,
+    query: &str,
+    now_epoch_secs: i64,
+) -> Vec<PaletteEntry> {
+    let mut all = palette_commands(state);
+    let cmd_count = all.len();
+    all.extend(palette_sessions(state, now_epoch_secs));
+    let tokens = query_tokens(query);
+    if tokens.is_empty() {
+        return all;
+    }
+    let mut ranked: Vec<(usize, u8, usize, PaletteEntry)> = all
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let score = match_tokens(&entry.search_key(), &tokens)?;
+            let kind_rank = u8::from(index >= cmd_count);
+            Some((score, kind_rank, index, entry))
+        })
+        .collect();
+    ranked.sort_by_key(|&(score, kind_rank, index, _)| (score, kind_rank, index));
+    ranked.into_iter().map(|(_, _, _, entry)| entry).collect()
+}
+
+fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
+    let connected = state.connection.as_ref() == Some(&ConnectionState::Connected);
+    let conversation = state
+        .selected
+        .as_ref()
+        .and_then(|id| state.conversations.get(id));
+    let writable = connected
+        && conversation.is_some_and(|c| c.runtime_id.is_some() && c.read_only_reason.is_none());
+    let mut out = Vec::new();
+    if connected && !state.creating {
+        out.push(PaletteEntry::command(
+            PaletteAction::NewChat,
+            "list-add-symbolic",
+            "New conversation",
+            "Create a fresh server-owned chat",
+            "Ctrl+N",
+        ));
+    }
+    if writable && conversation.is_some_and(|c| !c.model.switching()) {
+        out.push(PaletteEntry::command(
+            PaletteAction::SwitchModel,
+            "preferences-system-symbolic",
+            "Switch model…",
+            "Choose provider and model for this conversation",
+            "Ctrl+M",
+        ));
+    }
+    out.extend(palette_filter_commands(state));
+    out.extend(palette_utility_commands(state, connected));
+    out
+}
+
+fn palette_filter_commands(state: &AppState) -> Vec<PaletteEntry> {
+    let (all, chats, auto) = state.filter_counts();
+    let specs = [
+        (
+            SessionFilter::Chats,
+            "user-available-symbolic",
+            "Show interactive chats only",
+            format!("{chats} human conversations · hides cron"),
+        ),
+        (
+            SessionFilter::Auto,
+            "alarm-symbolic",
+            "Show automations & cron",
+            format!("{auto} scheduled or background sessions"),
+        ),
+        (
+            SessionFilter::All,
+            "view-list-symbolic",
+            "Show all conversations",
+            format!("{all} loaded conversations"),
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(|(filter, icon, title, subtitle)| {
+            let mut entry = PaletteEntry::command(
+                PaletteAction::FilterSessions(filter),
+                icon,
+                title,
+                subtitle,
+                "",
+            );
+            entry.active = state.session_filter == filter;
+            if entry.active {
+                entry.badge = "ACTIVE".into();
+            }
+            entry
+        })
+        .collect()
+}
+
+fn palette_utility_commands(state: &AppState, connected: bool) -> Vec<PaletteEntry> {
+    let mut out = vec![
+        PaletteEntry::command(
+            PaletteAction::ToggleSidebar,
+            "sidebar-show-symbolic",
+            "Toggle conversations sidebar",
+            "Collapse or expand the left session rail",
+            "Ctrl+B",
+        ),
+        PaletteEntry::command(
+            PaletteAction::FocusFilter,
+            "system-search-symbolic",
+            "Filter sidebar conversations",
+            "Focus the sidebar search input",
+            "Ctrl+F",
+        ),
+    ];
+    if connected && state.selected.is_some() {
+        out.push(PaletteEntry::command(
+            PaletteAction::ReloadHistory,
+            "view-refresh-symbolic",
+            "Reload conversation history",
+            "Re-fetch saved transcript from the server",
+            "Ctrl+R",
+        ));
+    }
+    if connected && state.list_has_more && !state.list_loading {
+        out.push(PaletteEntry::command(
+            PaletteAction::LoadMoreSessions,
+            "content-loading-symbolic",
+            "Load more conversations",
+            "Fetch the next page of 50 sessions from the server",
+            "",
+        ));
+    }
+    if !matches!(state.connection, Some(ConnectionState::Connecting)) {
+        out.push(PaletteEntry::command(
+            PaletteAction::Reconnect,
+            "network-transmit-receive-symbolic",
+            "Reconnect to Hermes gateway",
+            "Re-open the WebSocket and refresh session metadata",
+            "",
+        ));
+    }
+    if connected && state.selected.is_some() {
+        let mut del = PaletteEntry::command(
+            PaletteAction::DeleteCurrent,
+            "user-trash-symbolic",
+            "Delete current conversation…",
+            "Permanently close and remove this session on the server",
+            "",
+        );
+        del.destructive = true;
+        out.push(del);
+    }
+    out
+}
+
+fn palette_sessions(state: &AppState, now_epoch_secs: i64) -> Vec<PaletteEntry> {
+    state
+        .sessions
+        .iter()
+        .map(|session| {
+            let icon = if classify_source(&session.source) == SourceKind::Automated {
+                "alarm-symbolic"
+            } else {
+                "mail-send-symbolic"
+            };
+            let title = if session.title.is_empty() {
+                "Untitled conversation".into()
+            } else {
+                session.title.clone()
+            };
+            PaletteEntry {
+                action: PaletteAction::OpenSession(session.stored_id.clone()),
+                icon,
+                title,
+                subtitle: session_meta_line(session, now_epoch_secs),
+                shortcut: "",
+                badge: source_badge(&session.source),
+                active: state.selected.as_deref() == Some(session.stored_id.as_str()),
+                destructive: false,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1540,5 +2027,179 @@ mod tests {
         assert_eq!(conversation.runtime_id.as_deref(), Some("ephemeral"));
         assert_eq!(conversation.history_before, 12);
         assert_eq!(conversation.messages[0].text, "Partial");
+    }
+
+    fn sample_session(id: &str, title: &str, source: &str, count: usize) -> SessionSummary {
+        SessionSummary {
+            stored_id: id.into(),
+            title: title.into(),
+            source: source.into(),
+            updated_at: "1700000000".into(),
+            read_only_reason: None,
+            message_count: count,
+        }
+    }
+
+    #[test]
+    fn triage_separates_interactive_chats_from_automations_and_fuzzy_ranks() {
+        let mut state = AppState {
+            sessions: vec![
+                sample_session("s1", "Install hermes-push plugin", "tui", 8),
+                sample_session("s2", "stock-daily-self-review", "cron", 2),
+                sample_session("s3", "Set up Cloudflare Tunnel", "local", 14),
+                sample_session("s4", "board-worker", "kanban", 4),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.filter_counts(), (4, 2, 2));
+        assert_eq!(state.visible_sessions(), vec![0, 1, 2, 3]);
+        state.session_filter = SessionFilter::Chats;
+        assert_eq!(state.visible_sessions(), vec![0, 2]);
+        state.session_filter = SessionFilter::Auto;
+        assert_eq!(state.visible_sessions(), vec![1, 3]);
+        state.session_filter = SessionFilter::All;
+        state.session_query = "cloudflare".into();
+        assert_eq!(state.visible_sessions(), vec![2]);
+    }
+
+    #[test]
+    fn session_metadata_formats_badges_counts_and_relative_ages() {
+        assert_eq!(source_badge(""), "CHAT");
+        assert_eq!(source_badge("api_server"), "API");
+        assert_eq!(source_badge("cron"), "CRON");
+        assert_eq!(format_relative_age("0", 1_700_000_100), None);
+        assert_eq!(
+            format_relative_age("1700000090", 1_700_000_100).as_deref(),
+            Some("just now")
+        );
+        assert_eq!(
+            format_relative_age("1700000000000", 1_700_000_300).as_deref(),
+            Some("5m ago")
+        );
+        assert_eq!(
+            format_relative_age("1699992800", 1_700_000_000).as_deref(),
+            Some("2h ago")
+        );
+        assert_eq!(
+            format_relative_age("1699827200", 1_700_000_000).as_deref(),
+            Some("2d ago")
+        );
+        assert_eq!(
+            format_relative_age("1698700000", 1_700_000_000).as_deref(),
+            Some("2w ago")
+        );
+        let mut ro = sample_session("s1", "Readonly", "kanban", 1);
+        ro.read_only_reason = Some("locked".into());
+        assert_eq!(
+            session_meta_line(&ro, 1_700_000_120),
+            "1 msg · 2m ago · read-only"
+        );
+    }
+
+    #[test]
+    fn launch_composer_preserves_draft_on_failure_and_consumes_on_create() {
+        assert_eq!(derive_launch_title("   \n  "), "New conversation");
+        assert_eq!(
+            derive_launch_title("## Summarize   today's commits\nmore details"),
+            "Summarize today's commits"
+        );
+        let long =
+            "Explain how Wayland frame callbacks interact with GTK4 list recycling in detail";
+        assert!(derive_launch_title(long).ends_with('…'));
+
+        let mut state = AppState::default();
+        state.set_active_draft("  Ship command palette  ".into());
+        assert_eq!(state.active_draft(), "  Ship command palette  ");
+        let (title, prompt) = state.begin_launch_submit().expect("launch submit");
+        assert_eq!(title, "Ship command palette");
+        assert_eq!(prompt, "Ship command palette");
+        assert!(state.creating);
+        assert!(state.begin_launch_submit().is_none());
+
+        // Disconnect cancels the pending launch without losing the typed draft.
+        state.disconnect();
+        assert!(!state.creating);
+        assert!(state.pending_launch.is_none());
+        assert_eq!(state.launch_draft, "  Ship command palette  ");
+
+        let _ = state.begin_launch_submit().expect("retry launch submit");
+        assert_eq!(
+            state.take_pending_launch().as_deref(),
+            Some("Ship command palette")
+        );
+        assert!(state.launch_draft.is_empty());
+    }
+
+    #[test]
+    fn session_titles_and_deletion_keep_selection_and_runtime_mapping_consistent() {
+        let mut state = AppState {
+            sessions: vec![sample_session("stored-1", "New conversation", "tui", 0)],
+            selected: Some("stored-1".into()),
+            ..Default::default()
+        };
+        state.conversations.insert(
+            "stored-1".into(),
+            Conversation {
+                runtime_id: Some("rt-1".into()),
+                draft: "hello".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.active_draft(), "hello");
+        assert!(state.apply_session_title("rt-1", "  Hyprland Palette Design  "));
+        assert_eq!(state.sessions[0].title, "Hyprland Palette Design");
+        assert!(!state.apply_session_title("rt-1", "Hyprland Palette Design"));
+        assert!(!state.apply_session_title("rt-1", "   "));
+        assert!(!state.apply_session_title("unknown", "Other"));
+
+        assert!(!state.remove_session("missing"));
+        assert!(state.remove_session("stored-1"));
+        assert!(state.selected.is_none());
+        assert!(state.sessions.is_empty());
+        assert!(state.conversations.is_empty());
+    }
+
+    #[test]
+    fn command_palette_offers_contextual_actions_and_ranks_queries() {
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            sessions: vec![
+                sample_session("s1", "Cloudflare Tunnel Setup", "tui", 6),
+                sample_session("s2", "stock-market-snapshot", "cron", 2),
+            ],
+            selected: Some("s1".into()),
+            list_has_more: true,
+            ..Default::default()
+        };
+        state.conversations.insert(
+            "s1".into(),
+            Conversation {
+                runtime_id: Some("rt-1".into()),
+                ..Default::default()
+            },
+        );
+        let initial = build_palette_entries(&state, "", 1_700_000_600);
+        assert!(
+            initial
+                .iter()
+                .any(|e| e.action == PaletteAction::SwitchModel)
+        );
+        assert!(
+            initial
+                .iter()
+                .any(|e| e.action == PaletteAction::DeleteCurrent)
+        );
+        assert!(
+            initial
+                .iter()
+                .any(|e| e.action == PaletteAction::LoadMoreSessions)
+        );
+
+        let tunnel = build_palette_entries(&state, "cloudflare", 1_700_000_600);
+        assert_eq!(tunnel.len(), 1);
+        assert_eq!(tunnel[0].action, PaletteAction::OpenSession("s1".into()));
+
+        let model = build_palette_entries(&state, "switch model", 1_700_000_600);
+        assert_eq!(model[0].action, PaletteAction::SwitchModel);
     }
 }

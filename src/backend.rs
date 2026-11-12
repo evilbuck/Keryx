@@ -1219,49 +1219,10 @@ impl Link {
             "tool.start" | "tool.generating" | "tool.complete" => {
                 self.on_tool_event(&runtime_id, event_type, payload).await
             }
-            "request.cancel" => {
-                let Some(raw_id) = payload.get("id").or_else(|| payload.get("request_id")) else {
-                    return;
-                };
-                let Some((owner, request_id)) = self.take_ask(raw_id) else {
-                    return;
-                };
-                let waiting = self.asks.values().any(|ask| ask.runtime_id == owner);
-                if !waiting && let Some(turn) = self.turns.get_mut(&owner) {
-                    turn.note_withdraw();
-                }
-                self.emit(Event::InteractionCancelled {
-                    runtime_id: owner,
-                    request_id,
-                })
-                .await;
-            }
-            "error" => {
-                if self
-                    .turns
-                    .get(&runtime_id)
-                    .is_some_and(|turn| turn.phase == TurnPhase::Terminal)
-                {
-                    return;
-                }
-                if let Some(turn) = self.turns.get_mut(&runtime_id) {
-                    let _ = turn.finish();
-                }
-                self.retire_turn_jobs(&runtime_id);
-                let message = payload
-                    .get("message")
-                    .or_else(|| payload.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("The gateway reported an error.");
-                self.fail(
-                    "gateway",
-                    Some(runtime_id).filter(|s| !s.is_empty()),
-                    message,
-                )
-                .await;
-            }
-            "session.info" | "session.title" | "sessions.changed" | "platforms.changed"
-            | "message.interim" => {}
+            "request.cancel" => self.on_request_cancel(payload).await,
+            "error" => self.on_gateway_error(runtime_id, payload).await,
+            "session.title" => self.on_session_title(&runtime_id, payload).await,
+            "session.info" | "sessions.changed" | "platforms.changed" | "message.interim" => {}
             // Named `event` frames are notifications: they need no response.
             // An unknown name is unrelated metadata, not a conversation failure.
             // `error` and failed `message.complete` stay above. A missing type
@@ -1280,6 +1241,95 @@ impl Link {
                 }
             }
         }
+    }
+
+    async fn on_request_cancel(&mut self, payload: &Value) {
+        let Some(raw_id) = payload.get("id").or_else(|| payload.get("request_id")) else {
+            return;
+        };
+        let Some((owner, request_id)) = self.take_ask(raw_id) else {
+            return;
+        };
+        let waiting = self.asks.values().any(|ask| ask.runtime_id == owner);
+        if !waiting && let Some(turn) = self.turns.get_mut(&owner) {
+            turn.note_withdraw();
+        }
+        self.emit(Event::InteractionCancelled {
+            runtime_id: owner,
+            request_id,
+        })
+        .await;
+    }
+
+    async fn on_gateway_error(&mut self, runtime_id: String, payload: &Value) {
+        if self
+            .turns
+            .get(&runtime_id)
+            .is_some_and(|turn| turn.phase == TurnPhase::Terminal)
+        {
+            return;
+        }
+        if let Some(turn) = self.turns.get_mut(&runtime_id) {
+            let _ = turn.finish();
+        }
+        self.retire_turn_jobs(&runtime_id);
+        let message = payload
+            .get("message")
+            .or_else(|| payload.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("The gateway reported an error.");
+        self.fail(
+            "gateway",
+            Some(runtime_id).filter(|s| !s.is_empty()),
+            message,
+        )
+        .await;
+    }
+
+    async fn on_session_title(&mut self, runtime_id: &str, payload: &Value) {
+        let Some(raw_title) = payload
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let session_id = self.resolve_title_session_id(runtime_id, payload);
+        if session_id.is_empty() {
+            return;
+        }
+        self.emit(Event::SessionTitle {
+            session_id,
+            title: self.clean(raw_title.to_string()),
+        })
+        .await;
+    }
+
+    fn resolve_title_session_id(&self, runtime_id: &str, payload: &Value) -> String {
+        if let Some(stored) = payload
+            .get("stored_session_id")
+            .or_else(|| payload.get("session_key"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return stored.to_string();
+        }
+        if let Some(stored) = self
+            .runtime_of
+            .iter()
+            .find_map(|(stored, rt)| (rt == runtime_id).then(|| stored.clone()))
+        {
+            return stored;
+        }
+        if !runtime_id.is_empty() {
+            return runtime_id.to_string();
+        }
+        payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
     }
 
     /// Turn-rollover handling for message.start, in the documented order:
@@ -1900,7 +1950,7 @@ impl Link {
                 stored_id,
                 title,
                 source: "tui".into(),
-                updated_at: String::new(),
+                updated_at: crate::palette::now_epoch_secs().to_string(),
                 read_only_reason: None,
                 message_count: 0,
             },
@@ -2262,13 +2312,7 @@ fn session_summary(row: &Value) -> Result<SessionSummary, String> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    let updated = row
-        .get("last_active")
-        .or_else(|| row.get("last_activity_at"))
-        .or_else(|| row.get("started_at"))
-        .and_then(Value::as_i64)
-        .map(|n| n.to_string())
-        .unwrap_or_default();
+    let updated = extract_epoch_string(row);
     Ok(SessionSummary {
         stored_id,
         title: if title.is_empty() {
@@ -2285,6 +2329,33 @@ fn session_summary(row: &Value) -> Result<SessionSummary, String> {
         read_only_reason: None,
         message_count,
     })
+}
+
+fn value_as_epoch(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .map(|f| f as i64)
+        })
+        .filter(|&n| n > 0)
+}
+
+fn extract_epoch_string(row: &Value) -> String {
+    [
+        "last_active",
+        "last_activity_at",
+        "updated_at",
+        "ended_at",
+        "started_at",
+    ]
+    .into_iter()
+    .find_map(|key| row.get(key).and_then(value_as_epoch))
+    .map(|n| n.to_string())
+    .unwrap_or_default()
 }
 
 async fn fetch_history(
@@ -3661,5 +3732,63 @@ mod tests {
             assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
             assert_eq!(link.turns["rt"].generation, 4);
         });
+    }
+
+    #[test]
+    fn session_title_event_maps_runtime_to_stored_session() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(4);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.runtime_of.insert("stored-42".into(), "rt-42".into());
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "session.title",
+                    "session_id": "rt-42",
+                    "payload": {"title": "  Hyprland Command Palette  "}
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("title event") {
+                Event::SessionTitle { session_id, title } => {
+                    assert_eq!(session_id, "stored-42");
+                    assert_eq!(title, "Hyprland Command Palette");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn session_list_parses_float_timestamps_from_hermes_sqlite() {
+        let parsed = parse_sessions(
+            &json!({
+                "total": 1,
+                "sessions": [{
+                    "id": "s-float",
+                    "title": "Float epoch test",
+                    "source": "tui",
+                    "message_count": 12,
+                    "started_at": 1_794_452_594.819_234
+                }]
+            }),
+            0,
+        )
+        .expect("sessions");
+        let Event::Sessions { sessions, .. } = parsed else {
+            panic!("expected sessions");
+        };
+        assert_eq!(sessions[0].updated_at, "1794452594");
     }
 }

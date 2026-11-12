@@ -9,12 +9,19 @@ use gtk::{gdk, gio, glib};
 use crate::backend::{self, Backend};
 use crate::markdown;
 use crate::model::*;
+use crate::palette::{self, CommandPalette, TriageBar};
 
 struct Ui {
     backend: Option<Backend>,
     state: RefCell<AppState>,
     pending_resumes: RefCell<HashSet<String>>,
     window: adw::ApplicationWindow,
+    sidebar: gtk::Box,
+    triage: Rc<TriageBar>,
+    palette: RefCell<Option<Rc<CommandPalette>>>,
+    palette_trigger: gtk::Button,
+    delete_chat: gtk::Button,
+    composer_hint: gtk::Label,
     sessions: gio::ListStore,
     selection: gtk::SingleSelection,
     messages: gio::ListStore,
@@ -55,6 +62,14 @@ struct Ui {
     select_created: Cell<bool>,
     suppress_selection: Cell<bool>,
     sequence: Cell<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetaOutcome {
+    Unhandled,
+    Handled,
+    RefreshSessions,
+    ResetToLaunch,
 }
 
 /// A switch awaiting an explicit confirmation, kept so the retry repeats the same target.
@@ -157,6 +172,90 @@ fn with_conversation(
         })
 }
 
+fn header_title(state: &AppState) -> &str {
+    state
+        .selected
+        .as_ref()
+        .and_then(|id| state.sessions.iter().find(|s| &s.stored_id == id))
+        .map(|s| s.title.as_str())
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Hermes Native")
+}
+
+fn activity_text(state: &AppState, resume_loading: bool) -> &str {
+    if state.pending_launch.is_some() {
+        return "Starting conversation…";
+    }
+    if resume_loading {
+        return "Loading server history…";
+    }
+    state
+        .selected
+        .as_ref()
+        .and_then(|id| state.conversations.get(id))
+        .map_or("", |c| c.activity.as_str())
+}
+
+fn spinner_active(state: &AppState, resume_loading: bool) -> bool {
+    state.pending_launch.is_some()
+        || resume_loading
+        || state
+            .selected
+            .as_ref()
+            .and_then(|id| state.conversations.get(id))
+            .is_some_and(|c| c.status.busy() || c.history_loading)
+}
+
+fn editor_editable(state: &AppState) -> bool {
+    match &state.selected {
+        None => state.pending_launch.is_none(),
+        Some(id) => state
+            .conversations
+            .get(id)
+            .is_some_and(|c| c.read_only_reason.is_none()),
+    }
+}
+
+fn can_send_in_conversation(c: &Conversation) -> bool {
+    c.runtime_id.is_some()
+        && c.read_only_reason.is_none()
+        && c.status != TurnStatus::Stopping
+        && !c.draft.trim().is_empty()
+}
+
+fn composer_send_sensitive(state: &AppState, reload_pending: bool) -> bool {
+    if state.connection.as_ref() != Some(&ConnectionState::Connected) || reload_pending {
+        return false;
+    }
+    match &state.selected {
+        None => {
+            !state.creating
+                && state.pending_launch.is_none()
+                && !state.launch_draft.trim().is_empty()
+        }
+        Some(id) => state
+            .conversations
+            .get(id)
+            .is_some_and(can_send_in_conversation),
+    }
+}
+
+fn composer_hint_text(state: &AppState) -> &'static str {
+    let Some(id) = &state.selected else {
+        return "Enter to start a new chat · Shift+Enter new line · Ctrl+K commands";
+    };
+    let Some(c) = state.conversations.get(id) else {
+        return "Enter to send · Shift+Enter for a new line · Ctrl+K commands";
+    };
+    if c.read_only_reason.is_some() {
+        "Read-only conversation · Ctrl+N for a new chat"
+    } else if c.status.steerable() {
+        "Enter to steer active turn · Shift+Enter for a new line"
+    } else {
+        "Enter to send · Shift+Enter for a new line · Ctrl+K commands"
+    }
+}
+
 pub fn build(app: &adw::Application, config: Result<Config, String>) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -171,21 +270,27 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     title.add_css_class("title");
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     header.set_title_widget(Some(&title));
-    let toggle_sidebar = icon_button("sidebar-show-symbolic", "Toggle conversations");
+    let toggle_sidebar = icon_button("sidebar-show-symbolic", "Toggle conversations · Ctrl+B");
+    let palette_trigger = palette::build_palette_trigger();
     header.pack_start(&toggle_sidebar);
+    header.pack_start(&palette_trigger);
     let connection = gtk::Label::new(Some("Connecting…"));
     connection.add_css_class("connection-label");
     let reconnect = icon_button(
         "view-refresh-symbolic",
         "Reconnect and reload server history",
     );
+    let delete_chat = icon_button("user-trash-symbolic", "Delete conversation");
+    delete_chat.add_css_class("flat");
+    delete_chat.set_visible(false);
     header.pack_end(&reconnect);
+    header.pack_end(&delete_chat);
     header.pack_end(&connection);
 
-    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 12);
     sidebar.add_css_class("hermes-sidebar");
-    sidebar.set_width_request(220);
-    set_margins(&sidebar, 16);
+    sidebar.set_width_request(230);
+    set_margins(&sidebar, 14);
     let brand = gtk::Label::new(Some("HERMES"));
     brand.add_css_class("hermes-brand");
     brand.set_xalign(0.0);
@@ -198,48 +303,15 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     new_chat.set_tooltip_text(Some("Create a server-side conversation · Ctrl+N"));
     new_chat.add_css_class("suggested-action");
     sidebar.append(&new_chat);
+    let triage = TriageBar::new();
+    sidebar.append(&triage.container);
+    sidebar.append(&triage.empty_label);
     let sessions = gio::ListStore::new::<glib::BoxedAnyObject>();
     let selection = gtk::SingleSelection::new(Some(sessions.clone()));
     selection.set_autoselect(false);
     selection.set_can_unselect(true);
     let session_factory = gtk::SignalListItemFactory::new();
-    session_factory.connect_bind(|_, object| {
-        let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
-        let value = item
-            .item()
-            .and_downcast::<glib::BoxedAnyObject>()
-            .expect("session item");
-        let session = value.borrow::<SessionSummary>();
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 5);
-        row.add_css_class("session-row");
-        let title = gtk::Label::new(Some(if session.title.is_empty() {
-            "Untitled conversation"
-        } else {
-            &session.title
-        }));
-        title.set_xalign(0.0);
-        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title.add_css_class("session-title");
-        row.append(&title);
-        let meta = gtk::Label::new(Some(&format!(
-            "{}{}",
-            session.source,
-            if session.read_only_reason.is_some() {
-                " · read-only"
-            } else {
-                ""
-            }
-        )));
-        meta.set_xalign(0.0);
-        meta.add_css_class("session-meta");
-        row.append(&meta);
-        let identity = match &session.read_only_reason {
-            Some(reason) => format!("Conversation ID: {}\n{}", session.stored_id, reason),
-            None => format!("Conversation ID: {}", session.stored_id),
-        };
-        row.set_tooltip_text(Some(&identity));
-        item.set_child(Some(&row));
-    });
+    session_factory.connect_bind(|_, object| palette::bind_session_row(object));
     let session_list = gtk::ListView::new(Some(selection.clone()), Some(session_factory));
     // This property selects the row under the pointer. Leave it off so hover
     // cannot resume a conversation; clicks and arrow keys still select.
@@ -354,12 +426,13 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     empty_title.set_wrap(true);
     empty.append(&empty_title);
     let empty_subtitle = gtk::Label::new(Some(
-        "Choose a conversation, or start something new.\nYour history stays on your Hermes server.",
+        "Start typing below to launch a new conversation,\nor press Ctrl+K to jump anywhere on your Hermes server.",
     ));
     empty_subtitle.set_wrap(true);
     empty_subtitle.set_justify(gtk::Justification::Center);
     empty_subtitle.add_css_class("empty-subtitle");
     empty.append(&empty_subtitle);
+    empty.append(&palette::build_shortcut_hints());
     content.add_named(&empty, Some("empty"));
     content.set_visible_child_name("empty");
     main.append(&content);
@@ -468,11 +541,12 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     model_row.append(&model_menu);
     composer.append(&model_row);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let hint = gtk::Label::new(Some("Enter to send · Shift+Enter for a new line"));
-    hint.set_xalign(0.0);
-    hint.set_hexpand(true);
-    hint.add_css_class("composer-hint");
-    actions.append(&hint);
+    let composer_hint = gtk::Label::new(Some("Enter to send · Shift+Enter for a new line"));
+    composer_hint.set_xalign(0.0);
+    composer_hint.set_hexpand(true);
+    composer_hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    composer_hint.add_css_class("composer-hint");
+    actions.append(&composer_hint);
     let stop = icon_button("media-playback-stop-symbolic", "Stop response");
     actions.append(&stop);
     let send = text_icon_button("mail-send-symbolic", "Send");
@@ -499,8 +573,9 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&paned));
     window.set_content(Some(&toolbar));
+    let sidebar_for_toggle = sidebar.clone();
     toggle_sidebar.connect_clicked(move |_| {
-        sidebar.set_visible(!sidebar.is_visible());
+        sidebar_for_toggle.set_visible(!sidebar_for_toggle.is_visible());
     });
 
     let (backend, initial_notice) = match config {
@@ -515,6 +590,12 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         }),
         pending_resumes: RefCell::new(HashSet::new()),
         window,
+        sidebar,
+        triage,
+        palette: RefCell::new(None),
+        palette_trigger,
+        delete_chat,
+        composer_hint,
         sessions,
         selection,
         messages,
@@ -558,8 +639,11 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     });
     let pointer_row_click = Rc::new(Cell::new(false));
     connect_actions(&ui, &session_list, &pointer_row_click);
+    connect_workspace(&ui);
+    ui.refresh_sessions();
     ui.refresh();
     ui.window.present();
+    ui.editor.grab_focus();
     let weak = Rc::downgrade(&ui);
     // The window owns this strong reference until close. Callbacks otherwise use weak references.
     let keep_alive = RefCell::new(Some(ui.clone()));
@@ -811,13 +895,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
     });
     let weak = Rc::downgrade(ui);
     ui.reconnect.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ui.state.borrow_mut().notice.clear();
-            ui.state.borrow_mut().disconnect();
-            ui.pending_resumes.borrow_mut().clear();
-            ui.command(Command::Reconnect);
-            ui.refresh();
-        }
+        let _ = weak.upgrade().map(|ui| ui.trigger_reconnect());
     });
     let weak = Rc::downgrade(ui);
     ui.stop.connect_clicked(move |_| {
@@ -838,13 +916,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
     });
     let weak = Rc::downgrade(ui);
     ui.more_sessions.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let offset = ui.state.borrow().sessions.len();
-        ui.state.borrow_mut().list_loading = true;
-        ui.command(Command::List { offset });
-        ui.refresh();
+        let _ = weak.upgrade().map(|ui| ui.load_more_sessions());
     });
     let weak = Rc::downgrade(ui);
     ui.older.connect_clicked(move |_| {
@@ -876,13 +948,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
     });
     let weak = Rc::downgrade(ui);
     ui.latest.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let id = ui.state.borrow().selected.clone();
-        if let Some(id) = id {
-            ui.resume(&id);
-        }
+        let _ = weak.upgrade().map(|ui| ui.reload_current());
     });
     let weak = Rc::downgrade(ui);
     ui.editor.buffer().connect_changed(move |buffer| {
@@ -895,11 +961,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
         let text = buffer
             .text(&buffer.start_iter(), &buffer.end_iter(), true)
             .to_string();
-        let mut state = ui.state.borrow_mut();
-        if let Some(id) = state.selected.clone() {
-            state.conversations.entry(id).or_default().draft = text;
-        }
-        drop(state);
+        ui.state.borrow_mut().set_active_draft(text);
         ui.refresh_controls();
     });
     let key = gtk::EventControllerKey::new();
@@ -908,28 +970,12 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
         if (key == gdk::Key::Return || key == gdk::Key::KP_Enter)
             && !modifiers.contains(gdk::ModifierType::SHIFT_MASK)
         {
-            if let Some(ui) = weak.upgrade() {
-                ui.submit();
-            }
+            let _ = weak.upgrade().map(|ui| ui.submit());
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
     });
     ui.editor.add_controller(key);
-    let shortcuts = gtk::EventControllerKey::new();
-    let weak = Rc::downgrade(ui);
-    shortcuts.connect_key_pressed(move |_, key, _, modifiers| {
-        if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-            && (key == gdk::Key::n || key == gdk::Key::N)
-        {
-            if let Some(ui) = weak.upgrade() {
-                ui.create();
-            }
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    ui.window.add_controller(shortcuts);
     connect_model_picker(ui);
     let adjustment = ui.transcript.vadjustment();
     let weak = Rc::downgrade(ui);
@@ -939,6 +985,124 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
                 .set(adjustment.value() + adjustment.page_size() >= adjustment.upper() - 64.0);
         }
     });
+}
+
+fn connect_workspace(ui: &Rc<Ui>) {
+    let weak = Rc::downgrade(ui);
+    let palette = CommandPalette::new(Rc::new(move |action| {
+        let _ = weak.upgrade().map(|ui| ui.run_palette_action(action));
+    }));
+    let weak = Rc::downgrade(ui);
+    palette.connect_query(move |palette| {
+        let _ = weak
+            .upgrade()
+            .map(|ui| palette.populate(&ui.state.borrow()));
+    });
+    *ui.palette.borrow_mut() = Some(palette);
+
+    let weak = Rc::downgrade(ui);
+    ui.palette_trigger.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.toggle_palette());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.delete_chat.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.confirm_delete_current());
+    });
+
+    let weak_filter = Rc::downgrade(ui);
+    let weak_query = Rc::downgrade(ui);
+    let weak_esc = Rc::downgrade(ui);
+    ui.triage.connect(
+        move |filter| {
+            let _ = weak_filter.upgrade().map(|ui| {
+                ui.state.borrow_mut().session_filter = filter;
+                ui.refresh_sessions();
+            });
+        },
+        move |query| {
+            let _ = weak_query.upgrade().map(|ui| {
+                ui.state.borrow_mut().session_query = query;
+                ui.refresh_sessions();
+            });
+        },
+        move || {
+            let _ = weak_esc.upgrade().map(|ui| {
+                ui.editor.grab_focus();
+            });
+        },
+    );
+
+    let shortcuts = gtk::EventControllerKey::new();
+    shortcuts.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(ui);
+    shortcuts.connect_key_pressed(move |_, key, _, modifiers| {
+        weak.upgrade().map_or(glib::Propagation::Proceed, |ui| {
+            handle_window_shortcut(&ui, key, modifiers)
+        })
+    });
+    ui.window.add_controller(shortcuts);
+}
+
+fn shortcut_command(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<char> {
+    let clean = modifiers
+        & (gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::ALT_MASK);
+    if clean != gdk::ModifierType::CONTROL_MASK {
+        return None;
+    }
+    key.to_unicode().map(|ch| ch.to_ascii_lowercase())
+}
+
+fn handle_window_shortcut(
+    ui: &Rc<Ui>,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> glib::Propagation {
+    let Some(ch) = shortcut_command(key, modifiers) else {
+        return glib::Propagation::Proceed;
+    };
+    match ch {
+        'k' => ui.toggle_palette(),
+        'n' => {
+            ui.close_palette();
+            ui.create();
+        }
+        'b' => {
+            ui.close_palette();
+            ui.toggle_sidebar();
+        }
+        'f' => {
+            ui.close_palette();
+            ui.focus_sidebar_filter();
+        }
+        'm' => {
+            ui.close_palette();
+            ui.open_model_menu();
+        }
+        'r' => {
+            ui.close_palette();
+            ui.reload_or_reconnect();
+        }
+        _ => return glib::Propagation::Proceed,
+    }
+    glib::Propagation::Stop
+}
+
+fn visible_selected_position(state: &AppState, visible_indices: &[usize]) -> u32 {
+    state
+        .selected
+        .as_ref()
+        .and_then(|id| {
+            visible_indices.iter().position(|&index| {
+                state
+                    .sessions
+                    .get(index)
+                    .is_some_and(|s| &s.stored_id == id)
+            })
+        })
+        .map(|pos| pos as u32)
+        .unwrap_or(gtk::INVALID_LIST_POSITION)
 }
 
 impl Ui {
@@ -973,9 +1137,19 @@ impl Ui {
         self.refresh();
     }
 
+    fn set_editor_text(&self, text: &str) {
+        self.changing_draft.set(true);
+        self.editor.buffer().set_text(text);
+        self.changing_draft.set(false);
+    }
+
     fn select(&self, id: &str, focus_editor: bool) {
-        self.state.borrow_mut().selected = Some(id.to_string());
-        self.state.borrow_mut().notice.clear();
+        {
+            let mut state = self.state.borrow_mut();
+            state.pending_launch = None;
+            state.selected = Some(id.to_string());
+            state.notice.clear();
+        }
         self.follow_bottom.set(true);
         let draft = self
             .state
@@ -985,9 +1159,7 @@ impl Ui {
             .or_default()
             .draft
             .clone();
-        self.changing_draft.set(true);
-        self.editor.buffer().set_text(&draft);
-        self.changing_draft.set(false);
+        self.set_editor_text(&draft);
         let needs_resume =
             self.state.borrow().conversations.get(id).is_none_or(|c| {
                 !c.loaded || (c.runtime_id.is_none() && c.read_only_reason.is_none())
@@ -1016,6 +1188,10 @@ impl Ui {
     }
 
     fn submit(&self) {
+        if self.state.borrow().selected.is_none() {
+            self.submit_from_launch();
+            return;
+        }
         let reload_pending = self
             .state
             .borrow()
@@ -1072,11 +1248,199 @@ impl Ui {
             c.activity = "Sending…".into();
         }
         drop(state);
-        self.changing_draft.set(true);
-        self.editor.buffer().set_text("");
-        self.changing_draft.set(false);
+        self.set_editor_text("");
         self.follow_bottom.set(true);
         self.refresh();
+    }
+
+    fn submit_from_launch(&self) {
+        if !self.send.is_sensitive() {
+            return;
+        }
+        let Some((title, _)) = self.state.borrow_mut().begin_launch_submit() else {
+            return;
+        };
+        self.select_created.set(true);
+        if !self.command(Command::Create { title }) {
+            self.state.borrow_mut().cancel_pending_launch();
+        }
+        self.refresh();
+    }
+
+    fn send_initial_prompt(&self, id: &str, runtime_id: String, text: String) {
+        if !self.command(Command::Submit {
+            runtime_id,
+            text: text.clone(),
+        }) {
+            if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
+                c.draft = text.clone();
+            }
+            if self.state.borrow().selected.as_deref() == Some(id) {
+                self.set_editor_text(&text);
+            }
+            self.refresh();
+            return;
+        }
+        self.sequence.set(self.sequence.get() + 1);
+        if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
+            c.record_message(ChatMessage {
+                id: format!("client-{}", self.sequence.get()),
+                role: Role::User,
+                text,
+            });
+            c.draft.clear();
+            c.status = TurnStatus::Submitting;
+            c.activity = "Sending…".into();
+        }
+        self.follow_bottom.set(true);
+        self.refresh();
+    }
+
+    fn toggle_palette(&self) {
+        let palette = self.palette.borrow().clone();
+        if let Some(palette) = palette {
+            let state = self.state.borrow();
+            palette.toggle(&self.window, &state);
+        }
+    }
+
+    fn close_palette(&self) {
+        if let Some(palette) = self.palette.borrow().clone() {
+            palette.close();
+        }
+    }
+
+    fn toggle_sidebar(&self) {
+        let next = !self.sidebar.is_visible();
+        self.sidebar.set_visible(next);
+        if !next {
+            self.editor.grab_focus();
+        }
+    }
+
+    fn focus_sidebar_filter(&self) {
+        self.sidebar.set_visible(true);
+        self.triage.search.grab_focus();
+    }
+
+    fn set_session_filter(&self, filter: SessionFilter) {
+        self.sidebar.set_visible(true);
+        self.state.borrow_mut().session_filter = filter;
+        self.refresh_sessions();
+    }
+
+    fn open_model_menu(&self) {
+        if self.model_menu.is_sensitive() {
+            self.model_menu.popup();
+        }
+    }
+
+    fn trigger_reconnect(&self) {
+        if !self.reconnect.is_sensitive() {
+            return;
+        }
+        self.state.borrow_mut().notice.clear();
+        self.state.borrow_mut().disconnect();
+        self.pending_resumes.borrow_mut().clear();
+        self.command(Command::Reconnect);
+        self.refresh();
+    }
+
+    fn load_more_sessions(&self) {
+        if !self.more_sessions.is_sensitive() {
+            return;
+        }
+        let offset = self.state.borrow().sessions.len();
+        self.state.borrow_mut().list_loading = true;
+        self.command(Command::List { offset });
+        self.refresh();
+    }
+
+    fn reload_current(&self) {
+        if !self.latest.is_sensitive() {
+            return;
+        }
+        let id = self.state.borrow().selected.clone();
+        if let Some(id) = id {
+            self.resume(&id);
+        }
+    }
+
+    fn reload_or_reconnect(&self) {
+        if self.state.borrow().selected.is_some() {
+            self.reload_current();
+        } else {
+            self.trigger_reconnect();
+        }
+    }
+
+    fn confirm_delete_current(self: &Rc<Self>) {
+        let target = {
+            let state = self.state.borrow();
+            if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+                return;
+            }
+            let Some(id) = state.selected.clone() else {
+                return;
+            };
+            let title = state
+                .sessions
+                .iter()
+                .find(|s| s.stored_id == id)
+                .map(|s| s.title.as_str())
+                .filter(|t| !t.is_empty())
+                .unwrap_or("Untitled conversation")
+                .to_string();
+            (id, title)
+        };
+        let (stored_id, title) = target;
+        let body = format!(
+            "“{title}” will be permanently deleted from the Hermes server. This cannot be undone."
+        );
+        let dialog = adw::AlertDialog::new(Some("Delete conversation?"), Some(&body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response == "delete"
+                && let Some(ui) = weak.upgrade()
+            {
+                ui.command(Command::Delete {
+                    stored_id: stored_id.clone(),
+                });
+                ui.refresh();
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn run_palette_action(self: &Rc<Self>, action: PaletteAction) {
+        self.close_palette();
+        match action {
+            PaletteAction::NewChat => self.create(),
+            PaletteAction::SwitchModel => self.open_model_menu(),
+            PaletteAction::ToggleSidebar => self.toggle_sidebar(),
+            PaletteAction::FocusFilter => self.focus_sidebar_filter(),
+            PaletteAction::FilterSessions(filter) => self.set_session_filter(filter),
+            PaletteAction::OpenSession(id) => {
+                self.select_created.set(false);
+                self.select(&id, true);
+            }
+            other => self.run_palette_session_action(other),
+        }
+    }
+
+    fn run_palette_session_action(self: &Rc<Self>, action: PaletteAction) {
+        match action {
+            PaletteAction::ReloadHistory => self.reload_current(),
+            PaletteAction::LoadMoreSessions => self.load_more_sessions(),
+            PaletteAction::Reconnect => self.trigger_reconnect(),
+            PaletteAction::DeleteCurrent => self.confirm_delete_current(),
+            _ => {}
+        }
     }
 
     /// Busy-turn steer: optimistic row now, live turn untouched until the
@@ -1318,27 +1682,30 @@ impl Ui {
         model: Option<ModelIdentity>,
     ) {
         let id = session.stored_id.clone();
-        {
+        let launch_prompt = {
             let mut state = self.state.borrow_mut();
+            let seeded_draft = state.take_launch_draft_for_blank_chat();
+            let prompt = state.take_pending_launch();
             state.sessions.insert(0, session);
-            state.conversations.insert(
-                id.clone(),
-                Conversation {
-                    runtime_id: Some(runtime_id),
-                    loaded: true,
-                    ..Default::default()
-                },
-            );
-            if let Some(model) = model
-                && let Some(conversation) = state.conversations.get_mut(&id)
-            {
+            let mut conversation = Conversation {
+                runtime_id: Some(runtime_id.clone()),
+                loaded: true,
+                draft: seeded_draft,
+                ..Default::default()
+            };
+            if let Some(model) = model {
                 conversation.confirm_model(model);
             }
+            state.conversations.insert(id.clone(), conversation);
             state.creating = false;
-        }
+            prompt
+        };
         self.refresh_sessions();
         if self.select_created.replace(false) {
             self.select(&id, true);
+        }
+        if let Some(prompt) = launch_prompt {
+            self.send_initial_prompt(&id, runtime_id, prompt);
         }
     }
 
@@ -1427,46 +1794,84 @@ impl Ui {
                 }
             }
             other => {
-                if !self.apply_history(&mut state, &other) {
+                let meta = self.apply_history(&mut state, &other);
+                if meta == MetaOutcome::Unhandled {
                     self.apply_stream(&mut state, other);
+                } else {
+                    drop(state);
+                    self.finish_meta(meta);
                 }
             }
         }
     }
 
-    /// Session-list and failure events. Returns true when the event was handled.
-    /// Live-turn and history-page events are consumed by `apply` directly.
-    fn apply_history(&self, state: &mut AppState, event: &Event) -> bool {
+    /// Session-list, title, deletion, and failure events.
+    fn apply_history(&self, state: &mut AppState, event: &Event) -> MetaOutcome {
         match event {
+            Event::SessionTitle { session_id, title } => {
+                if state.apply_session_title(session_id, title) {
+                    MetaOutcome::RefreshSessions
+                } else {
+                    MetaOutcome::Handled
+                }
+            }
             Event::Deleted { stored_id } => {
-                state.sessions.retain(|s| &s.stored_id != stored_id);
-                state.conversations.remove(stored_id);
-                true
+                if state.remove_session(stored_id) {
+                    MetaOutcome::ResetToLaunch
+                } else {
+                    MetaOutcome::RefreshSessions
+                }
             }
             Event::Error {
                 operation,
                 session_id,
                 message,
             } => {
-                state.notice = format!("{operation}: {message}");
-                state.creating = false;
-                state.list_loading = false;
-                if let Some(id) = session_id {
-                    self.pending_resumes.borrow_mut().remove(id);
-                    let stored = if state.conversations.contains_key(id) {
-                        Some(id.clone())
-                    } else {
-                        state.stored_for_runtime(id)
-                    };
-                    if let Some(id) = stored {
-                        let c = state.conversations.get_mut(&id).unwrap();
-                        c.history_loading = false;
-                        c.operation_failed(operation, message.clone());
-                    }
-                }
-                true
+                self.record_error(state, operation, session_id.as_deref(), message);
+                MetaOutcome::Handled
             }
-            _ => false,
+            _ => MetaOutcome::Unhandled,
+        }
+    }
+
+    fn record_error(
+        &self,
+        state: &mut AppState,
+        operation: &str,
+        session_id: Option<&str>,
+        message: &str,
+    ) {
+        state.notice = format!("{operation}: {message}");
+        if operation == "create" {
+            state.cancel_pending_launch();
+        }
+        state.creating = false;
+        state.list_loading = false;
+        let Some(id) = session_id else {
+            return;
+        };
+        self.pending_resumes.borrow_mut().remove(id);
+        let stored = if state.conversations.contains_key(id) {
+            Some(id.to_string())
+        } else {
+            state.stored_for_runtime(id)
+        };
+        if let Some(c) = stored.and_then(|key| state.conversations.get_mut(&key)) {
+            c.history_loading = false;
+            c.operation_failed(operation, message.to_string());
+        }
+    }
+
+    fn finish_meta(&self, outcome: MetaOutcome) {
+        match outcome {
+            MetaOutcome::Unhandled | MetaOutcome::Handled => {}
+            MetaOutcome::RefreshSessions => self.refresh_sessions(),
+            MetaOutcome::ResetToLaunch => {
+                self.refresh_sessions();
+                let draft = self.state.borrow().launch_draft.clone();
+                self.set_editor_text(&draft);
+                self.editor.grab_focus();
+            }
         }
     }
 
@@ -1540,20 +1945,17 @@ impl Ui {
     fn refresh_sessions(&self) {
         let (rows, selected) = {
             let state = self.state.borrow();
-            let rows: Vec<_> = state
-                .sessions
+            let indices = state.visible_sessions();
+            let rows: Vec<_> = indices
                 .iter()
+                .filter_map(|&index| state.sessions.get(index))
                 .cloned()
                 .map(glib::BoxedAnyObject::new)
                 .collect();
-            let selected = state
-                .selected
-                .as_ref()
-                .and_then(|id| state.sessions.iter().position(|s| &s.stored_id == id))
-                .map(|index| index as u32)
-                .unwrap_or(gtk::INVALID_LIST_POSITION);
+            let selected = visible_selected_position(&state, &indices);
             (rows, selected)
         };
+        let visible_count = rows.len();
         // Drop the state borrow before these mutations. Hold the guard across
         // both: splice emits selection changes before the replacement position
         // is applied, and a nested handler must not clear this flag.
@@ -1561,17 +1963,18 @@ impl Ui {
         self.sessions.splice(0, self.sessions.n_items(), &rows);
         self.selection.set_selected(selected);
         self.suppress_selection.set(false);
+        let state = self.state.borrow();
+        self.triage.sync(&state, visible_count);
+        if let Some(palette) = self.palette.borrow().clone() {
+            palette.refresh_if_open(&state);
+        }
     }
 
     fn sync_sidebar_selection(&self) {
         let selected = {
             let state = self.state.borrow();
-            state
-                .selected
-                .as_ref()
-                .and_then(|id| state.sessions.iter().position(|s| &s.stored_id == id))
-                .map(|index| index as u32)
-                .unwrap_or(gtk::INVALID_LIST_POSITION)
+            let indices = state.visible_sessions();
+            visible_selected_position(&state, &indices)
         };
         self.suppress_selection.set(true);
         self.selection.set_selected(selected);
@@ -1656,27 +2059,17 @@ impl Ui {
                 "empty"
             },
         );
-        self.title.set_text(
-            selected
-                .and_then(|id| state.sessions.iter().find(|s| &s.stored_id == id))
-                .map_or("Hermes Native", |s| s.title.as_str()),
-        );
+        self.title.set_text(header_title(&state));
         self.notice.set_text(&state.notice);
         self.notice.set_visible(!state.notice.is_empty());
         let reason = conversation.and_then(|c| c.read_only_reason.as_deref());
         self.readonly.set_text(reason.unwrap_or_default());
         self.readonly.set_visible(reason.is_some());
-        self.activity.set_text(
-            if selected.is_some_and(|id| self.pending_resumes.borrow().contains(id)) {
-                "Loading server history…"
-            } else {
-                conversation.map_or("", |c| c.activity.as_str())
-            },
-        );
-        self.spinner.set_spinning(
-            conversation.is_some_and(|c| c.status.busy() || c.history_loading)
-                || selected.is_some_and(|id| self.pending_resumes.borrow().contains(id)),
-        );
+        let resume_loading = selected.is_some_and(|id| self.pending_resumes.borrow().contains(id));
+        self.activity
+            .set_text(activity_text(&state, resume_loading));
+        self.spinner
+            .set_spinning(spinner_active(&state, resume_loading));
         self.older
             .set_visible(conversation.is_some_and(|c| c.history_before > 0));
         self.older
@@ -1717,15 +2110,12 @@ impl Ui {
             .selected
             .as_ref()
             .is_some_and(|id| self.pending_resumes.borrow().contains(id));
-        self.editor
-            .set_editable(conversation.is_some_and(|c| c.read_only_reason.is_none()));
-        self.send.set_sensitive(
-            writable
-                && !reload_pending
-                && conversation.is_some_and(|c| {
-                    c.status != TurnStatus::Stopping && !c.draft.trim().is_empty()
-                }),
-        );
+        self.editor.set_editable(editor_editable(&state));
+        self.send
+            .set_sensitive(composer_send_sensitive(&state, reload_pending));
+        self.composer_hint.set_text(composer_hint_text(&state));
+        self.delete_chat
+            .set_visible(connected && state.selected.is_some());
         self.stop
             .set_visible(conversation.is_some_and(|c| c.status.busy()));
         self.stop.set_sensitive(
@@ -1741,6 +2131,10 @@ impl Ui {
                 && !matches!(state.connection, Some(ConnectionState::Connecting)),
         );
         self.refresh_model_trigger(conversation, &state.catalog, writable);
+        self.refresh_connection_badge(&state);
+    }
+
+    fn refresh_connection_badge(&self, state: &AppState) {
         self.connection.remove_css_class("connection-live");
         self.connection.remove_css_class("connection-error");
         match &state.connection {
@@ -2269,5 +2663,97 @@ mod tests {
         );
         assert!(tooltip.contains("next message"), "{tooltip}");
         assert!(tooltip.contains("Acme"), "{tooltip}");
+    }
+
+    #[test]
+    fn launch_composer_is_editable_and_arms_send_when_connected() {
+        let mut state = AppState::default();
+        assert!(editor_editable(&state));
+        assert!(!composer_send_sensitive(&state, false));
+        assert!(composer_hint_text(&state).contains("Enter to start a new chat"));
+
+        state.launch_draft = "  Explain Wayland  ".into();
+        assert!(!composer_send_sensitive(&state, false));
+        state.connection = Some(ConnectionState::Connected);
+        assert!(composer_send_sensitive(&state, false));
+
+        let _ = state.begin_launch_submit();
+        assert!(!editor_editable(&state));
+        assert!(!composer_send_sensitive(&state, false));
+        assert_eq!(activity_text(&state, false), "Starting conversation…");
+        assert!(spinner_active(&state, false));
+    }
+
+    #[test]
+    fn conversation_controls_track_readonly_steering_and_filtered_selection() {
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            sessions: vec![
+                SessionSummary {
+                    stored_id: "cron-1".into(),
+                    title: String::new(),
+                    source: "cron".into(),
+                    message_count: 1,
+                    ..Default::default()
+                },
+                SessionSummary {
+                    stored_id: "chat-1".into(),
+                    title: "Hyprland rice".into(),
+                    source: "tui".into(),
+                    message_count: 4,
+                    ..Default::default()
+                },
+            ],
+            selected: Some("cron-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(header_title(&state), "Hermes Native");
+        state.selected = Some("chat-1".into());
+        assert_eq!(header_title(&state), "Hyprland rice");
+
+        state.session_filter = SessionFilter::Chats;
+        let visible = state.visible_sessions();
+        assert_eq!(visible_selected_position(&state, &visible), 0);
+        state.session_filter = SessionFilter::Auto;
+        let visible = state.visible_sessions();
+        assert_eq!(
+            visible_selected_position(&state, &visible),
+            gtk::INVALID_LIST_POSITION
+        );
+
+        state.conversations.insert(
+            "chat-1".into(),
+            Conversation {
+                runtime_id: Some("rt-1".into()),
+                draft: "steer this".into(),
+                status: TurnStatus::Streaming,
+                ..Default::default()
+            },
+        );
+        assert!(composer_send_sensitive(&state, false));
+        assert!(composer_hint_text(&state).contains("steer"));
+    }
+
+    #[test]
+    fn shortcut_command_accepts_plain_ctrl_letters_only() {
+        assert_eq!(
+            shortcut_command(gdk::Key::k, gdk::ModifierType::CONTROL_MASK),
+            Some('k')
+        );
+        assert_eq!(
+            shortcut_command(gdk::Key::K, gdk::ModifierType::CONTROL_MASK),
+            Some('k')
+        );
+        assert_eq!(
+            shortcut_command(
+                gdk::Key::k,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+            ),
+            None
+        );
+        assert_eq!(
+            shortcut_command(gdk::Key::k, gdk::ModifierType::empty()),
+            None
+        );
     }
 }
