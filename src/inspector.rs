@@ -16,6 +16,7 @@ pub enum InspectorAction {
     AskSide(String),
     InsertDraft(String),
     JumpToMessage(usize),
+    BranchAt(usize),
 }
 
 type ActionCallback = Rc<RefCell<Option<Box<dyn Fn(InspectorAction)>>>>;
@@ -960,7 +961,7 @@ fn tool_subtitle_text(trace: &ToolTrace) -> String {
     trace.detail.clone()
 }
 
-fn build_outline_row(entry: &OutlineEntry, cb: &ActionCallback) -> gtk::Button {
+fn build_outline_row(entry: &OutlineEntry, cb: &ActionCallback) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -991,14 +992,34 @@ fn build_outline_row(entry: &OutlineEntry, cb: &ActionCallback) -> gtk::Button {
             .build(),
     );
 
-    let btn = gtk::Button::builder()
+    let jump_btn = gtk::Button::builder()
         .child(&row)
+        .hexpand(true)
         .css_classes(["flat", "outline-row"])
         .build();
     let target = entry.message_index;
-    let cb = cb.clone();
-    btn.connect_clicked(move |_| emit_action(&cb, InspectorAction::JumpToMessage(target)));
-    btn
+    let cb_jump = cb.clone();
+    jump_btn
+        .connect_clicked(move |_| emit_action(&cb_jump, InspectorAction::JumpToMessage(target)));
+
+    let fork_btn = gtk::Button::builder()
+        .label("⑂")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Branch conversation after this turn")
+        .css_classes(["flat", "side-action-btn"])
+        .build();
+    let fork_target = entry.end_message_index;
+    let cb_fork = cb.clone();
+    fork_btn
+        .connect_clicked(move |_| emit_action(&cb_fork, InspectorAction::BranchAt(fork_target)));
+
+    let container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .build();
+    container.append(&jump_btn);
+    container.append(&fork_btn);
+    container
 }
 
 pub fn tab_badge_label(base: &str, count: usize) -> String {

@@ -2,7 +2,8 @@ use std::time::{Duration, Instant};
 
 use hermes_native::backend::{self, Backend};
 use hermes_native::model::{
-    Catalog, ChatMessage, Command, Config, ConnectionState, Event, ModelIdentity, Role, TurnStatus,
+    Catalog, ChatMessage, Command, Config, ConnectionState, Event, ModelIdentity, RewindMode, Role,
+    SeedMessage, TurnStatus,
 };
 
 const WORD: &str = "lattice";
@@ -105,26 +106,206 @@ fn verify_reconnect_history(
 fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, String> {
     check_prompt_isolation()?;
     wait_connected(harness, Duration::from_secs(40))?;
+    prove_conversations_and_timeline(harness, created)?;
+    let switched = prove_model_switch(harness, created)?;
+    Ok(format!(
+        "connected created=4 turn1={WORD} turn2_context=true btw_snapshot=true branched_undo=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
+    ))
+}
+
+fn prove_conversations_and_timeline(
+    harness: &mut Harness,
+    created: &mut Vec<String>,
+) -> Result<(), String> {
     let first = create(harness, "hn-smoke-a")?;
     created.push(first.0.clone());
     let second = create(harness, "hn-smoke-b")?;
     created.push(second.0.clone());
-    let first_reply = submit(harness, &first.1, TURN_ONE)?.0;
-    let second_reply = submit(harness, &first.1, TURN_TWO)?.0;
-    let other_reply = submit(harness, &second.1, TURN_OTHER)?.0;
-    expect_words(&first_reply, &second_reply, &other_reply)?;
+    prove_initial_turns(harness, &first.1, &second.1)?;
     prove_side_question(harness, &first.1)?;
-    let saved = resume(harness, &second.0)?;
+    prove_branch_and_undo(harness, &first.0, &first.1, created)?;
+    prove_saved_and_reconnected(harness, &first.0, &second.0)
+}
+
+fn prove_initial_turns(
+    harness: &mut Harness,
+    first_rt: &str,
+    second_rt: &str,
+) -> Result<(), String> {
+    let first_reply = submit(harness, first_rt, TURN_ONE)?.0;
+    let second_reply = submit(harness, first_rt, TURN_TWO)?.0;
+    let other_reply = submit(harness, second_rt, TURN_OTHER)?.0;
+    expect_words(&first_reply, &second_reply, &other_reply)
+}
+
+fn prove_saved_and_reconnected(
+    harness: &mut Harness,
+    first_id: &str,
+    second_id: &str,
+) -> Result<(), String> {
+    let saved = resume(harness, second_id)?;
     assert_separate(&saved.1, "the second chat")?;
-    let resumed = resume(harness, &first.0)?;
+    let resumed = resume(harness, first_id)?;
     assert_context(&resumed.1)?;
     assert_side_unpersisted(&resumed.1)?;
-    verify_reconnect_history(harness, &first.0, &second.0)?;
+    verify_reconnect_history(harness, first_id, second_id)
+}
 
-    let switched = prove_model_switch(harness, created)?;
-    Ok(format!(
-        "connected created=3 turn1={WORD} turn2_context=true btw_snapshot=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
-    ))
+fn prove_branch_and_undo(
+    harness: &mut Harness,
+    parent_stored: &str,
+    parent_runtime: &str,
+    created: &mut Vec<String>,
+) -> Result<(), String> {
+    let (branch_stored, branch_runtime, branch_msgs) =
+        branch_point_in_time(harness, parent_stored, parent_runtime)?;
+    created.push(branch_stored.clone());
+    if branch_msgs.len() != 2 {
+        return Err(format!(
+            "point-in-time branch expected 2 messages, got {}",
+            branch_msgs.len()
+        ));
+    }
+    let (branch_reply, _) = submit(harness, &branch_runtime, TURN_TWO)?;
+    if branch_reply.trim() != WORD {
+        return Err(format!(
+            "branched chat lost parent context (len {})",
+            branch_reply.trim().len()
+        ));
+    }
+    let undone_msgs = undo_turn(harness, &branch_stored, &branch_runtime)?;
+    if undone_msgs.len() != 2 {
+        return Err(format!(
+            "session.undo expected 2 remaining messages, got {}",
+            undone_msgs.len()
+        ));
+    }
+    Ok(())
+}
+
+fn branch_point_in_time(
+    harness: &mut Harness,
+    parent_stored: &str,
+    parent_runtime: &str,
+) -> Result<(String, String, Vec<ChatMessage>), String> {
+    harness.send(Command::Branch {
+        stored_id: parent_stored.into(),
+        runtime_id: Some(parent_runtime.into()),
+        parent_title: "hn-smoke-a".into(),
+        before_loaded: 0,
+        visible_count: Some(2),
+        custom_title: Some("hn-smoke-branch".into()),
+        seed_fallback: vec![
+            SeedMessage {
+                role: "user".into(),
+                content: TURN_ONE.into(),
+            },
+            SeedMessage {
+                role: "assistant".into(),
+                content: WORD.into(),
+            },
+        ],
+    })?;
+    let start = Instant::now();
+    let mut found = None;
+    while start.elapsed() < Duration::from_secs(45) {
+        for event in harness.drain() {
+            if let Some(event) = note_branch(event, parent_stored, &mut found)? {
+                harness.events.push(event);
+            }
+        }
+        if let Some(out) = found {
+            return Ok(out);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("session.branch timed out".into())
+}
+
+fn note_branch(
+    event: Event,
+    parent_stored: &str,
+    found: &mut Option<(String, String, Vec<ChatMessage>)>,
+) -> Result<Option<Event>, String> {
+    match event {
+        Event::Branched {
+            session,
+            runtime_id,
+            messages,
+            ..
+        } if session.parent_session_id.as_deref() == Some(parent_stored) => {
+            *found = Some((session.stored_id, runtime_id, messages));
+            Ok(None)
+        }
+        Event::Error {
+            operation, message, ..
+        } if operation == "branch" => Err(format!("branch failed: {message}")),
+        Event::Connection(ConnectionState::Disconnected(message)) => {
+            Err(format!("disconnected during branch: {message}"))
+        }
+        other => Ok(Some(other)),
+    }
+}
+
+fn undo_turn(
+    harness: &mut Harness,
+    stored_id: &str,
+    runtime_id: &str,
+) -> Result<Vec<ChatMessage>, String> {
+    harness.send(Command::Undo {
+        stored_id: stored_id.into(),
+        runtime_id: runtime_id.into(),
+        mode: RewindMode::Undo,
+        prompt_text: TURN_TWO.into(),
+    })?;
+    let start = Instant::now();
+    let mut undone = None;
+    while start.elapsed() < Duration::from_secs(45) {
+        for event in harness.drain() {
+            if let Some(event) = note_undo(event, stored_id, &mut undone)? {
+                harness.events.push(event);
+            }
+        }
+        if let Some(messages) = undone {
+            return Ok(messages);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("session.undo timed out".into())
+}
+
+fn note_undo(
+    event: Event,
+    target_stored: &str,
+    undone: &mut Option<Vec<ChatMessage>>,
+) -> Result<Option<Event>, String> {
+    match event {
+        Event::Undone {
+            stored_id,
+            removed,
+            messages,
+            ..
+        } if stored_id == target_stored => {
+            if removed < 2 {
+                return Err(format!(
+                    "session.undo removed {removed} rows, expected >= 2"
+                ));
+            }
+            *undone = Some(messages);
+            Ok(None)
+        }
+        Event::Error {
+            operation,
+            session_id,
+            message,
+        } if operation == "undo" && session_id.as_deref() == Some(target_stored) => {
+            Err(format!("undo failed: {message}"))
+        }
+        Event::Connection(ConnectionState::Disconnected(message)) => {
+            Err(format!("disconnected during undo: {message}"))
+        }
+        other => Ok(Some(other)),
+    }
 }
 
 fn note_side(

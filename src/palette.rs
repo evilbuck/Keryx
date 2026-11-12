@@ -411,6 +411,8 @@ fn append_palette_badges(row: &gtk::Box, entry: &PaletteEntry) {
         badge.set_valign(gtk::Align::Center);
         if matches!(entry.action, PaletteAction::OpenSession(_)) && entry.badge == "CRON" {
             badge.add_css_class("source-auto");
+        } else if entry.badge == "PARENT" {
+            badge.add_css_class("fork-badge");
         }
         row.append(&badge);
     }
@@ -461,6 +463,7 @@ pub fn build_shortcut_hints() -> gtk::Box {
     ]));
     stack.append(&shortcut_hint_row(&[
         ("Ctrl+I", "Flight Deck"),
+        ("Ctrl+D", "Branch"),
         ("Alt+Enter", "Side-Ask"),
     ]));
     stack
@@ -511,6 +514,12 @@ pub fn bind_session_row(object: &glib::Object) {
         SourceKind::Interactive => "source-chat",
     });
     meta_row.append(&badge);
+    if session.is_branch {
+        let fork = gtk::Label::new(Some("⑂ FORK"));
+        fork.add_css_class("source-badge");
+        fork.add_css_class("fork-badge");
+        meta_row.append(&fork);
+    }
 
     let meta = gtk::Label::new(Some(&session_meta_line(&session, now_epoch_secs())));
     meta.set_xalign(0.0);

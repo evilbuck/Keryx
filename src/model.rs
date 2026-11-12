@@ -92,6 +92,8 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub read_only_reason: Option<String>,
     pub message_count: usize,
+    pub parent_session_id: Option<String>,
+    pub is_branch: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -225,7 +227,7 @@ pub enum Role {
     System,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatMessage {
     pub id: String,
     pub role: Role,
@@ -607,6 +609,31 @@ impl ModelState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewindMode {
+    /// Drop the last user turn and its reply (`intent: "undo"`).
+    Undo,
+    /// Drop the last user turn and load its prompt into the composer for editing (`intent: "retry"`).
+    EditRetry,
+    /// Drop the last user turn and immediately re-submit the same prompt (`intent: "retry"`).
+    Regenerate,
+}
+
+impl RewindMode {
+    pub fn wire_intent(self) -> &'static str {
+        match self {
+            Self::Undo => "undo",
+            Self::EditRetry | Self::Regenerate => "retry",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedMessage {
+    pub role: String,
+    pub content: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum Command {
     List {
@@ -641,6 +668,23 @@ pub enum Command {
     },
     Delete {
         stored_id: String,
+    },
+    /// Fork a live or read-only conversation (`session.branch`, `session.branch_stored`, or seeded `session.create`).
+    Branch {
+        stored_id: String,
+        runtime_id: Option<String>,
+        parent_title: String,
+        before_loaded: usize,
+        visible_count: Option<usize>,
+        custom_title: Option<String>,
+        seed_fallback: Vec<SeedMessage>,
+    },
+    /// Rewind the last user turn and everything after it (`session.undo`).
+    Undo {
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
     },
     /// Fetch the configured catalog for this connection.
     FetchModels,
@@ -677,6 +721,8 @@ pub enum ComposerIntent {
     Empty,
     Prompt(String),
     SideQuestion(String),
+    Branch(Option<String>),
+    Rewind(RewindMode),
 }
 
 pub fn parse_composer_input(raw: &str) -> ComposerIntent {
@@ -684,16 +730,47 @@ pub fn parse_composer_input(raw: &str) -> ComposerIntent {
     if trimmed.is_empty() {
         return ComposerIntent::Empty;
     }
+    if let Some(side) = parse_side_command(trimmed) {
+        return side;
+    }
+    if let Some(timeline) = parse_timeline_command(trimmed) {
+        return timeline;
+    }
+    ComposerIntent::Prompt(trimmed.to_string())
+}
+
+fn parse_side_command(trimmed: &str) -> Option<ComposerIntent> {
     for prefix in ["/btw", "/ask"] {
         if let Some(rest) = strip_command_prefix(trimmed, prefix) {
-            return if rest.is_empty() {
+            return Some(if rest.is_empty() {
                 ComposerIntent::Empty
             } else {
                 ComposerIntent::SideQuestion(rest.to_string())
-            };
+            });
         }
     }
-    ComposerIntent::Prompt(trimmed.to_string())
+    None
+}
+
+fn parse_timeline_command(trimmed: &str) -> Option<ComposerIntent> {
+    for prefix in ["/branch", "/fork"] {
+        if let Some(rest) = strip_command_prefix(trimmed, prefix) {
+            let custom = (!rest.is_empty()).then(|| rest.to_string());
+            return Some(ComposerIntent::Branch(custom));
+        }
+    }
+    let rewinds = [
+        ("/undo", RewindMode::Undo),
+        ("/retry", RewindMode::EditRetry),
+        ("/regen", RewindMode::Regenerate),
+        ("/regenerate", RewindMode::Regenerate),
+    ];
+    for (cmd, mode) in rewinds {
+        if strip_command_prefix(trimmed, cmd) == Some("") {
+            return Some(ComposerIntent::Rewind(mode));
+        }
+    }
+    None
 }
 
 fn strip_command_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
@@ -1050,6 +1127,7 @@ fn json_str(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
 pub struct OutlineEntry {
     pub turn_number: usize,
     pub message_index: usize,
+    pub end_message_index: usize,
     pub title: String,
     pub meta: String,
     pub code_blocks: usize,
@@ -1069,7 +1147,12 @@ pub fn build_outline(messages: &[ChatMessage]) -> Vec<OutlineEntry> {
                 .get(turn_idx + 1)
                 .copied()
                 .unwrap_or(messages.len());
-            outline_for_slice(turn_idx + 1, start, &messages[start..end])
+            outline_for_slice(
+                turn_idx + 1,
+                start,
+                end.saturating_sub(1),
+                &messages[start..end],
+            )
         })
         .collect()
 }
@@ -1077,6 +1160,7 @@ pub fn build_outline(messages: &[ChatMessage]) -> Vec<OutlineEntry> {
 fn outline_for_slice(
     turn_number: usize,
     message_index: usize,
+    end_message_index: usize,
     slice: &[ChatMessage],
 ) -> OutlineEntry {
     let title = slice
@@ -1097,10 +1181,75 @@ fn outline_for_slice(
     OutlineEntry {
         turn_number,
         message_index,
+        end_message_index,
         title,
         meta: format_outline_meta(replied, tools, code_blocks),
         code_blocks,
     }
+}
+
+pub fn is_branchable_message(message: &ChatMessage) -> bool {
+    matches!(message.role, Role::User | Role::Assistant) && !message.text.trim().is_empty()
+}
+
+pub fn count_visible_branch_messages(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| is_branchable_message(message))
+        .count()
+}
+
+/// Server-side `session.branch` `count` argument for forking up through `index` (inclusive).
+/// Returns `None` when `index` includes all visible messages (meaning a whole-session branch).
+pub fn visible_branch_count_through(messages: &[ChatMessage], index: usize) -> Option<usize> {
+    if messages.is_empty() {
+        return None;
+    }
+    let capped = index.min(messages.len() - 1);
+    let prefix = count_visible_branch_messages(&messages[..=capped]);
+    let total = count_visible_branch_messages(messages);
+    (prefix > 0 && prefix < total).then_some(prefix)
+}
+
+pub fn seed_messages_through(
+    messages: &[ChatMessage],
+    end_inclusive: Option<usize>,
+) -> Vec<SeedMessage> {
+    let slice = match end_inclusive {
+        Some(idx) if !messages.is_empty() => &messages[..=idx.min(messages.len() - 1)],
+        _ => messages,
+    };
+    slice
+        .iter()
+        .filter(|m| is_branchable_message(m))
+        .map(|m| SeedMessage {
+            role: if m.role == Role::User {
+                "user".into()
+            } else {
+                "assistant".into()
+            },
+            content: m.text.clone(),
+        })
+        .collect()
+}
+
+/// Identifies `(last_user_id, last_assistant_after_user_id, last_user_text)` for inline rewind actions.
+pub fn last_turn_targets(
+    messages: &[ChatMessage],
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(user_idx) = messages
+        .iter()
+        .rposition(|m| m.role == Role::User && !m.text.trim().is_empty())
+    else {
+        return (None, None, None);
+    };
+    let user = &messages[user_idx];
+    let assistant_id = messages[user_idx + 1..]
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant && !m.text.trim().is_empty())
+        .map(|m| m.id.clone());
+    (Some(user.id.clone()), assistant_id, Some(user.text.clone()))
 }
 
 fn count_fenced_blocks(markdown: &str) -> usize {
@@ -1149,6 +1298,23 @@ pub enum Event {
         session: SessionSummary,
         runtime_id: String,
         model: Option<ModelIdentity>,
+    },
+    Branched {
+        session: SessionSummary,
+        parent_title: String,
+        runtime_id: String,
+        messages: Vec<ChatMessage>,
+        before: usize,
+        model: Option<ModelIdentity>,
+    },
+    Undone {
+        stored_id: String,
+        runtime_id: String,
+        removed: usize,
+        messages: Vec<ChatMessage>,
+        before: usize,
+        mode: RewindMode,
+        prompt_text: String,
     },
     Resumed {
         stored_id: String,
@@ -1299,6 +1465,7 @@ pub struct Conversation {
     pub loaded: bool,
     pub history_before: usize,
     pub history_loading: bool,
+    pub rewinding: bool,
     pub revision: u64,
     pub inspector_revision: u64,
     pub model: ModelState,
@@ -1456,6 +1623,10 @@ impl Conversation {
     }
 
     pub fn operation_failed(&mut self, operation: &str, message: String) {
+        if matches!(operation, "branch" | "undo") {
+            self.rewinding = false;
+            self.activity.clear();
+        }
         if self.status.busy() && matches!(operation, "submit" | "gateway") {
             self.status = TurnStatus::Failed;
             self.activity = message;
@@ -1833,6 +2004,8 @@ fn ensure_tool_entry<'a>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     NewChat,
+    BranchCurrent,
+    RewindLast(RewindMode),
     SwitchModel,
     ToggleSidebar,
     ToggleInspector,
@@ -1887,6 +2060,7 @@ impl PaletteEntry {
 pub struct AppState {
     pub sessions: Vec<SessionSummary>,
     pub conversations: HashMap<String, Conversation>,
+    pub branch_parents: HashMap<String, (String, String)>,
     pub selected: Option<String>,
     pub connection: Option<ConnectionState>,
     pub list_has_more: bool,
@@ -1926,6 +2100,70 @@ impl AppState {
         } else {
             self.sessions.push(session);
         }
+        self.sync_branch_flags();
+    }
+
+    pub fn record_branch(&mut self, child_id: &str, parent_id: &str, parent_title: &str) {
+        if child_id.is_empty() || parent_id.is_empty() {
+            return;
+        }
+        self.branch_parents.insert(
+            child_id.to_string(),
+            (parent_id.to_string(), fallback_session_title(parent_title)),
+        );
+        self.sync_branch_flags();
+    }
+
+    /// Recompute `is_branch` on loaded session summaries. Auto-compressed predecessors are
+    /// hidden by `GET /api/sessions`, so only true forks have a visible parent row or `(branch)` title.
+    pub fn sync_branch_flags(&mut self) {
+        let known_ids: std::collections::HashSet<String> =
+            self.sessions.iter().map(|s| s.stored_id.clone()).collect();
+        for session in &mut self.sessions {
+            session.is_branch = self.branch_parents.contains_key(&session.stored_id)
+                || session.parent_session_id.as_ref().is_some_and(|pid| {
+                    pid != &session.stored_id
+                        && (known_ids.contains(pid) || session.title.ends_with(" (branch)"))
+                });
+        }
+    }
+
+    pub fn parent_for(&self, stored_id: &str) -> Option<(String, String)> {
+        if let Some((pid, saved_title)) = self.branch_parents.get(stored_id) {
+            let live_title = self
+                .sessions
+                .iter()
+                .find(|s| s.stored_id == *pid)
+                .map(|s| fallback_session_title(&s.title))
+                .unwrap_or_else(|| saved_title.clone());
+            return Some((pid.clone(), live_title));
+        }
+        let session = self.sessions.iter().find(|s| s.stored_id == stored_id)?;
+        let pid = session.parent_session_id.as_ref()?;
+        if pid == stored_id {
+            return None;
+        }
+        if let Some(parent) = self.sessions.iter().find(|s| &s.stored_id == pid) {
+            return Some((pid.clone(), fallback_session_title(&parent.title)));
+        }
+        session.title.ends_with(" (branch)").then(|| {
+            let stripped = session.title.trim_end_matches(" (branch)");
+            (pid.clone(), fallback_session_title(stripped))
+        })
+    }
+
+    pub fn branches_of(&self, stored_id: &str) -> Vec<&SessionSummary> {
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.stored_id != stored_id
+                    && (s.parent_session_id.as_deref() == Some(stored_id)
+                        || self
+                            .branch_parents
+                            .get(&s.stored_id)
+                            .is_some_and(|(pid, _)| pid == stored_id))
+            })
+            .collect()
     }
 
     pub fn filter_counts(&self) -> (usize, usize, usize) {
@@ -1951,7 +2189,11 @@ impl AppState {
         }
         let mut ranked: Vec<(usize, usize)> = filtered
             .filter_map(|(index, s)| {
-                let key = normalize(&format!("{} {} {}", s.title, s.source, s.stored_id));
+                let fork_tag = if s.is_branch { "branch fork" } else { "" };
+                let key = normalize(&format!(
+                    "{} {} {} {fork_tag}",
+                    s.title, s.source, s.stored_id
+                ));
                 match_tokens(&key, &tokens).map(|score| (score, index))
             })
             .collect();
@@ -2035,6 +2277,9 @@ impl AppState {
     pub fn remove_session(&mut self, stored_id: &str) -> bool {
         self.sessions.retain(|s| s.stored_id != stored_id);
         self.conversations.remove(stored_id);
+        self.branch_parents.remove(stored_id);
+        self.branch_parents.retain(|_, (pid, _)| pid != stored_id);
+        self.sync_branch_flags();
         if self.selected.as_deref() == Some(stored_id) {
             self.selected = None;
             true
@@ -2062,7 +2307,17 @@ impl AppState {
             );
             conversation.runtime_id = None;
             conversation.history_loading = false;
+            conversation.rewinding = false;
         }
+    }
+}
+
+fn fallback_session_title(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "Untitled conversation".into()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -2109,6 +2364,12 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
             "Ctrl+N",
         ));
     }
+    out.extend(palette_timeline_commands(
+        state,
+        conversation,
+        connected,
+        writable,
+    ));
     if writable && conversation.is_some_and(|c| !c.model.switching()) {
         out.push(PaletteEntry::command(
             PaletteAction::SwitchModel,
@@ -2121,6 +2382,64 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
     out.extend(palette_inspector_commands(state, writable));
     out.extend(palette_filter_commands(state));
     out.extend(palette_utility_commands(state, connected));
+    out
+}
+
+fn palette_timeline_commands(
+    state: &AppState,
+    conversation: Option<&Conversation>,
+    connected: bool,
+    writable: bool,
+) -> Vec<PaletteEntry> {
+    let mut out = Vec::new();
+    if connected
+        && !state.creating
+        && conversation
+            .is_some_and(|c| !c.status.busy() && count_visible_branch_messages(&c.messages) > 0)
+    {
+        out.push(PaletteEntry::command(
+            PaletteAction::BranchCurrent,
+            "media-playlist-shuffle-symbolic",
+            "Branch conversation",
+            "Fork saved history into an independent writable thread",
+            "Ctrl+D",
+        ));
+    }
+    if let Some((parent_id, parent_title)) = state
+        .selected
+        .as_deref()
+        .and_then(|id| state.parent_for(id))
+    {
+        let mut entry = PaletteEntry::command(
+            PaletteAction::OpenSession(parent_id),
+            "go-up-symbolic",
+            format!("Open parent conversation: {parent_title}"),
+            "Jump back to the conversation this branch forked from",
+            "",
+        );
+        entry.badge = "PARENT".into();
+        out.push(entry);
+    }
+    if writable
+        && conversation.is_some_and(|c| {
+            !c.status.busy() && !c.rewinding && last_turn_targets(&c.messages).0.is_some()
+        })
+    {
+        out.push(PaletteEntry::command(
+            PaletteAction::RewindLast(RewindMode::EditRetry),
+            "document-edit-symbolic",
+            "Edit & retry last turn",
+            "Rewind the last exchange and load your prompt into the composer",
+            "",
+        ));
+        out.push(PaletteEntry::command(
+            PaletteAction::RewindLast(RewindMode::Regenerate),
+            "view-refresh-symbolic",
+            "Regenerate last response",
+            "Rewind the last exchange and run the prompt again",
+            "",
+        ));
+    }
     out
 }
 
@@ -2280,11 +2599,15 @@ fn palette_sessions(state: &AppState, now_epoch_secs: i64) -> Vec<PaletteEntry> 
             } else {
                 session.title.clone()
             };
+            let mut subtitle = session_meta_line(session, now_epoch_secs);
+            if session.is_branch {
+                subtitle.push_str(" · fork");
+            }
             PaletteEntry {
                 action: PaletteAction::OpenSession(session.stored_id.clone()),
                 icon,
                 title,
-                subtitle: session_meta_line(session, now_epoch_secs),
+                subtitle,
                 shortcut: "",
                 badge: source_badge(&session.source),
                 active: state.selected.as_deref() == Some(session.stored_id.as_str()),
@@ -2892,6 +3215,7 @@ mod tests {
             updated_at: "1700000000".into(),
             read_only_reason: None,
             message_count: count,
+            ..Default::default()
         }
     }
 
@@ -3225,7 +3549,209 @@ mod tests {
         assert_eq!(outline.len(), 1);
         assert_eq!(outline[0].turn_number, 1);
         assert_eq!(outline[0].message_index, 0);
+        assert_eq!(outline[0].end_message_index, 2);
         assert_eq!(outline[0].code_blocks, 1);
         assert_eq!(outline[0].meta, "1 tool · 1 code block");
+    }
+
+    #[test]
+    fn slash_commands_parse_branch_fork_undo_retry_and_regenerate() {
+        assert_eq!(
+            parse_composer_input("/branch"),
+            ComposerIntent::Branch(None)
+        );
+        assert_eq!(
+            parse_composer_input("  /branch    Try async channel  "),
+            ComposerIntent::Branch(Some("Try async channel".into()))
+        );
+        assert_eq!(
+            parse_composer_input("/fork Wayland experiment"),
+            ComposerIntent::Branch(Some("Wayland experiment".into()))
+        );
+        assert_eq!(
+            parse_composer_input("/undo"),
+            ComposerIntent::Rewind(RewindMode::Undo)
+        );
+        assert_eq!(
+            parse_composer_input("/retry"),
+            ComposerIntent::Rewind(RewindMode::EditRetry)
+        );
+        assert_eq!(
+            parse_composer_input("/regen"),
+            ComposerIntent::Rewind(RewindMode::Regenerate)
+        );
+        assert_eq!(
+            parse_composer_input("/regenerate"),
+            ComposerIntent::Rewind(RewindMode::Regenerate)
+        );
+        assert_eq!(RewindMode::Undo.wire_intent(), "undo");
+        assert_eq!(RewindMode::EditRetry.wire_intent(), "retry");
+        assert_eq!(RewindMode::Regenerate.wire_intent(), "retry");
+    }
+
+    #[test]
+    fn visible_branch_counts_and_seeds_skip_tool_rows_and_detect_prefix() {
+        let messages = vec![
+            ChatMessage {
+                id: "u1".into(),
+                role: Role::User,
+                text: "First prompt".into(),
+            },
+            ChatMessage {
+                id: "t1".into(),
+                role: Role::Tool,
+                text: "Used grep".into(),
+            },
+            ChatMessage {
+                id: "a1".into(),
+                role: Role::Assistant,
+                text: "First answer".into(),
+            },
+            ChatMessage {
+                id: "u2".into(),
+                role: Role::User,
+                text: "Second prompt".into(),
+            },
+            ChatMessage {
+                id: "a2".into(),
+                role: Role::Assistant,
+                text: "Second answer".into(),
+            },
+        ];
+        assert_eq!(count_visible_branch_messages(&messages), 4);
+        assert_eq!(visible_branch_count_through(&messages, 0), Some(1));
+        assert_eq!(visible_branch_count_through(&messages, 2), Some(2));
+        assert_eq!(visible_branch_count_through(&messages, 4), None);
+
+        let seeded = seed_messages_through(&messages, Some(2));
+        assert_eq!(
+            seeded,
+            vec![
+                SeedMessage {
+                    role: "user".into(),
+                    content: "First prompt".into()
+                },
+                SeedMessage {
+                    role: "assistant".into(),
+                    content: "First answer".into()
+                },
+            ]
+        );
+        assert_eq!(
+            last_turn_targets(&messages),
+            (
+                Some("u2".into()),
+                Some("a2".into()),
+                Some("Second prompt".into())
+            )
+        );
+    }
+
+    #[test]
+    fn lineage_sync_flags_true_forks_without_marking_compressed_predecessors() {
+        let mut state = AppState {
+            sessions: vec![
+                SessionSummary {
+                    stored_id: "root".into(),
+                    title: "Architecture design".into(),
+                    source: "tui".into(),
+                    ..Default::default()
+                },
+                SessionSummary {
+                    stored_id: "fork-1".into(),
+                    title: "Architecture design (branch)".into(),
+                    source: "tui".into(),
+                    parent_session_id: Some("root".into()),
+                    ..Default::default()
+                },
+                SessionSummary {
+                    stored_id: "compressed-tip".into(),
+                    title: "Long running chat".into(),
+                    source: "tui".into(),
+                    parent_session_id: Some("hidden-old-segment".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        state.sync_branch_flags();
+        assert!(!state.sessions[0].is_branch);
+        assert!(state.sessions[1].is_branch);
+        assert!(!state.sessions[2].is_branch);
+        assert_eq!(
+            state.parent_for("fork-1"),
+            Some(("root".into(), "Architecture design".into()))
+        );
+        assert_eq!(state.parent_for("compressed-tip"), None);
+        assert_eq!(state.branches_of("root").len(), 1);
+
+        state.session_query = "fork".into();
+        assert_eq!(state.visible_sessions(), vec![1]);
+    }
+
+    #[test]
+    fn palette_surfaces_branch_rewind_and_parent_jump_actions() {
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            selected: Some("fork-1".into()),
+            sessions: vec![
+                SessionSummary {
+                    stored_id: "root".into(),
+                    title: "Base chat".into(),
+                    source: "tui".into(),
+                    ..Default::default()
+                },
+                SessionSummary {
+                    stored_id: "fork-1".into(),
+                    title: "Base chat (branch)".into(),
+                    source: "tui".into(),
+                    parent_session_id: Some("root".into()),
+                    is_branch: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        state.conversations.insert(
+            "fork-1".into(),
+            Conversation {
+                runtime_id: Some("rt-fork".into()),
+                messages: vec![
+                    ChatMessage {
+                        id: "u1".into(),
+                        role: Role::User,
+                        text: "Hello".into(),
+                    },
+                    ChatMessage {
+                        id: "a1".into(),
+                        role: Role::Assistant,
+                        text: "Hi".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let entries = build_palette_entries(&state, "", 1_700_000_000);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == PaletteAction::BranchCurrent)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == PaletteAction::RewindLast(RewindMode::EditRetry))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.action == PaletteAction::RewindLast(RewindMode::Regenerate))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.badge == "PARENT"
+                    && e.action == PaletteAction::OpenSession("root".into()))
+        );
     }
 }

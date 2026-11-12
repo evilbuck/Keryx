@@ -8,8 +8,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::model::{
     Catalog, ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event,
-    InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, Role, SessionSummary,
-    SteerOutcome, ToolEventUpdate, TurnStatus, parse_live_info_telemetry, parse_telemetry_payload,
+    InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, RewindMode, Role,
+    SeedMessage, SessionSummary, SteerOutcome, ToolEventUpdate, TurnStatus,
+    parse_live_info_telemetry, parse_telemetry_payload, seed_messages_through,
 };
 
 const PAGE: usize = 50;
@@ -217,6 +218,75 @@ fn queued_submit_params(runtime_id: &str, text: &str) -> Value {
     json!({"session_id": runtime_id, "text": text, "queued": true})
 }
 
+fn default_branch_title(parent_title: &str, custom_title: Option<&str>) -> String {
+    if let Some(name) = custom_title.map(str::trim).filter(|s| !s.is_empty()) {
+        return name.to_string();
+    }
+    let clean = parent_title.trim();
+    if clean.is_empty() {
+        "Conversation (branch)".into()
+    } else {
+        format!("{clean} (branch)")
+    }
+}
+
+fn branch_rpc_params(runtime_id: &str, custom_title: Option<&str>, count: Option<usize>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("session_id".into(), Value::String(runtime_id.to_string()));
+    if let Some(name) = custom_title.map(str::trim).filter(|s| !s.is_empty()) {
+        map.insert("name".into(), Value::String(name.to_string()));
+    }
+    if let Some(limit) = count.filter(|&n| n > 0) {
+        map.insert("count".into(), json!(limit));
+    }
+    Value::Object(map)
+}
+
+fn seeded_branch_params(title: &str, parent_stored_id: &str, seed: &[SeedMessage]) -> Value {
+    let rows: Vec<Value> = seed
+        .iter()
+        .map(|m| json!({"role": m.role, "content": m.content}))
+        .collect();
+    json!({
+        "title": title,
+        "parent_session_id": parent_stored_id,
+        "messages": rows,
+    })
+}
+
+fn undo_rpc_params(runtime_id: &str, mode: RewindMode) -> Value {
+    json!({
+        "session_id": runtime_id,
+        "intent": mode.wire_intent(),
+    })
+}
+
+fn extract_session_ids(result: &Value) -> Option<(String, String)> {
+    let runtime_id = result
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let stored_id = result
+        .get("stored_session_id")
+        .or_else(|| result.get("session_key"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((runtime_id, stored_id))
+}
+
+struct PendingBranch {
+    stored_id: String,
+    temp_runtime_id: String,
+    parent_stored_id: String,
+    parent_title: String,
+    title: String,
+    count: usize,
+    fallback_messages: Vec<ChatMessage>,
+    model: Option<ModelIdentity>,
+}
+
 struct Job {
     kind: JobKind,
     deadline: Instant,
@@ -274,6 +344,40 @@ enum JobKind {
     SideQuestion {
         runtime_id: String,
         client_id: u64,
+    },
+    Branch {
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_seed: Vec<SeedMessage>,
+    },
+    BranchClose(PendingBranch),
+    BranchResume(PendingBranch),
+    BranchStored {
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_seed: Vec<SeedMessage>,
+    },
+    BranchSeeded {
+        parent_stored_id: String,
+        parent_title: String,
+        title: String,
+        seed_count: usize,
+    },
+    Undo {
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        attempts: u8,
+    },
+    UndoSync {
+        stored_id: String,
+        runtime_id: String,
+        removed: usize,
+        mode: RewindMode,
+        prompt_text: String,
     },
 }
 
@@ -654,6 +758,7 @@ impl Link {
                 answer,
             } => self.respond(runtime_id, request_id, answer).await,
             Command::Delete { stored_id } => self.begin_delete(stored_id).await,
+            Command::Branch { .. } | Command::Undo { .. } => self.timeline_command(command).await,
             Command::FetchModels | Command::SetModel { .. } | Command::AskSide { .. } => {
                 self.model_command(command).await;
             }
@@ -681,6 +786,15 @@ impl Link {
                 client_id,
                 message: "Not connected. Reconnect to try again.".into(),
             })
+            .await;
+            return;
+        }
+        if let Command::Undo { stored_id, .. } | Command::Branch { stored_id, .. } = command {
+            self.fail(
+                "timeline",
+                Some(stored_id),
+                "Not connected. Reconnect to try again.",
+            )
             .await;
             return;
         }
@@ -864,6 +978,227 @@ impl Link {
                 message: send_fault_message("btw", fault),
             })
             .await;
+        }
+    }
+
+    async fn timeline_command(&mut self, command: Command) {
+        match command {
+            Command::Branch {
+                stored_id,
+                runtime_id,
+                parent_title,
+                before_loaded,
+                visible_count,
+                custom_title,
+                seed_fallback,
+            } => {
+                self.begin_branch(
+                    stored_id,
+                    runtime_id,
+                    parent_title,
+                    before_loaded,
+                    visible_count,
+                    custom_title,
+                    seed_fallback,
+                )
+                .await;
+            }
+            Command::Undo {
+                stored_id,
+                runtime_id,
+                mode,
+                prompt_text,
+            } => {
+                self.begin_undo(stored_id, runtime_id, mode, prompt_text)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_branch(
+        &mut self,
+        stored_id: String,
+        runtime_id: Option<String>,
+        parent_title: String,
+        before_loaded: usize,
+        visible_count: Option<usize>,
+        custom_title: Option<String>,
+        seed_fallback: Vec<SeedMessage>,
+    ) {
+        let fallback_title = default_branch_title(&parent_title, custom_title.as_deref());
+        let (total_visible, full_seed) =
+            if before_loaded > 0 && (visible_count.is_some() || runtime_id.is_none()) {
+                match self.fetch_earlier_visible(&stored_id, before_loaded).await {
+                    Ok(mut earlier) => {
+                        let prefix_len = earlier.len();
+                        earlier.extend(seed_fallback);
+                        (visible_count.map(|v| prefix_len + v), earlier)
+                    }
+                    Err(err) => {
+                        self.fail("branch", Some(stored_id), err).await;
+                        return;
+                    }
+                }
+            } else {
+                (visible_count, seed_fallback)
+            };
+        if let Some(rt) = runtime_id {
+            let params = branch_rpc_params(&rt, custom_title.as_deref(), total_visible);
+            if let Err(fault) = self
+                .send_rpc(
+                    "session.branch",
+                    params,
+                    JobKind::Branch {
+                        parent_stored_id: stored_id.clone(),
+                        parent_title,
+                        fallback_title,
+                        fallback_seed: full_seed,
+                    },
+                    RPC_TIMEOUT,
+                )
+                .await
+            {
+                self.fail(
+                    "branch",
+                    Some(stored_id),
+                    send_fault_message("branch", fault),
+                )
+                .await;
+            }
+        } else if total_visible.is_none() && custom_title.is_none() {
+            self.begin_stored_branch(stored_id, parent_title, fallback_title, full_seed)
+                .await;
+        } else {
+            self.begin_seeded_branch(stored_id, parent_title, fallback_title, full_seed)
+                .await;
+        }
+    }
+
+    async fn begin_stored_branch(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_seed: Vec<SeedMessage>,
+    ) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.branch_stored",
+                json!({"parent_session_id": parent_stored_id}),
+                JobKind::BranchStored {
+                    parent_stored_id: parent_stored_id.clone(),
+                    parent_title,
+                    fallback_title,
+                    fallback_seed,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn begin_seeded_branch(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        title: String,
+        seed: Vec<SeedMessage>,
+    ) {
+        if seed.is_empty() {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                "Nothing to branch — send a message first.",
+            )
+            .await;
+            return;
+        }
+        let params = seeded_branch_params(&title, &parent_stored_id, &seed);
+        let seed_count = seed.len();
+        if let Err(fault) = self
+            .send_rpc(
+                "session.create",
+                params,
+                JobKind::BranchSeeded {
+                    parent_stored_id: parent_stored_id.clone(),
+                    parent_title,
+                    title,
+                    seed_count,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn fetch_earlier_visible(
+        &self,
+        stored_id: &str,
+        before_loaded: usize,
+    ) -> Result<Vec<SeedMessage>, String> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset < before_loaded {
+            let limit = (before_loaded - offset).min(PAGE);
+            let page = fetch_history(&self.http, &self.origin, stored_id, offset, limit).await?;
+            out.extend(seed_messages_through(&page, None));
+            offset += limit;
+        }
+        Ok(out)
+    }
+
+    async fn begin_undo(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+    ) {
+        self.send_undo(stored_id, runtime_id, mode, prompt_text, 0)
+            .await;
+    }
+
+    async fn send_undo(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        attempts: u8,
+    ) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.undo",
+                undo_rpc_params(&runtime_id, mode),
+                JobKind::Undo {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                    mode,
+                    prompt_text,
+                    attempts,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail("undo", Some(stored_id), send_fault_message("undo", fault))
+                .await;
         }
     }
 
@@ -1876,7 +2211,390 @@ impl Link {
             JobKind::DeleteResume { stored_id } => {
                 self.on_delete_resume_reply(stored_id, result).await
             }
+            kind => self.on_timeline_job(kind, result).await,
         }
+    }
+
+    async fn on_timeline_job(&mut self, kind: JobKind, result: &Value) {
+        match kind {
+            JobKind::Branch {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                self.on_live_branch_reply(
+                    parent_stored_id,
+                    parent_title,
+                    fallback_title,
+                    fallback_seed.len(),
+                    result,
+                )
+                .await;
+            }
+            JobKind::BranchClose(pending) => self.reopen_branched(pending).await,
+            JobKind::BranchResume(pending) => {
+                self.finish_reopened_branch(pending, result).await;
+            }
+            JobKind::BranchStored {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                self.on_branched(
+                    parent_stored_id,
+                    parent_title,
+                    fallback_title,
+                    fallback_seed.len(),
+                    result,
+                )
+                .await;
+            }
+            JobKind::BranchSeeded {
+                parent_stored_id,
+                parent_title,
+                title,
+                seed_count,
+            } => {
+                self.on_branched(parent_stored_id, parent_title, title, seed_count, result)
+                    .await;
+            }
+            JobKind::Undo {
+                stored_id,
+                runtime_id,
+                mode,
+                prompt_text,
+                ..
+            } => {
+                self.on_undo_reply(stored_id, runtime_id, mode, prompt_text, result)
+                    .await;
+            }
+            JobKind::UndoSync {
+                stored_id,
+                runtime_id,
+                removed,
+                mode,
+                prompt_text,
+            } => {
+                self.on_undo_sync_reply(stored_id, runtime_id, removed, mode, prompt_text, result)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    fn build_pending_branch(
+        &self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_count: usize,
+        result: &Value,
+    ) -> Option<PendingBranch> {
+        let (temp_runtime_id, stored_id) = extract_session_ids(result)?;
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .map_or(fallback_count, |n| n as usize);
+        let raw_title = payload_str(result, &["title"]);
+        let title = if raw_title.is_empty() {
+            fallback_title
+        } else {
+            self.clean(raw_title)
+        };
+        let fallback_messages = result
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|rows| messages_from(rows))
+            .unwrap_or_default();
+        Some(PendingBranch {
+            stored_id,
+            temp_runtime_id,
+            parent_stored_id,
+            parent_title,
+            title,
+            count,
+            fallback_messages,
+            model: model_identity(result),
+        })
+    }
+
+    /// Hermes v0.23.0 `session.branch` leaves `branch_db = None` on the child's initial
+    /// runtime in the default profile (`methods_session_branch.py:33`), while the branch row
+    /// and copied messages are already persisted in SQLite. Closing that transient runtime and
+    /// immediately resuming `stored_id` binds a full DB-backed runtime so subsequent turns and
+    /// `session.undo` rewinds persist cleanly.
+    async fn on_live_branch_reply(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_count: usize,
+        result: &Value,
+    ) {
+        let Some(pending) = self.build_pending_branch(
+            parent_stored_id.clone(),
+            parent_title,
+            fallback_title,
+            fallback_count,
+            result,
+        ) else {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                "The gateway did not return a branched conversation id.",
+            )
+            .await;
+            return;
+        };
+        let temp_rt = pending.temp_runtime_id.clone();
+        let parent_id = pending.parent_stored_id.clone();
+        if let Err(fault) = self
+            .send_rpc(
+                "session.close",
+                json!({"session_id": temp_rt}),
+                JobKind::BranchClose(pending),
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn reopen_branched(&mut self, pending: PendingBranch) {
+        let stored_id = pending.stored_id.clone();
+        let parent_id = pending.parent_stored_id.clone();
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::BranchResume(pending),
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn finish_reopened_branch(&mut self, pending: PendingBranch, result: &Value) {
+        let runtime_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| pending.temp_runtime_id.clone());
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .map_or(pending.count, |n| n as usize);
+        let model = model_identity(result).or(pending.model.clone());
+        self.emit_branched_session(
+            pending.stored_id,
+            runtime_id.clone(),
+            pending.parent_stored_id,
+            pending.parent_title,
+            pending.title,
+            count,
+            pending.fallback_messages,
+            model,
+        )
+        .await;
+        self.emit_live_info(&runtime_id, result).await;
+    }
+
+    async fn on_branched(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_count: usize,
+        result: &Value,
+    ) {
+        let Some(pending) = self.build_pending_branch(
+            parent_stored_id.clone(),
+            parent_title,
+            fallback_title,
+            fallback_count,
+            result,
+        ) else {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                "The gateway did not return a branched conversation id.",
+            )
+            .await;
+            return;
+        };
+        let runtime_id = pending.temp_runtime_id.clone();
+        self.emit_branched_session(
+            pending.stored_id,
+            runtime_id.clone(),
+            pending.parent_stored_id,
+            pending.parent_title,
+            pending.title,
+            pending.count,
+            pending.fallback_messages,
+            pending.model,
+        )
+        .await;
+        self.emit_live_info(&runtime_id, result).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_branched_session(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        parent_stored_id: String,
+        parent_title: String,
+        title: String,
+        count: usize,
+        fallback_messages: Vec<ChatMessage>,
+        model: Option<ModelIdentity>,
+    ) {
+        self.runtime_of
+            .insert(stored_id.clone(), runtime_id.clone());
+        self.message_counts.insert(stored_id.clone(), count);
+        let before = count.saturating_sub(PAGE);
+        let messages = self
+            .load_branch_messages(&stored_id, before, count - before, fallback_messages)
+            .await;
+        self.emit(Event::Branched {
+            session: SessionSummary {
+                stored_id,
+                title,
+                source: "tui".into(),
+                updated_at: crate::palette::now_epoch_secs().to_string(),
+                read_only_reason: None,
+                message_count: before + messages.len(),
+                parent_session_id: Some(parent_stored_id),
+                is_branch: true,
+            },
+            parent_title,
+            runtime_id,
+            messages,
+            before,
+            model,
+        })
+        .await;
+    }
+
+    async fn load_branch_messages(
+        &self,
+        stored_id: &str,
+        before: usize,
+        limit: usize,
+        fallback: Vec<ChatMessage>,
+    ) -> Vec<ChatMessage> {
+        if let Ok(rows) = fetch_history(&self.http, &self.origin, stored_id, before, limit).await
+            && !rows.is_empty()
+        {
+            return rows;
+        }
+        fallback
+    }
+
+    async fn on_undo_reply(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        result: &Value,
+    ) {
+        let removed = result.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if removed == 0 {
+            self.fail(
+                "undo",
+                Some(stored_id),
+                "Nothing to rewind in this conversation.",
+            )
+            .await;
+            return;
+        }
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::UndoSync {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                    removed,
+                    mode,
+                    prompt_text,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail("undo", Some(stored_id), send_fault_message("undo", fault))
+                .await;
+        }
+    }
+
+    async fn on_undo_sync_reply(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        removed: usize,
+        mode: RewindMode,
+        prompt_text: String,
+        result: &Value,
+    ) {
+        let effective_runtime = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(runtime_id);
+        self.runtime_of
+            .insert(stored_id.clone(), effective_runtime.clone());
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        self.message_counts.insert(stored_id.clone(), count);
+        let before = count.saturating_sub(PAGE);
+        let messages =
+            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    self.fail("undo", Some(stored_id), err).await;
+                    return;
+                }
+            };
+        self.emit(Event::Undone {
+            stored_id,
+            runtime_id: effective_runtime,
+            removed,
+            messages,
+            before,
+            mode,
+            prompt_text,
+        })
+        .await;
     }
 
     async fn on_submit_reply(&mut self, runtime_id: String, generation: u64) {
@@ -2085,6 +2803,131 @@ impl Link {
             | JobKind::Delete { .. }) => {
                 self.fail_delete_job(kind, code, message).await;
             }
+            kind => self.fail_timeline_job(kind, code, message).await,
+        }
+    }
+
+    async fn fail_timeline_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
+            JobKind::Undo {
+                stored_id,
+                runtime_id,
+                mode,
+                prompt_text,
+                attempts,
+            } => {
+                self.fail_undo_job(
+                    stored_id,
+                    runtime_id,
+                    mode,
+                    prompt_text,
+                    attempts,
+                    code,
+                    message,
+                )
+                .await;
+            }
+            JobKind::UndoSync {
+                stored_id,
+                runtime_id,
+                removed,
+                mode,
+                prompt_text,
+            } => {
+                if code == 4007 {
+                    self.message_counts.insert(stored_id.clone(), 0);
+                    self.emit(Event::Undone {
+                        stored_id,
+                        runtime_id,
+                        removed,
+                        messages: Vec::new(),
+                        before: 0,
+                        mode,
+                        prompt_text,
+                    })
+                    .await;
+                } else {
+                    self.fail("undo", Some(stored_id), message).await;
+                }
+            }
+            branch_kind => self.fail_branch_job(branch_kind, code, message).await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_undo_job(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        attempts: u8,
+        code: i64,
+        message: &str,
+    ) {
+        if code == 4009 && attempts < 3 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            self.send_undo(stored_id, runtime_id, mode, prompt_text, attempts + 1)
+                .await;
+            return;
+        }
+        self.fail("undo", Some(stored_id), message).await;
+    }
+
+    async fn fail_branch_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
+            JobKind::Branch {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                if matches!(code, -32601 | 4007) && !fallback_seed.is_empty() {
+                    self.begin_seeded_branch(
+                        parent_stored_id,
+                        parent_title,
+                        fallback_title,
+                        fallback_seed,
+                    )
+                    .await;
+                } else {
+                    self.fail("branch", Some(parent_stored_id), message).await;
+                }
+            }
+            JobKind::BranchClose(pending) => {
+                if code == -32000 {
+                    self.fail("branch", Some(pending.parent_stored_id), message)
+                        .await;
+                } else {
+                    self.reopen_branched(pending).await;
+                }
+            }
+            JobKind::BranchResume(pending) => {
+                self.fail("branch", Some(pending.parent_stored_id), message)
+                    .await;
+            }
+            JobKind::BranchStored {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                if code != -32000 && !fallback_seed.is_empty() {
+                    self.begin_seeded_branch(
+                        parent_stored_id,
+                        parent_title,
+                        fallback_title,
+                        fallback_seed,
+                    )
+                    .await;
+                } else {
+                    self.fail("branch", Some(parent_stored_id), message).await;
+                }
+            }
+            JobKind::BranchSeeded {
+                parent_stored_id, ..
+            } => self.fail("branch", Some(parent_stored_id), message).await,
+            _ => {}
         }
     }
 
@@ -2206,6 +3049,8 @@ impl Link {
                 updated_at: crate::palette::now_epoch_secs().to_string(),
                 read_only_reason: None,
                 message_count: 0,
+                parent_session_id: None,
+                is_branch: false,
             },
             runtime_id: runtime_id.clone(),
             model,
@@ -2560,6 +3405,12 @@ fn session_summary(row: &Value) -> Result<SessionSummary, String> {
         .unwrap_or("")
         .trim();
     let updated = extract_epoch_string(row);
+    let parent_session_id = row
+        .get("parent_session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     Ok(SessionSummary {
         stored_id,
         title: if title.is_empty() {
@@ -2575,6 +3426,8 @@ fn session_summary(row: &Value) -> Result<SessionSummary, String> {
         updated_at: updated,
         read_only_reason: None,
         message_count,
+        parent_session_id,
+        is_branch: false,
     })
 }
 
@@ -4310,6 +5163,228 @@ mod tests {
                 Event::Telemetry { telemetry, .. } => {
                     assert_eq!(telemetry.input_tokens, 2000);
                     assert_eq!(telemetry.context_used, Some(2400));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn branch_and_undo_rpc_params_and_session_summary_parse_lineage() {
+        assert_eq!(
+            default_branch_title("Hyprland setup", None),
+            "Hyprland setup (branch)"
+        );
+        assert_eq!(
+            default_branch_title("Hyprland setup", Some("  Waybar fork  ")),
+            "Waybar fork"
+        );
+        assert_eq!(
+            branch_rpc_params("rt-1", None, None),
+            json!({"session_id": "rt-1"})
+        );
+        assert_eq!(
+            branch_rpc_params("rt-1", Some("Alt"), Some(2)),
+            json!({"session_id": "rt-1", "name": "Alt", "count": 2})
+        );
+        let seeded = seeded_branch_params(
+            "Alt",
+            "parent-1",
+            &[SeedMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            }],
+        );
+        assert_eq!(seeded["title"], json!("Alt"));
+        assert_eq!(seeded["parent_session_id"], json!("parent-1"));
+        assert_eq!(seeded["messages"][0]["content"], json!("Hi"));
+        assert_eq!(
+            undo_rpc_params("rt-1", RewindMode::Undo),
+            json!({"session_id": "rt-1", "intent": "undo"})
+        );
+        assert_eq!(
+            undo_rpc_params("rt-1", RewindMode::EditRetry),
+            json!({"session_id": "rt-1", "intent": "retry"})
+        );
+        assert_eq!(
+            extract_session_ids(&json!({"session_id": "rt-9", "stored_session_id": "st-9"})),
+            Some(("rt-9".into(), "st-9".into()))
+        );
+        let summary = session_summary(&json!({
+            "id": "fork-1",
+            "title": "Demo (branch)",
+            "source": "tui",
+            "message_count": 4,
+            "parent_session_id": "root-1"
+        }))
+        .expect("summary");
+        assert_eq!(summary.parent_session_id.as_deref(), Some("root-1"));
+    }
+
+    #[test]
+    fn undo_empty_reply_and_4007_sync_settle_cleanly() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.on_undo_reply(
+                "st-1".into(),
+                "rt-1".into(),
+                RewindMode::Undo,
+                "prompt".into(),
+                &json!({"removed": 0}),
+            )
+            .await;
+            assert!(matches!(
+                incoming.try_recv().expect("undo error"),
+                Event::Error { ref operation, .. } if operation == "undo"
+            ));
+
+            link.fail_timeline_job(
+                JobKind::UndoSync {
+                    stored_id: "st-1".into(),
+                    runtime_id: "rt-1".into(),
+                    removed: 2,
+                    mode: RewindMode::EditRetry,
+                    prompt_text: "original".into(),
+                },
+                4007,
+                "Session not found",
+            )
+            .await;
+            match incoming.try_recv().expect("undone empty") {
+                Event::Undone {
+                    stored_id,
+                    removed,
+                    messages,
+                    mode,
+                    prompt_text,
+                    ..
+                } => {
+                    assert_eq!(stored_id, "st-1");
+                    assert_eq!(removed, 2);
+                    assert!(messages.is_empty());
+                    assert_eq!(mode, RewindMode::EditRetry);
+                    assert_eq!(prompt_text, "original");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn timeline_branch_fallback_and_inline_branched_messages_emit_branched_event() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("http://127.0.0.1:9").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            // Disconnected timeline commands emit clean non-fatal branch/undo errors.
+            link.timeline_command(Command::Branch {
+                stored_id: "root-1".into(),
+                runtime_id: None,
+                parent_title: "Root".into(),
+                before_loaded: 0,
+                visible_count: None,
+                custom_title: None,
+                seed_fallback: vec![SeedMessage {
+                    role: "user".into(),
+                    content: "Hi".into(),
+                }],
+            })
+            .await;
+            assert!(matches!(
+                incoming.try_recv().expect("branch not connected"),
+                Event::Error { ref operation, .. } if operation == "branch"
+            ));
+
+            // Inline branch reply falls back to result["messages"] when HTTP tail fetch fails.
+            link.on_branched(
+                "root-1".into(),
+                "Root".into(),
+                "Root (branch)".into(),
+                1,
+                &json!({
+                    "session_id": "rt-fork",
+                    "stored_session_id": "st-fork",
+                    "message_count": 1,
+                    "messages": [{"id": "m1", "role": "user", "content": "Seeded turn"}]
+                }),
+            )
+            .await;
+            match incoming.try_recv().expect("branched") {
+                Event::Branched {
+                    session,
+                    runtime_id,
+                    messages,
+                    ..
+                } => {
+                    assert_eq!(session.stored_id, "st-fork");
+                    assert_eq!(session.title, "Root (branch)");
+                    assert!(session.is_branch);
+                    assert_eq!(runtime_id, "rt-fork");
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(messages[0].text, "Seeded turn");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+
+            // Re-opened live branch swaps the transient branch runtime for the DB-backed resume runtime.
+            let pending = link
+                .build_pending_branch(
+                    "root-1".into(),
+                    "Root".into(),
+                    "Root (branch)".into(),
+                    1,
+                    &json!({
+                        "session_id": "rt-transient",
+                        "stored_session_id": "st-reopened",
+                        "title": "Custom fork",
+                        "message_count": 1,
+                        "messages": [{"id": "m1", "role": "user", "content": "Persisted turn"}]
+                    }),
+                )
+                .expect("pending branch");
+            link.finish_reopened_branch(
+                pending,
+                &json!({"session_id": "rt-resumed", "message_count": 1}),
+            )
+            .await;
+            assert_eq!(
+                link.runtime_of.get("st-reopened").map(String::as_str),
+                Some("rt-resumed")
+            );
+            match incoming.try_recv().expect("reopened branched") {
+                Event::Branched {
+                    session,
+                    runtime_id,
+                    messages,
+                    ..
+                } => {
+                    assert_eq!(session.stored_id, "st-reopened");
+                    assert_eq!(session.title, "Custom fork");
+                    assert_eq!(runtime_id, "rt-resumed");
+                    assert_eq!(messages.len(), 1);
                 }
                 other => panic!("unexpected: {other:?}"),
             }

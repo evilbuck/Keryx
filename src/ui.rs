@@ -21,6 +21,7 @@ struct Ui {
     triage: Rc<TriageBar>,
     palette: RefCell<Option<Rc<CommandPalette>>>,
     palette_trigger: gtk::Button,
+    branch_chat: gtk::Button,
     inspector: InspectorPanel,
     inspector_toggle: gtk::Button,
     inspector_badge: gtk::Label,
@@ -35,6 +36,7 @@ struct Ui {
     title: gtk::Label,
     connection: gtk::Label,
     notice: gtk::Label,
+    lineage_bar: gtk::Box,
     activity: gtk::Label,
     spinner: gtk::Spinner,
     editor: gtk::TextView,
@@ -56,17 +58,93 @@ struct Ui {
     more_sessions: gtk::Button,
     older: gtk::Button,
     latest: gtk::Button,
+    readonly_bar: gtk::Box,
     readonly: gtk::Label,
+    readonly_fork: gtk::Button,
     interaction: gtk::Box,
     interaction_scroll: gtk::ScrolledWindow,
     rendered_session: RefCell<Option<String>>,
     rendered_revision: Cell<u64>,
+    rendered_row_gate: Cell<(bool, bool)>,
+    rendered_lineage: RefCell<Option<LineageStamp>>,
     rendered_interaction: RefCell<Option<(String, String)>>,
     changing_draft: Cell<bool>,
     follow_bottom: Cell<bool>,
     select_created: Cell<bool>,
     suppress_selection: Cell<bool>,
     sequence: Cell<u64>,
+}
+
+type LineageStamp = (
+    Option<String>,
+    Option<(String, String)>,
+    Vec<(String, String)>,
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessageRowData {
+    index: usize,
+    message: ChatMessage,
+    can_branch: bool,
+    can_edit_retry: bool,
+    can_regenerate: bool,
+}
+
+fn row_action_gates(
+    conversation: Option<&Conversation>,
+    connected: bool,
+    creating: bool,
+) -> (bool, bool) {
+    let Some(c) = conversation else {
+        return (false, false);
+    };
+    let idle = connected && !c.status.busy() && !c.rewinding;
+    let can_branch = idle && !creating;
+    let writable_idle = idle && c.runtime_id.is_some() && c.read_only_reason.is_none();
+    (can_branch, writable_idle)
+}
+
+fn build_message_rows(
+    conversation: Option<&Conversation>,
+    connected: bool,
+    creating: bool,
+) -> Vec<MessageRowData> {
+    let Some(c) = conversation else {
+        return Vec::new();
+    };
+    let (can_branch_gate, writable_idle) = row_action_gates(Some(c), connected, creating);
+    let (last_user, last_assistant, _) = last_turn_targets(&c.messages);
+    c.messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| MessageRowData {
+            index,
+            message: message.clone(),
+            can_branch: can_branch_gate && is_branchable_message(message),
+            can_edit_retry: writable_idle && last_user.as_deref() == Some(message.id.as_str()),
+            can_regenerate: writable_idle && last_assistant.as_deref() == Some(message.id.as_str()),
+        })
+        .collect()
+}
+
+fn compute_lineage_stamp(state: &AppState) -> LineageStamp {
+    let Some(selected) = state.selected.clone() else {
+        return (None, None, Vec::new());
+    };
+    let parent = state.parent_for(&selected);
+    let children = state
+        .branches_of(&selected)
+        .into_iter()
+        .map(|s| {
+            let title = if s.title.is_empty() {
+                "Untitled branch".into()
+            } else {
+                s.title.clone()
+            };
+            (s.stored_id.clone(), title)
+        })
+        .collect();
+    (Some(selected), parent, children)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,7 +286,7 @@ fn spinner_active(state: &AppState, resume_loading: bool) -> bool {
             .selected
             .as_ref()
             .and_then(|id| state.conversations.get(id))
-            .is_some_and(|c| c.status.busy() || c.history_loading)
+            .is_some_and(|c| c.status.busy() || c.history_loading || c.rewinding)
 }
 
 fn editor_editable(state: &AppState) -> bool {
@@ -222,12 +300,16 @@ fn editor_editable(state: &AppState) -> bool {
 }
 
 fn can_send_in_conversation(c: &Conversation) -> bool {
-    if c.runtime_id.is_none() || c.read_only_reason.is_some() {
+    if c.runtime_id.is_none() || c.read_only_reason.is_some() || c.rewinding {
         return false;
     }
     match parse_composer_input(&c.draft) {
         ComposerIntent::Empty => false,
         ComposerIntent::SideQuestion(_) => true,
+        ComposerIntent::Branch(_) => {
+            !c.status.busy() && count_visible_branch_messages(&c.messages) > 0
+        }
+        ComposerIntent::Rewind(_) => !c.status.busy() && last_turn_targets(&c.messages).0.is_some(),
         ComposerIntent::Prompt(_) => c.status != TurnStatus::Stopping,
     }
 }
@@ -261,17 +343,153 @@ fn composer_hint_text(state: &AppState) -> &'static str {
 
 fn composer_conversation_hint(c: &Conversation) -> &'static str {
     if c.read_only_reason.is_some() {
-        return "Read-only conversation · Ctrl+N for a new chat · Ctrl+I Flight Deck";
+        return "Read-only transcript · Ctrl+D to fork into a live chat · Ctrl+I Flight Deck";
     }
-    let trimmed = c.draft.trim_start();
-    if trimmed.starts_with("/btw") || trimmed.starts_with("/ask") {
-        return "Enter to ask snapshot side question (/btw) · never saved to history";
+    if let Some(slash_hint) = composer_slash_hint(c.draft.trim_start()) {
+        return slash_hint;
     }
     if c.status.steerable() {
         "Enter to steer active turn · Alt+Enter or /btw side-ask · Ctrl+I Flight Deck"
     } else {
-        "Enter to send · Alt+Enter or /btw side-ask · Ctrl+I Flight Deck"
+        "Enter to send · /branch or Ctrl+D to fork · /retry to edit last · Ctrl+I Deck"
     }
+}
+
+fn composer_slash_hint(trimmed: &str) -> Option<&'static str> {
+    if trimmed.starts_with("/btw") || trimmed.starts_with("/ask") {
+        return Some("Enter to ask snapshot side question (/btw) · never saved to history");
+    }
+    if trimmed.starts_with("/branch") || trimmed.starts_with("/fork") {
+        return Some("Enter to fork conversation into a new branch (/branch [optional title])");
+    }
+    if trimmed.starts_with("/undo")
+        || trimmed.starts_with("/retry")
+        || trimmed.starts_with("/regen")
+    {
+        return Some("Enter to rewind last turn (/undo drop · /retry edit · /regen re-run)");
+    }
+    None
+}
+
+fn build_branch_trigger() -> gtk::Button {
+    let inner = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    inner.append(&gtk::Image::from_icon_name(
+        "media-playlist-shuffle-symbolic",
+    ));
+    let label = gtk::Label::new(Some("Branch"));
+    label.add_css_class("palette-trigger-label");
+    inner.append(&label);
+    let button = gtk::Button::new();
+    button.set_child(Some(&inner));
+    button.add_css_class("flat");
+    button.add_css_class("palette-trigger");
+    button.set_tooltip_text(Some("Branch conversation into a new thread · Ctrl+D"));
+    button.update_property(&[gtk::accessible::Property::Label("Branch conversation")]);
+    button.set_visible(false);
+    button
+}
+
+fn build_readonly_bar() -> (gtk::Box, gtk::Label, gtk::Button) {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    bar.add_css_class("readonly-notice");
+    set_margins(&bar, 12);
+    bar.set_visible(false);
+    let label = gtk::Label::new(None);
+    label.set_wrap(true);
+    label.set_selectable(true);
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    let fork = gtk::Button::with_label("⑂ Fork into live chat");
+    fork.add_css_class("suggested-action");
+    fork.add_css_class("readonly-fork-btn");
+    fork.set_valign(gtk::Align::Center);
+    fork.set_tooltip_text(Some(
+        "Create a writable branch seeded with this saved transcript · Ctrl+D",
+    ));
+    bar.append(&label);
+    bar.append(&fork);
+    (bar, label, fork)
+}
+
+fn bind_message_row(object: &glib::Object) {
+    let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
+    let value = item
+        .item()
+        .and_downcast::<glib::BoxedAnyObject>()
+        .expect("message item");
+    let data = value.borrow::<MessageRowData>();
+    let (speaker_label, row_class, speaker_class) = role_style(&data.message.role);
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    row.add_css_class("message");
+    row.add_css_class(row_class);
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let speaker = gtk::Label::new(Some(speaker_label));
+    speaker.add_css_class("speaker");
+    speaker.add_css_class(speaker_class);
+    speaker.set_hexpand(true);
+    speaker.set_xalign(0.0);
+    heading.append(&speaker);
+    append_message_actions(&heading, &data);
+    let copy = icon_button("edit-copy-symbolic", "Copy original message");
+    copy.add_css_class("flat");
+    copy.add_css_class("message-copy");
+    let source = value.clone();
+    copy.connect_clicked(move |button| {
+        button
+            .clipboard()
+            .set_text(&source.borrow::<MessageRowData>().message.text);
+    });
+    heading.append(&copy);
+    row.append(&heading);
+    row.append(&message_body(&data.message));
+    let column = adw::Clamp::builder()
+        .maximum_size(860)
+        .tightening_threshold(600)
+        .child(&row)
+        .build();
+    item.set_child(Some(&column));
+}
+
+fn append_message_actions(heading: &gtk::Box, data: &MessageRowData) {
+    if data.can_edit_retry {
+        let btn = message_pill_button(
+            "↺ Edit & retry",
+            "Rewind this turn and load your prompt into the composer",
+        );
+        btn.connect_clicked(|b| {
+            let _ = b.activate_action("win.rewind", Some(&"edit".to_variant()));
+        });
+        heading.append(&btn);
+    }
+    if data.can_regenerate {
+        let btn = message_pill_button(
+            "↻ Regenerate",
+            "Rewind this turn and generate a fresh response",
+        );
+        btn.connect_clicked(|b| {
+            let _ = b.activate_action("win.rewind", Some(&"regen".to_variant()));
+        });
+        heading.append(&btn);
+    }
+    if data.can_branch {
+        let idx = data.index as u32;
+        let btn = message_pill_button(
+            "⑂ Branch",
+            "Fork a new conversation starting up through this message",
+        );
+        btn.connect_clicked(move |b| {
+            let _ = b.activate_action("win.branch-at", Some(&idx.to_variant()));
+        });
+        heading.append(&btn);
+    }
+}
+
+fn message_pill_button(label: &str, tooltip: &str) -> gtk::Button {
+    let btn = gtk::Button::with_label(label);
+    btn.add_css_class("flat");
+    btn.add_css_class("message-action-btn");
+    btn.set_tooltip_text(Some(tooltip));
+    btn
 }
 
 fn build_inspector_trigger() -> (gtk::Button, gtk::Label) {
@@ -291,6 +509,15 @@ fn build_inspector_trigger() -> (gtk::Button, gtk::Label) {
     ));
     button.update_property(&[gtk::accessible::Property::Label("Flight Deck inspector")]);
     (button, badge)
+}
+
+fn build_lineage_bar() -> gtk::Box {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bar.add_css_class("lineage-bar");
+    set_margins(&bar, 12);
+    bar.set_margin_bottom(4);
+    bar.set_visible(false);
+    bar
 }
 
 fn build_workspace_split(main: &gtk::Box, inspector_root: &gtk::Box) -> gtk::Paned {
@@ -321,8 +548,10 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     header.set_title_widget(Some(&title));
     let toggle_sidebar = icon_button("sidebar-show-symbolic", "Toggle conversations · Ctrl+B");
     let palette_trigger = palette::build_palette_trigger();
+    let branch_chat = build_branch_trigger();
     header.pack_start(&toggle_sidebar);
     header.pack_start(&palette_trigger);
+    header.pack_start(&branch_chat);
     let connection = gtk::Label::new(Some("Connecting…"));
     connection.add_css_class("connection-label");
     let (inspector_toggle, inspector_badge) = build_inspector_trigger();
@@ -390,14 +619,10 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     set_margins(&notice, 12);
     notice.set_visible(false);
     main.append(&notice);
-    let readonly = gtk::Label::new(None);
-    readonly.set_wrap(true);
-    readonly.set_selectable(true);
-    readonly.set_xalign(0.0);
-    readonly.add_css_class("readonly-notice");
-    set_margins(&readonly, 12);
-    readonly.set_visible(false);
-    main.append(&readonly);
+    let lineage_bar = build_lineage_bar();
+    main.append(&lineage_bar);
+    let (readonly_bar, readonly, readonly_fork) = build_readonly_bar();
+    main.append(&readonly_bar);
     let history_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     history_bar.set_halign(gtk::Align::Center);
     let older = gtk::Button::with_label("Load earlier messages");
@@ -411,43 +636,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
 
     let messages = gio::ListStore::new::<glib::BoxedAnyObject>();
     let message_factory = gtk::SignalListItemFactory::new();
-    message_factory.connect_bind(|_, object| {
-        let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
-        let value = item
-            .item()
-            .and_downcast::<glib::BoxedAnyObject>()
-            .expect("message item");
-        let message = value.borrow::<ChatMessage>();
-        let (speaker_label, row_class, speaker_class) = role_style(&message.role);
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        row.add_css_class("message");
-        row.add_css_class(row_class);
-        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let speaker = gtk::Label::new(Some(speaker_label));
-        speaker.add_css_class("speaker");
-        speaker.add_css_class(speaker_class);
-        speaker.set_hexpand(true);
-        speaker.set_xalign(0.0);
-        heading.append(&speaker);
-        let copy = icon_button("edit-copy-symbolic", "Copy original message");
-        copy.add_css_class("flat");
-        copy.add_css_class("message-copy");
-        let source = value.clone();
-        copy.connect_clicked(move |button| {
-            button
-                .clipboard()
-                .set_text(&source.borrow::<ChatMessage>().text);
-        });
-        heading.append(&copy);
-        row.append(&heading);
-        row.append(&message_body(&message));
-        let column = adw::Clamp::builder()
-            .maximum_size(860)
-            .tightening_threshold(600)
-            .child(&row)
-            .build();
-        item.set_child(Some(&column));
-    });
+    message_factory.connect_bind(|_, object| bind_message_row(object));
     let message_list = gtk::ListView::new(
         Some(gtk::NoSelection::new(Some(messages.clone()))),
         Some(message_factory),
@@ -647,6 +836,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         triage,
         palette: RefCell::new(None),
         palette_trigger,
+        branch_chat,
         inspector,
         inspector_toggle,
         inspector_badge,
@@ -661,6 +851,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         title,
         connection,
         notice,
+        lineage_bar,
         activity,
         spinner,
         editor,
@@ -682,11 +873,15 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         more_sessions,
         older,
         latest,
+        readonly_bar,
         readonly,
+        readonly_fork,
         interaction,
         interaction_scroll,
         rendered_session: RefCell::new(None),
         rendered_revision: Cell::new(u64::MAX),
+        rendered_row_gate: Cell::new((false, false)),
+        rendered_lineage: RefCell::new(None),
         rendered_interaction: RefCell::new(None),
         changing_draft: Cell::new(false),
         follow_bottom: Cell::new(true),
@@ -1080,6 +1275,7 @@ fn connect_workspace(ui: &Rc<Ui>) {
         let _ = weak.upgrade().map(|ui| ui.confirm_delete_current());
     });
     connect_inspector(ui);
+    connect_timeline(ui);
 
     let weak_filter = Rc::downgrade(ui);
     let weak_query = Rc::downgrade(ui);
@@ -1126,6 +1322,80 @@ fn connect_inspector(ui: &Rc<Ui>) {
     });
 }
 
+fn connect_timeline(ui: &Rc<Ui>) {
+    let weak = Rc::downgrade(ui);
+    ui.branch_chat.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.branch_from(None, None));
+    });
+    let weak = Rc::downgrade(ui);
+    ui.readonly_fork.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.branch_from(None, None));
+    });
+    register_branch_action(ui);
+    register_rewind_action(ui);
+    register_open_session_action(ui);
+}
+
+fn register_branch_action(ui: &Rc<Ui>) {
+    let action = gio::SimpleAction::new(
+        "branch-at",
+        Some(glib::VariantTy::new("u").expect("static variant type")),
+    );
+    let weak = Rc::downgrade(ui);
+    action.connect_activate(move |_, param| {
+        if let Some(index) = param.and_then(|p| p.get::<u32>())
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.branch_from(Some(index as usize), None);
+        }
+    });
+    ui.window.add_action(&action);
+}
+
+fn register_rewind_action(ui: &Rc<Ui>) {
+    let action = gio::SimpleAction::new(
+        "rewind",
+        Some(glib::VariantTy::new("s").expect("static variant type")),
+    );
+    let weak = Rc::downgrade(ui);
+    action.connect_activate(move |_, param| {
+        if let Some(mode) = param
+            .and_then(|p| p.get::<String>())
+            .and_then(|s| parse_rewind_action(&s))
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.rewind_last(mode);
+        }
+    });
+    ui.window.add_action(&action);
+}
+
+fn register_open_session_action(ui: &Rc<Ui>) {
+    let action = gio::SimpleAction::new(
+        "open-session",
+        Some(glib::VariantTy::new("s").expect("static variant type")),
+    );
+    let weak = Rc::downgrade(ui);
+    action.connect_activate(move |_, param| {
+        if let Some(id) = param.and_then(|p| p.get::<String>())
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.select_created.set(false);
+            ui.select(&id, true);
+        }
+    });
+    ui.window.add_action(&action);
+}
+
+fn parse_rewind_action(kind: &str) -> Option<RewindMode> {
+    match kind {
+        "undo" => Some(RewindMode::Undo),
+        "edit" => Some(RewindMode::EditRetry),
+        "regen" => Some(RewindMode::Regenerate),
+        _ => None,
+    }
+}
+
 fn shortcut_command(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<char> {
     let clean = modifiers
         & (gdk::ModifierType::CONTROL_MASK
@@ -1160,6 +1430,10 @@ fn dispatch_workspace_shortcut(ui: &Rc<Ui>, ch: char) -> bool {
         'n' => {
             ui.close_palette();
             ui.create();
+        }
+        'd' => {
+            ui.close_palette();
+            ui.branch_from(None, None);
         }
         'b' => {
             ui.close_palette();
@@ -1297,8 +1571,23 @@ impl Ui {
             ComposerIntent::SideQuestion(question) => {
                 self.dispatch_composer_side_question(&id, question);
             }
+            ComposerIntent::Branch(custom_title) => {
+                self.clear_composer_draft(&id);
+                self.branch_from(None, custom_title);
+            }
+            ComposerIntent::Rewind(mode) => {
+                self.clear_composer_draft(&id);
+                self.rewind_last(mode);
+            }
             ComposerIntent::Prompt(text) => self.dispatch_prompt_or_steer(id, runtime_id, text),
         }
+    }
+
+    fn clear_composer_draft(&self, id: &str) {
+        if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
+            c.draft.clear();
+        }
+        self.set_editor_text("");
     }
 
     fn extract_submit_target(&self) -> Option<(String, String, String)> {
@@ -1401,7 +1690,9 @@ impl Ui {
                 return;
             };
             let question = match parse_composer_input(&c.draft) {
-                ComposerIntent::Empty => String::new(),
+                ComposerIntent::Empty | ComposerIntent::Branch(_) | ComposerIntent::Rewind(_) => {
+                    String::new()
+                }
                 ComposerIntent::SideQuestion(q) | ComposerIntent::Prompt(q) => q,
             };
             (id, question)
@@ -1507,6 +1798,7 @@ impl Ui {
             }
             InspectorAction::InsertDraft(snippet) => self.insert_into_composer(&snippet),
             InspectorAction::JumpToMessage(index) => self.jump_to_message(index),
+            InspectorAction::BranchAt(index) => self.branch_from(Some(index), None),
         }
     }
 
@@ -1681,12 +1973,66 @@ impl Ui {
         match action {
             PaletteAction::ToggleInspector => self.toggle_inspector(),
             PaletteAction::OpenInspector(tab) => self.open_inspector(tab),
+            PaletteAction::BranchCurrent => self.branch_from(None, None),
+            PaletteAction::RewindLast(mode) => self.rewind_last(mode),
             PaletteAction::ReloadHistory => self.reload_current(),
             PaletteAction::LoadMoreSessions => self.load_more_sessions(),
             PaletteAction::Reconnect => self.trigger_reconnect(),
             PaletteAction::DeleteCurrent => self.confirm_delete_current(),
             _ => {}
         }
+    }
+
+    fn branch_from(&self, end_inclusive: Option<usize>, custom_title: Option<String>) {
+        let prepared = {
+            let state = self.state.borrow();
+            prepare_branch_command(&state, end_inclusive, custom_title)
+        };
+        let Some((stored_id, cmd)) = prepared else {
+            return;
+        };
+        self.select_created.set(true);
+        {
+            let mut state = self.state.borrow_mut();
+            state.creating = true;
+            state.notice.clear();
+            if let Some(c) = state.conversations.get_mut(&stored_id) {
+                c.activity = "Creating branch…".into();
+            }
+        }
+        if !self.command(cmd) {
+            let mut state = self.state.borrow_mut();
+            state.creating = false;
+            if let Some(c) = state.conversations.get_mut(&stored_id) {
+                c.activity.clear();
+            }
+        }
+        self.refresh();
+    }
+
+    fn rewind_last(&self, mode: RewindMode) {
+        let prepared = {
+            let state = self.state.borrow();
+            prepare_rewind_command(&state, mode)
+        };
+        let Some((stored_id, _, cmd)) = prepared else {
+            return;
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            state.notice.clear();
+            if let Some(c) = state.conversations.get_mut(&stored_id) {
+                c.rewinding = true;
+                c.activity = "Rewinding last turn…".into();
+            }
+        }
+        if !self.command(cmd)
+            && let Some(c) = self.state.borrow_mut().conversations.get_mut(&stored_id)
+        {
+            c.rewinding = false;
+            c.activity.clear();
+        }
+        self.refresh();
     }
 
     /// Busy-turn steer: optimistic row now, live turn untouched until the
@@ -2037,7 +2383,111 @@ impl Ui {
     }
 
     fn apply_auxiliary(self: &Rc<Self>, event: &Event) -> bool {
-        self.apply_model(event) || self.apply_inspector(event)
+        self.apply_model(event) || self.apply_inspector(event) || self.apply_timeline(event)
+    }
+
+    fn apply_timeline(&self, event: &Event) -> bool {
+        match event {
+            Event::Branched {
+                session,
+                runtime_id,
+                parent_title,
+                messages,
+                before,
+                model,
+            } => {
+                self.note_branched(
+                    session.clone(),
+                    runtime_id.clone(),
+                    parent_title.clone(),
+                    messages.clone(),
+                    *before,
+                    model.clone(),
+                );
+            }
+            Event::Undone {
+                stored_id,
+                runtime_id,
+                mode,
+                prompt_text,
+                messages,
+                before,
+                ..
+            } => {
+                self.note_undone(
+                    stored_id.clone(),
+                    runtime_id.clone(),
+                    *mode,
+                    prompt_text.clone(),
+                    messages.clone(),
+                    *before,
+                );
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn note_branched(
+        &self,
+        session: SessionSummary,
+        runtime_id: String,
+        parent_title: String,
+        messages: Vec<ChatMessage>,
+        before: usize,
+        model: Option<ModelIdentity>,
+    ) {
+        let id = session.stored_id.clone();
+        insert_branched_state(
+            &mut self.state.borrow_mut(),
+            session,
+            runtime_id,
+            parent_title,
+            messages,
+            before,
+            model,
+        );
+        self.refresh_sessions();
+        if self.select_created.replace(false) {
+            self.select(&id, true);
+        }
+    }
+
+    fn note_undone(
+        &self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        messages: Vec<ChatMessage>,
+        before: usize,
+    ) {
+        let is_selected = {
+            let mut state = self.state.borrow_mut();
+            if let Some(summary) = state.sessions.iter_mut().find(|s| s.stored_id == stored_id) {
+                summary.message_count = before + messages.len();
+            }
+            if let Some(c) = state.conversations.get_mut(&stored_id) {
+                c.runtime_id = Some(runtime_id.clone());
+                apply_rewound_conversation(c, mode, &prompt_text, messages, before);
+            }
+            state.selected.as_deref() == Some(stored_id.as_str())
+        };
+        self.refresh_sessions();
+        match mode {
+            RewindMode::Regenerate => {
+                self.dispatch_prompt_or_steer(stored_id, runtime_id, prompt_text);
+            }
+            RewindMode::Undo | RewindMode::EditRetry => {
+                if is_selected {
+                    let draft = self.state.borrow().active_draft().to_string();
+                    self.set_editor_text(&draft);
+                    if mode == RewindMode::EditRetry {
+                        self.editor.grab_focus();
+                    }
+                }
+            }
+        }
     }
 
     fn apply(self: &Rc<Self>, event: Event) {
@@ -2061,6 +2511,7 @@ impl Ui {
                 for session in sessions {
                     state.upsert_session(session);
                 }
+                state.sync_branch_flags();
                 state.list_has_more = has_more;
                 state.list_loading = false;
                 drop(state);
@@ -2327,47 +2778,7 @@ impl Ui {
         let state = self.state.borrow();
         let selected = state.selected.as_ref();
         let conversation = selected.and_then(|id| state.conversations.get(id));
-        let identity_changed = *self.rendered_session.borrow() != state.selected;
-        let revision = conversation.map_or(0, |c| c.revision);
-        if identity_changed || self.rendered_revision.get() != revision {
-            if identity_changed {
-                self.messages.remove_all();
-                *self.rendered_session.borrow_mut() = state.selected.clone();
-            }
-            let current = conversation.map_or(&[][..], |c| c.messages.as_slice());
-            if self.messages.n_items() as usize > current.len() {
-                self.messages.splice(
-                    current.len() as u32,
-                    self.messages.n_items() - current.len() as u32,
-                    &[] as &[glib::BoxedAnyObject],
-                );
-            }
-            for (index, message) in current.iter().enumerate() {
-                let same = self
-                    .messages
-                    .item(index as u32)
-                    .and_downcast::<glib::BoxedAnyObject>()
-                    .is_some_and(|v| {
-                        let old = v.borrow::<ChatMessage>();
-                        old.id == message.id && old.text == message.text && old.role == message.role
-                    });
-                if !same {
-                    let value = glib::BoxedAnyObject::new(message.clone());
-                    if (index as u32) < self.messages.n_items() {
-                        self.messages.splice(index as u32, 1, &[value]);
-                    } else {
-                        self.messages.append(&value);
-                    }
-                }
-            }
-            self.rendered_revision.set(revision);
-            if self.follow_bottom.get() {
-                let adjustment = self.transcript.vadjustment();
-                glib::idle_add_local_once(move || {
-                    adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
-                });
-            }
-        }
+        self.sync_message_list(&state, conversation);
         self.content.set_visible_child_name(
             if conversation.is_some_and(|c| !c.messages.is_empty()) {
                 "messages"
@@ -2378,9 +2789,10 @@ impl Ui {
         self.title.set_text(header_title(&state));
         self.notice.set_text(&state.notice);
         self.notice.set_visible(!state.notice.is_empty());
+        self.sync_lineage_bar(&state);
         let reason = conversation.and_then(|c| c.read_only_reason.as_deref());
         self.readonly.set_text(reason.unwrap_or_default());
-        self.readonly.set_visible(reason.is_some());
+        self.readonly_bar.set_visible(reason.is_some());
         let resume_loading = selected.is_some_and(|id| self.pending_resumes.borrow().contains(id));
         self.activity
             .set_text(activity_text(&state, resume_loading));
@@ -2394,6 +2806,51 @@ impl Ui {
         drop(state);
         self.refresh_interaction();
         self.refresh_controls();
+    }
+
+    fn sync_message_list(&self, state: &AppState, conversation: Option<&Conversation>) {
+        let connected = state.connection.as_ref() == Some(&ConnectionState::Connected);
+        let gates = row_action_gates(conversation, connected, state.creating);
+        let identity_changed = *self.rendered_session.borrow() != state.selected;
+        let revision = conversation.map_or(0, |c| c.revision);
+        if !identity_changed
+            && self.rendered_revision.get() == revision
+            && self.rendered_row_gate.get() == gates
+        {
+            return;
+        }
+        if identity_changed {
+            self.messages.remove_all();
+            *self.rendered_session.borrow_mut() = state.selected.clone();
+        }
+        let current = build_message_rows(conversation, connected, state.creating);
+        sync_list_store_rows(&self.messages, &current);
+        self.rendered_revision.set(revision);
+        self.rendered_row_gate.set(gates);
+        if self.follow_bottom.get() {
+            let adjustment = self.transcript.vadjustment();
+            glib::idle_add_local_once(move || {
+                adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
+            });
+        }
+    }
+
+    fn sync_lineage_bar(&self, state: &AppState) {
+        let stamp = compute_lineage_stamp(state);
+        if *self.rendered_lineage.borrow() == Some(stamp.clone()) {
+            return;
+        }
+        *self.rendered_lineage.borrow_mut() = Some(stamp.clone());
+        while let Some(child) = self.lineage_bar.first_child() {
+            self.lineage_bar.remove(&child);
+        }
+        let (_, parent, children) = stamp;
+        if parent.is_none() && children.is_empty() {
+            self.lineage_bar.set_visible(false);
+            return;
+        }
+        populate_lineage_bar(&self.lineage_bar, parent, &children);
+        self.lineage_bar.set_visible(true);
     }
 
     fn refresh_model_trigger(
@@ -2446,9 +2903,27 @@ impl Ui {
             self.backend.is_some()
                 && !matches!(state.connection, Some(ConnectionState::Connecting)),
         );
+        self.sync_branch_controls(&state, conversation, connected);
         self.refresh_model_trigger(conversation, &state.catalog, writable);
         self.refresh_connection_badge(&state);
         self.sync_inspector_chrome(&state, conversation, writable);
+    }
+
+    fn sync_branch_controls(
+        &self,
+        state: &AppState,
+        conversation: Option<&Conversation>,
+        connected: bool,
+    ) {
+        let has_branchable =
+            conversation.is_some_and(|c| count_visible_branch_messages(&c.messages) > 0);
+        let (can_branch_gate, _) = row_action_gates(conversation, connected, state.creating);
+        let can_branch_now = can_branch_gate && has_branchable;
+        self.branch_chat
+            .set_visible(state.selected.is_some() && has_branchable);
+        self.branch_chat.set_sensitive(can_branch_now);
+        self.readonly_fork.set_visible(has_branchable);
+        self.readonly_fork.set_sensitive(can_branch_now);
     }
 
     fn sync_inspector_chrome(
@@ -2678,6 +3153,254 @@ impl Ui {
         buttons.append(&cancel);
         self.interaction.append(&buttons);
     }
+}
+
+fn prepare_branch_command(
+    state: &AppState,
+    end_inclusive: Option<usize>,
+    custom_title: Option<String>,
+) -> Option<(String, Command)> {
+    if state.connection.as_ref() != Some(&ConnectionState::Connected) || state.creating {
+        return None;
+    }
+    let stored_id = state.selected.clone()?;
+    let c = state.conversations.get(&stored_id)?;
+    if c.status.busy() || c.rewinding {
+        return None;
+    }
+    let seed_fallback = seed_messages_through(&c.messages, end_inclusive);
+    if seed_fallback.is_empty() {
+        return None;
+    }
+    let visible_count =
+        end_inclusive.and_then(|idx| visible_branch_count_through(&c.messages, idx));
+    let parent_title = session_display_title(state, &stored_id);
+    let runtime_id = c
+        .runtime_id
+        .clone()
+        .filter(|_| c.read_only_reason.is_none());
+    let cmd = Command::Branch {
+        stored_id: stored_id.clone(),
+        runtime_id,
+        parent_title,
+        before_loaded: c.history_before,
+        visible_count,
+        custom_title,
+        seed_fallback,
+    };
+    Some((stored_id, cmd))
+}
+
+fn prepare_rewind_command(state: &AppState, mode: RewindMode) -> Option<(String, String, Command)> {
+    if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+        return None;
+    }
+    let stored_id = state.selected.clone()?;
+    let c = state.conversations.get(&stored_id)?;
+    if c.read_only_reason.is_some() || c.status.busy() || c.rewinding {
+        return None;
+    }
+    let runtime_id = c.runtime_id.clone()?;
+    let (_, _, prompt_text) = last_turn_targets(&c.messages);
+    let prompt_text = prompt_text?;
+    let cmd = Command::Undo {
+        stored_id: stored_id.clone(),
+        runtime_id: runtime_id.clone(),
+        mode,
+        prompt_text,
+    };
+    Some((stored_id, runtime_id, cmd))
+}
+
+fn insert_branched_state(
+    state: &mut AppState,
+    session: SessionSummary,
+    runtime_id: String,
+    parent_title: String,
+    messages: Vec<ChatMessage>,
+    before: usize,
+    model: Option<ModelIdentity>,
+) {
+    let id = session.stored_id.clone();
+    let parent_id = session.parent_session_id.clone();
+    clear_parent_branch_activity(state, parent_id.as_deref());
+    state.upsert_session(session);
+    promote_session_front(state, &id);
+    if let Some(pid) = &parent_id {
+        state.record_branch(&id, pid, &parent_title);
+    } else {
+        state.sync_branch_flags();
+    }
+    let mut conversation = Conversation {
+        runtime_id: Some(runtime_id),
+        messages,
+        history_before: before,
+        loaded: true,
+        activity: format!("Branched from “{parent_title}”."),
+        revision: 1,
+        inspector_revision: 1,
+        ..Default::default()
+    };
+    if let Some(model) = model {
+        conversation.confirm_model(model);
+    }
+    state.conversations.insert(id, conversation);
+    state.creating = false;
+}
+
+fn clear_parent_branch_activity(state: &mut AppState, parent_id: Option<&str>) {
+    let Some(pid) = parent_id else {
+        return;
+    };
+    if let Some(parent_conv) = state.conversations.get_mut(pid)
+        && parent_conv.activity == "Creating branch…"
+    {
+        parent_conv.activity.clear();
+    }
+}
+
+fn promote_session_front(state: &mut AppState, id: &str) {
+    if let Some(pos) = state.sessions.iter().position(|s| s.stored_id == id)
+        && pos > 0
+    {
+        let item = state.sessions.remove(pos);
+        state.sessions.insert(0, item);
+    }
+}
+
+fn apply_rewound_conversation(
+    c: &mut Conversation,
+    mode: RewindMode,
+    prompt_text: &str,
+    messages: Vec<ChatMessage>,
+    before: usize,
+) {
+    c.rewinding = false;
+    c.messages = messages;
+    c.history_before = before;
+    c.status = TurnStatus::Idle;
+    c.interaction = None;
+    c.clear_turn_reasoning();
+    c.revision += 1;
+    c.inspector_revision += 1;
+    match mode {
+        RewindMode::Undo => {
+            c.activity = "Rewound last turn.".into();
+            if c.draft.trim().is_empty() {
+                c.draft = prompt_text.to_string();
+            }
+        }
+        RewindMode::EditRetry => {
+            c.activity = "Turn rewound — edit your prompt and press Enter.".into();
+            c.draft = prompt_text.to_string();
+        }
+        RewindMode::Regenerate => {
+            c.activity = "Regenerating response…".into();
+        }
+    }
+}
+
+fn sync_list_store_rows(store: &gio::ListStore, current: &[MessageRowData]) {
+    if store.n_items() as usize > current.len() {
+        store.splice(
+            current.len() as u32,
+            store.n_items() - current.len() as u32,
+            &[] as &[glib::BoxedAnyObject],
+        );
+    }
+    for (index, row_data) in current.iter().enumerate() {
+        let same = store
+            .item(index as u32)
+            .and_downcast::<glib::BoxedAnyObject>()
+            .is_some_and(|v| *v.borrow::<MessageRowData>() == *row_data);
+        if !same {
+            let value = glib::BoxedAnyObject::new(row_data.clone());
+            if (index as u32) < store.n_items() {
+                store.splice(index as u32, 1, &[value]);
+            } else {
+                store.append(&value);
+            }
+        }
+    }
+}
+
+fn populate_lineage_bar(
+    bar: &gtk::Box,
+    parent: Option<(String, String)>,
+    children: &[(String, String)],
+) {
+    let badge = gtk::Label::new(Some("⑂"));
+    badge.add_css_class("fork-badge");
+    bar.append(&badge);
+    let summary = gtk::Label::new(Some(&lineage_summary_text(parent.as_ref(), children.len())));
+    summary.set_xalign(0.0);
+    summary.set_hexpand(true);
+    summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    summary.add_css_class("lineage-label");
+    bar.append(&summary);
+    if let Some((pid, ptitle)) = parent {
+        let up = gtk::Button::with_label("↖ Parent");
+        up.add_css_class("flat");
+        up.add_css_class("lineage-btn");
+        up.set_tooltip_text(Some(&format!("Jump to parent conversation “{ptitle}”")));
+        up.connect_clicked(move |btn| {
+            let _ = btn.activate_action("win.open-session", Some(&pid.to_variant()));
+        });
+        bar.append(&up);
+    }
+    if !children.is_empty() {
+        bar.append(&build_branches_menu(children));
+    }
+}
+
+fn lineage_summary_text(parent: Option<&(String, String)>, child_count: usize) -> String {
+    if let Some((_, ptitle)) = parent {
+        return format!("Branched from “{ptitle}”");
+    }
+    let noun = if child_count == 1 {
+        "branch"
+    } else {
+        "branches"
+    };
+    format!("Parent of {child_count} {noun}")
+}
+
+fn build_branches_menu(children: &[(String, String)]) -> gtk::MenuButton {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    set_margins(&list, 6);
+    list.set_width_request(240);
+    let popover = gtk::Popover::new();
+    for (cid, ctitle) in children {
+        let row_btn = gtk::Button::with_label(&format!("⑂  {ctitle}"));
+        row_btn.add_css_class("flat");
+        row_btn.add_css_class("branch-popover-row");
+        let cid = cid.clone();
+        let pop = popover.clone();
+        row_btn.connect_clicked(move |btn| {
+            pop.popdown();
+            let _ = btn.activate_action("win.open-session", Some(&cid.to_variant()));
+        });
+        list.append(&row_btn);
+    }
+    popover.set_child(Some(&list));
+    let menu = gtk::MenuButton::new();
+    menu.set_label(&format!("⑂ Branches · {}", children.len()));
+    menu.add_css_class("flat");
+    menu.add_css_class("lineage-btn");
+    menu.set_tooltip_text(Some("Jump to a conversation branched from this thread"));
+    menu.set_popover(Some(&popover));
+    menu
+}
+
+fn session_display_title(state: &AppState, stored_id: &str) -> String {
+    state
+        .sessions
+        .iter()
+        .find(|s| s.stored_id == stored_id)
+        .map(|s| s.title.trim())
+        .filter(|t| !t.is_empty())
+        .unwrap_or("Conversation")
+        .to_string()
 }
 
 struct ClarifySlot {
@@ -3117,5 +3840,165 @@ mod tests {
         state.conversations.insert("chat-1".into(), chat);
         assert!(composer_send_sensitive(&state, false));
         assert!(composer_hint_text(&state).contains("never saved to history"));
+    }
+
+    #[test]
+    fn message_rows_expose_branch_and_rewind_actions_only_when_idle() {
+        let mut chat = Conversation {
+            runtime_id: Some("rt-1".into()),
+            messages: vec![
+                ChatMessage {
+                    id: "u1".into(),
+                    role: Role::User,
+                    text: "Turn 1".into(),
+                },
+                ChatMessage {
+                    id: "t1".into(),
+                    role: Role::Tool,
+                    text: "Used read_file".into(),
+                },
+                ChatMessage {
+                    id: "a1".into(),
+                    role: Role::Assistant,
+                    text: "Answer 1".into(),
+                },
+                ChatMessage {
+                    id: "u2".into(),
+                    role: Role::User,
+                    text: "Turn 2".into(),
+                },
+                ChatMessage {
+                    id: "a2".into(),
+                    role: Role::Assistant,
+                    text: "Answer 2".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let rows = build_message_rows(Some(&chat), true, false);
+        assert_eq!(rows.len(), 5);
+        assert!(rows[0].can_branch && !rows[0].can_edit_retry);
+        assert!(!rows[1].can_branch);
+        assert!(rows[2].can_branch && !rows[2].can_regenerate);
+        assert!(rows[3].can_branch && rows[3].can_edit_retry);
+        assert!(rows[4].can_branch && rows[4].can_regenerate);
+
+        // Busy or read-only gates disable live rewind; read-only still allows branching.
+        chat.status = TurnStatus::Streaming;
+        let busy_rows = build_message_rows(Some(&chat), true, false);
+        assert!(
+            busy_rows
+                .iter()
+                .all(|r| !r.can_branch && !r.can_edit_retry && !r.can_regenerate)
+        );
+
+        chat.status = TurnStatus::Idle;
+        chat.runtime_id = None;
+        chat.read_only_reason = Some("Read-only cron log".into());
+        let ro_rows = build_message_rows(Some(&chat), true, false);
+        assert!(ro_rows[0].can_branch);
+        assert!(!ro_rows[3].can_edit_retry);
+        assert!(!ro_rows[4].can_regenerate);
+    }
+
+    #[test]
+    fn prepare_branch_and_rewind_commands_and_lineage_summary() {
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            selected: Some("root".into()),
+            sessions: vec![SessionSummary {
+                stored_id: "root".into(),
+                title: "Compositor notes".into(),
+                source: "tui".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut chat = Conversation {
+            runtime_id: Some("rt-root".into()),
+            draft: "/branch Wayland take".into(),
+            messages: vec![
+                ChatMessage {
+                    id: "u1".into(),
+                    role: Role::User,
+                    text: "First".into(),
+                },
+                ChatMessage {
+                    id: "a1".into(),
+                    role: Role::Assistant,
+                    text: "Reply".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(can_send_in_conversation(&chat));
+        assert!(composer_conversation_hint(&chat).contains("fork conversation"));
+        chat.draft = "/retry".into();
+        assert!(can_send_in_conversation(&chat));
+        assert!(composer_conversation_hint(&chat).contains("rewind last turn"));
+        state.conversations.insert("root".into(), chat);
+
+        let (_, branch_cmd) =
+            prepare_branch_command(&state, Some(0), Some("Point fork".into())).expect("branch");
+        assert!(matches!(
+            branch_cmd,
+            Command::Branch {
+                visible_count: Some(1),
+                ..
+            }
+        ));
+        let (_, _, rewind_cmd) =
+            prepare_rewind_command(&state, RewindMode::EditRetry).expect("rewind");
+        assert!(matches!(
+            rewind_cmd,
+            Command::Undo {
+                mode: RewindMode::EditRetry,
+                ..
+            }
+        ));
+
+        insert_branched_state(
+            &mut state,
+            SessionSummary {
+                stored_id: "child-1".into(),
+                title: "Compositor notes (branch)".into(),
+                source: "tui".into(),
+                parent_session_id: Some("root".into()),
+                ..Default::default()
+            },
+            "rt-child".into(),
+            "Compositor notes".into(),
+            Vec::new(),
+            0,
+            None,
+        );
+        let (_, parent_none, children) = compute_lineage_stamp(&state);
+        assert!(parent_none.is_none());
+        assert_eq!(children.len(), 1);
+        assert_eq!(lineage_summary_text(None, 1), "Parent of 1 branch");
+
+        state.selected = Some("child-1".into());
+        let (_, parent_some, _) = compute_lineage_stamp(&state);
+        assert_eq!(
+            lineage_summary_text(parent_some.as_ref(), 0),
+            "Branched from “Compositor notes”"
+        );
+        assert_eq!(parse_rewind_action("edit"), Some(RewindMode::EditRetry));
+        assert_eq!(parse_rewind_action("regen"), Some(RewindMode::Regenerate));
+        assert_eq!(parse_rewind_action("undo"), Some(RewindMode::Undo));
+
+        let mut rewound = Conversation {
+            rewinding: true,
+            ..Default::default()
+        };
+        apply_rewound_conversation(
+            &mut rewound,
+            RewindMode::EditRetry,
+            "Edited prompt",
+            Vec::new(),
+            0,
+        );
+        assert!(!rewound.rewinding);
+        assert_eq!(rewound.draft, "Edited prompt");
     }
 }
