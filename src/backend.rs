@@ -7,13 +7,19 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::model::{
-    Catalog, ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event,
-    InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, Role, SessionSummary,
-    SteerOutcome, TurnStatus,
+    Catalog, ChatMessage, ClarificationQuestion, Command, CompressSummary, Config, ConnectionState,
+    Event, InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, RewindMode, Role,
+    SeedMessage, SessionMutation, SessionSummary, SkillSummary, StagedImage, SteerOutcome,
+    ToolEventUpdate, TurnStatus, WorkspaceCatalog, parse_live_info_telemetry,
+    parse_telemetry_payload, seed_messages_through,
 };
+use crate::recall;
+use crate::studio;
 
 const PAGE: usize = 50;
+const SEARCH_LIMIT: usize = 25;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPRESS_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const EVENT_BOUND: usize = 512;
@@ -217,6 +223,84 @@ fn queued_submit_params(runtime_id: &str, text: &str) -> Value {
     json!({"session_id": runtime_id, "text": text, "queued": true})
 }
 
+fn default_branch_title(parent_title: &str, custom_title: Option<&str>) -> String {
+    if let Some(name) = custom_title.map(str::trim).filter(|s| !s.is_empty()) {
+        return name.to_string();
+    }
+    let clean = parent_title.trim();
+    if clean.is_empty() {
+        "Conversation (branch)".into()
+    } else {
+        format!("{clean} (branch)")
+    }
+}
+
+fn branch_rpc_params(runtime_id: &str, custom_title: Option<&str>, count: Option<usize>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("session_id".into(), Value::String(runtime_id.to_string()));
+    if let Some(name) = custom_title.map(str::trim).filter(|s| !s.is_empty()) {
+        map.insert("name".into(), Value::String(name.to_string()));
+    }
+    if let Some(limit) = count.filter(|&n| n > 0) {
+        map.insert("count".into(), json!(limit));
+    }
+    Value::Object(map)
+}
+
+fn seeded_branch_params(title: &str, parent_stored_id: &str, seed: &[SeedMessage]) -> Value {
+    let rows: Vec<Value> = seed
+        .iter()
+        .map(|m| json!({"role": m.role, "content": m.content}))
+        .collect();
+    json!({
+        "title": title,
+        "parent_session_id": parent_stored_id,
+        "messages": rows,
+    })
+}
+
+fn undo_rpc_params(runtime_id: &str, mode: RewindMode) -> Value {
+    json!({
+        "session_id": runtime_id,
+        "intent": mode.wire_intent(),
+    })
+}
+
+fn create_rpc_params(title: &str, cwd: Option<&str>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("title".into(), Value::String(title.to_string()));
+    if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+        map.insert("cwd".into(), Value::String(dir.to_string()));
+    }
+    Value::Object(map)
+}
+
+fn extract_session_ids(result: &Value) -> Option<(String, String)> {
+    let runtime_id = result
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let stored_id = result
+        .get("stored_session_id")
+        .or_else(|| result.get("session_key"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((runtime_id, stored_id))
+}
+
+struct PendingBranch {
+    stored_id: String,
+    temp_runtime_id: String,
+    parent_stored_id: String,
+    parent_title: String,
+    title: String,
+    count: usize,
+    fallback_messages: Vec<ChatMessage>,
+    model: Option<ModelIdentity>,
+}
+
 struct Job {
     kind: JobKind,
     deadline: Instant,
@@ -234,6 +318,12 @@ enum JobKind {
     Submit {
         runtime_id: String,
         generation: u64,
+    },
+    AttachImage {
+        runtime_id: String,
+        generation: u64,
+        remaining_paths: VecDeque<String>,
+        prompt_text: String,
     },
     Interrupt {
         runtime_id: String,
@@ -260,6 +350,13 @@ enum JobKind {
     DeleteResume {
         stored_id: String,
     },
+    ArchiveClose {
+        stored_id: String,
+        retried: bool,
+    },
+    ArchiveResume {
+        stored_id: String,
+    },
     Catalog,
     /// Provider-less prime on a chat whose agent is not built yet.
     Prime {
@@ -270,6 +367,56 @@ enum JobKind {
     Switch {
         runtime_id: String,
         target: ModelIdentity,
+    },
+    SideQuestion {
+        runtime_id: String,
+        client_id: u64,
+    },
+    Branch {
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_seed: Vec<SeedMessage>,
+    },
+    BranchClose(PendingBranch),
+    BranchResume(PendingBranch),
+    BranchStored {
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_seed: Vec<SeedMessage>,
+    },
+    BranchSeeded {
+        parent_stored_id: String,
+        parent_title: String,
+        title: String,
+        seed_count: usize,
+    },
+    Undo {
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        attempts: u8,
+    },
+    UndoSync {
+        stored_id: String,
+        runtime_id: String,
+        removed: usize,
+        mode: RewindMode,
+        prompt_text: String,
+    },
+    Compress {
+        stored_id: String,
+        runtime_id: String,
+    },
+    CompressSync {
+        stored_id: String,
+        runtime_id: String,
+        summary: CompressSummary,
+    },
+    SessionInfo {
+        runtime_id: String,
     },
 }
 
@@ -285,6 +432,8 @@ struct Link {
     next_id: u64,
     next_turn_generation: u64,
     message_counts: HashMap<String, usize>,
+    pinned_sessions: HashSet<String>,
+    deferred_mutations: HashMap<String, (Option<String>, Option<bool>)>,
     jobs: HashMap<u64, Job>,
     runtime_of: HashMap<String, String>,
     refused: HashSet<String>,
@@ -415,6 +564,8 @@ impl Link {
             next_id: 1,
             next_turn_generation: 0,
             message_counts: HashMap::new(),
+            pinned_sessions: HashSet::new(),
+            deferred_mutations: HashMap::new(),
             jobs: HashMap::new(),
             runtime_of: HashMap::new(),
             refused: HashSet::new(),
@@ -444,6 +595,19 @@ impl Link {
 
     fn clean(&self, text: String) -> String {
         sanitize(&text, &self.secrets)
+    }
+
+    /// Credential tokens (`password` and ephemeral `ws-ticket`) without `username`,
+    /// so short usernames never corrupt skill category slugs or workspace labels.
+    fn credential_secrets(&self) -> Vec<String> {
+        let mut creds = Vec::with_capacity(2);
+        if let Some(pw) = self.secrets.first() {
+            creds.push(pw.clone());
+        }
+        for extra in self.secrets.iter().skip(2) {
+            creds.push(extra.clone());
+        }
+        creds
     }
 
     async fn connect(&mut self) -> Result<(), String> {
@@ -609,6 +773,7 @@ impl Link {
         self.emit(Event::Connection(ConnectionState::Connected))
             .await;
         self.fetch_models().await;
+        self.fetch_studio_catalogs().await;
         while self.ready && self.write.is_some() {
             let Some(command) = self.queued.pop_front() else {
                 break;
@@ -624,144 +789,293 @@ impl Link {
         if (!self.ready || self.write.is_none())
             && !matches!(command, Command::Reconnect | Command::Shutdown)
         {
-            if self.write.is_some()
-                || matches!(
-                    command,
-                    Command::List { .. } | Command::Create { .. } | Command::Resume { .. }
-                )
-            {
-                self.queued.push_back(command);
-                return;
-            }
-            self.fail("connect", None, "Not connected. Reconnect to try again.")
-                .await;
+            self.handle_unready_command(command).await;
             return;
         }
         match command {
-            Command::Reconnect => {} // The supervisor handles connection cancellation.
-            Command::Shutdown => {}
-            Command::List { offset } => self.list(offset).await,
-            Command::Create { title } => {
-                if let Err(fault) = self
-                    .send_rpc(
-                        "session.create",
-                        json!({"title": title}),
-                        JobKind::Create { title },
-                        RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    self.fail("create", None, send_fault_message("create", fault))
-                        .await;
-                }
-            }
-            Command::Resume { stored_id } => {
-                if let Err(fault) = self
-                    .send_rpc(
-                        "session.resume",
-                        json!({
-                            "session_id": stored_id,
-                            "inline_images": false,
-                            "omit_messages": true
-                        }),
-                        JobKind::Resume {
-                            stored_id: stored_id.clone(),
-                        },
-                        RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    self.fail(
-                        "resume",
-                        Some(stored_id),
-                        send_fault_message("resume", fault),
-                    )
+            Command::Reconnect | Command::Shutdown => {}
+            Command::List { .. }
+            | Command::History { .. }
+            | Command::SearchSessions { .. }
+            | Command::MutateSession { .. }
+            | Command::FetchStudio => self.http_command(command).await,
+            Command::Create { title, cwd } => self.begin_create(title, cwd).await,
+            Command::Resume { stored_id } => self.begin_resume(stored_id).await,
+            Command::Submit {
+                runtime_id,
+                text,
+                attachments,
+            } => {
+                self.submit_unless_stopping(runtime_id, text, attachments)
                     .await;
-                }
             }
-            Command::History { stored_id, before } => self.history(stored_id, before).await,
-            Command::Submit { runtime_id, text } => {
-                if self
-                    .turns
-                    .get(&runtime_id)
-                    .is_some_and(|turn| turn.phase == TurnPhase::Stopping)
-                {
-                    return;
-                }
-                self.begin_submit(runtime_id, text).await;
-            }
-            Command::Steer { runtime_id, text } => match steer_route(self.turns.get(&runtime_id)) {
-                SteerRoute::Drop => {}
-                SteerRoute::Redirect => {
-                    if let Err(fault) = self
-                        .send_rpc(
-                            "session.redirect",
-                            json!({"session_id": runtime_id, "text": text}),
-                            JobKind::Steer {
-                                runtime_id: runtime_id.clone(),
-                                text,
-                            },
-                            RPC_TIMEOUT,
-                        )
-                        .await
-                    {
-                        // A failed steer must not end the live turn: the
-                        // "steer" operation is deliberately not "submit".
-                        self.fail(
-                            "steer",
-                            Some(runtime_id),
-                            send_fault_message("steer", fault),
-                        )
-                        .await;
-                    }
-                }
-                // Idle or already-settled turn: this is a normal next prompt.
-                SteerRoute::Submit => self.begin_submit(runtime_id, text).await,
-            },
-            Command::Interrupt { runtime_id } => {
-                let generation = self
-                    .turns
-                    .get(&runtime_id)
-                    .map_or(0, |turn| turn.generation);
-                if let Err(fault) = self
-                    .send_rpc(
-                        "session.interrupt",
-                        json!({"session_id": runtime_id}),
-                        JobKind::Interrupt {
-                            runtime_id: runtime_id.clone(),
-                            generation,
-                        },
-                        RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    self.fail(
-                        "interrupt",
-                        Some(runtime_id),
-                        send_fault_message("interrupt", fault),
-                    )
-                    .await;
-                }
-            }
+            Command::Steer { runtime_id, text } => self.begin_steer(runtime_id, text).await,
+            Command::Interrupt { runtime_id } => self.begin_interrupt(runtime_id).await,
             Command::Respond {
                 runtime_id,
                 request_id,
                 answer,
             } => self.respond(runtime_id, request_id, answer).await,
             Command::Delete { stored_id } => self.begin_delete(stored_id).await,
-            Command::FetchModels | Command::SetModel { .. } => {
+            Command::Branch { .. } | Command::Undo { .. } | Command::Compress { .. } => {
+                self.timeline_command(command).await;
+            }
+            Command::FetchModels | Command::SetModel { .. } | Command::AskSide { .. } => {
                 self.model_command(command).await;
             }
         }
     }
 
-    async fn begin_submit(&mut self, runtime_id: String, text: String) {
+    async fn submit_unless_stopping(
+        &mut self,
+        runtime_id: String,
+        text: String,
+        attachments: Vec<StagedImage>,
+    ) {
+        if !self
+            .turns
+            .get(&runtime_id)
+            .is_some_and(|turn| turn.phase == TurnPhase::Stopping)
+        {
+            self.begin_submit(runtime_id, text, attachments).await;
+        }
+    }
+
+    async fn http_command(&mut self, command: Command) {
+        match command {
+            Command::List { offset } => self.list(offset).await,
+            Command::History { stored_id, before } => self.history(stored_id, before).await,
+            Command::SearchSessions { query, request_seq } => {
+                self.search_sessions(query, request_seq).await;
+            }
+            Command::MutateSession {
+                stored_id,
+                mutation,
+            } => self.mutate_session(stored_id, mutation).await,
+            Command::FetchStudio => self.fetch_studio_catalogs().await,
+            _ => {}
+        }
+    }
+
+    async fn handle_unready_command(&mut self, command: Command) {
+        if self.write.is_some() || is_queueable_while_connecting(&command) {
+            self.queued.push_back(command);
+            return;
+        }
+        if let Command::AskSide {
+            runtime_id,
+            client_id,
+            ..
+        } = command
+        {
+            self.emit(Event::SideFailed {
+                runtime_id,
+                client_id,
+                message: "Not connected. Reconnect to try again.".into(),
+            })
+            .await;
+            return;
+        }
+        if let Some((op, stored_id)) = unready_session_failure(&command) {
+            self.fail(
+                op,
+                Some(stored_id),
+                "Not connected. Reconnect to try again.",
+            )
+            .await;
+            return;
+        }
+        self.fail("connect", None, "Not connected. Reconnect to try again.")
+            .await;
+    }
+
+    async fn begin_create(&mut self, title: String, cwd: Option<String>) {
+        let params = create_rpc_params(&title, cwd.as_deref());
+        if let Err(fault) = self
+            .send_rpc(
+                "session.create",
+                params,
+                JobKind::Create { title },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail("create", None, send_fault_message("create", fault))
+                .await;
+        }
+    }
+
+    async fn begin_resume(&mut self, stored_id: String) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::Resume {
+                    stored_id: stored_id.clone(),
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "resume",
+                Some(stored_id),
+                send_fault_message("resume", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn begin_steer(&mut self, runtime_id: String, text: String) {
+        match steer_route(self.turns.get(&runtime_id)) {
+            SteerRoute::Drop => {}
+            SteerRoute::Redirect => {
+                if let Err(fault) = self
+                    .send_rpc(
+                        "session.redirect",
+                        json!({"session_id": runtime_id, "text": text}),
+                        JobKind::Steer {
+                            runtime_id: runtime_id.clone(),
+                            text,
+                        },
+                        RPC_TIMEOUT,
+                    )
+                    .await
+                {
+                    // A failed steer must not end the live turn: the
+                    // "steer" operation is deliberately not "submit".
+                    self.fail(
+                        "steer",
+                        Some(runtime_id),
+                        send_fault_message("steer", fault),
+                    )
+                    .await;
+                }
+            }
+            // Idle or already-settled turn: this is a normal next prompt.
+            SteerRoute::Submit => self.begin_submit(runtime_id, text, Vec::new()).await,
+        }
+    }
+
+    async fn begin_interrupt(&mut self, runtime_id: String) {
+        let generation = self
+            .turns
+            .get(&runtime_id)
+            .map_or(0, |turn| turn.generation);
+        if let Err(fault) = self
+            .send_rpc(
+                "session.interrupt",
+                json!({"session_id": runtime_id}),
+                JobKind::Interrupt {
+                    runtime_id: runtime_id.clone(),
+                    generation,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "interrupt",
+                Some(runtime_id),
+                send_fault_message("interrupt", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn begin_submit(
+        &mut self,
+        runtime_id: String,
+        text: String,
+        attachments: Vec<StagedImage>,
+    ) {
         self.next_turn_generation += 1;
         let generation = self.next_turn_generation;
         self.turns.insert(
             runtime_id.clone(),
             Turn::submitting(format!("turn-{runtime_id}-{generation}"), generation),
         );
+        let wire_text = studio::effective_wire_prompt(&text, !attachments.is_empty());
+        if attachments.is_empty() {
+            self.send_submit_rpc(runtime_id, generation, wire_text)
+                .await;
+            return;
+        }
+        match self.upload_staged_images(&attachments).await {
+            Ok(paths) => {
+                self.advance_attach_or_submit(runtime_id, generation, paths, wire_text)
+                    .await;
+            }
+            Err(err) => {
+                if let Some(turn) = self.turns.get_mut(&runtime_id) {
+                    let _ = turn.fail_submit(generation);
+                }
+                self.fail(
+                    "submit",
+                    Some(runtime_id),
+                    format!("{err} The prompt was not sent."),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn upload_staged_images(
+        &self,
+        attachments: &[StagedImage],
+    ) -> Result<VecDeque<String>, String> {
+        let mut paths = VecDeque::with_capacity(attachments.len());
+        for image in attachments {
+            let uploaded = upload_chat_image_http(&self.http, &self.origin, image).await?;
+            paths.push_back(uploaded);
+        }
+        Ok(paths)
+    }
+
+    async fn advance_attach_or_submit(
+        &mut self,
+        runtime_id: String,
+        generation: u64,
+        mut remaining_paths: VecDeque<String>,
+        prompt_text: String,
+    ) {
+        let still_submitting = self.turns.get(&runtime_id).is_some_and(|turn| {
+            turn.generation == generation
+                && turn.phase == TurnPhase::Submitting
+                && !turn.submit_settled
+        });
+        if !still_submitting {
+            return;
+        }
+        let Some(next_path) = remaining_paths.pop_front() else {
+            self.send_submit_rpc(runtime_id, generation, prompt_text)
+                .await;
+            return;
+        };
+        if let Err(fault) = self
+            .send_rpc(
+                "image.attach",
+                json!({"session_id": runtime_id, "path": next_path}),
+                JobKind::AttachImage {
+                    runtime_id: runtime_id.clone(),
+                    generation,
+                    remaining_paths,
+                    prompt_text,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.abort_local_submit(&runtime_id, generation, fault)
+                .await;
+        }
+    }
+
+    async fn send_submit_rpc(&mut self, runtime_id: String, generation: u64, text: String) {
         if let Err(fault) = self
             .send_rpc(
                 "prompt.submit",
@@ -774,16 +1088,21 @@ impl Link {
             )
             .await
         {
-            if let Some(turn) = self.turns.get_mut(&runtime_id) {
-                let _ = turn.fail_submit(generation);
-            }
-            self.fail(
-                "submit",
-                Some(runtime_id),
-                send_fault_message("submit", fault),
-            )
-            .await;
+            self.abort_local_submit(&runtime_id, generation, fault)
+                .await;
         }
+    }
+
+    async fn abort_local_submit(&mut self, runtime_id: &str, generation: u64, fault: SendFault) {
+        if let Some(turn) = self.turns.get_mut(runtime_id) {
+            let _ = turn.fail_submit(generation);
+        }
+        self.fail(
+            "submit",
+            Some(runtime_id.to_string()),
+            send_fault_message("submit", fault),
+        )
+        .await;
     }
 
     async fn model_command(&mut self, command: Command) {
@@ -803,7 +1122,301 @@ impl Link {
                         .await;
                 }
             }
+            Command::AskSide {
+                runtime_id,
+                client_id,
+                question,
+            } => {
+                self.begin_side_question(runtime_id, client_id, question)
+                    .await;
+            }
             _ => {}
+        }
+    }
+
+    async fn begin_side_question(&mut self, runtime_id: String, client_id: u64, question: String) {
+        if let Err(fault) = self
+            .send_rpc(
+                "prompt.btw",
+                json!({"session_id": runtime_id, "text": question}),
+                JobKind::SideQuestion {
+                    runtime_id: runtime_id.clone(),
+                    client_id,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.emit(Event::SideFailed {
+                runtime_id,
+                client_id,
+                message: send_fault_message("btw", fault),
+            })
+            .await;
+        }
+    }
+
+    async fn timeline_command(&mut self, command: Command) {
+        match command {
+            Command::Branch {
+                stored_id,
+                runtime_id,
+                parent_title,
+                before_loaded,
+                visible_count,
+                custom_title,
+                seed_fallback,
+            } => {
+                self.begin_branch(
+                    stored_id,
+                    runtime_id,
+                    parent_title,
+                    before_loaded,
+                    visible_count,
+                    custom_title,
+                    seed_fallback,
+                )
+                .await;
+            }
+            Command::Undo {
+                stored_id,
+                runtime_id,
+                mode,
+                prompt_text,
+            } => {
+                self.begin_undo(stored_id, runtime_id, mode, prompt_text)
+                    .await;
+            }
+            Command::Compress {
+                stored_id,
+                runtime_id,
+            } => {
+                self.begin_compress(stored_id, runtime_id).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn begin_compress(&mut self, stored_id: String, runtime_id: String) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.compress",
+                json!({"session_id": runtime_id}),
+                JobKind::Compress {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                },
+                COMPRESS_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "compress",
+                Some(stored_id),
+                send_fault_message("compress", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn fetch_studio_catalogs(&self) {
+        let creds = self.credential_secrets();
+        let catalog = match fetch_workspaces_http(&self.http, &self.origin, &creds).await {
+            Ok(catalog) => catalog,
+            Err(err) => WorkspaceCatalog {
+                error: Some(self.clean(err)),
+                ..Default::default()
+            },
+        };
+        self.emit(Event::Workspaces { catalog }).await;
+        if let Ok(skills) = fetch_skills_http(&self.http, &self.origin, &creds).await {
+            self.emit(Event::Skills { skills }).await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_branch(
+        &mut self,
+        stored_id: String,
+        runtime_id: Option<String>,
+        parent_title: String,
+        before_loaded: usize,
+        visible_count: Option<usize>,
+        custom_title: Option<String>,
+        seed_fallback: Vec<SeedMessage>,
+    ) {
+        let fallback_title = default_branch_title(&parent_title, custom_title.as_deref());
+        let (total_visible, full_seed) =
+            if before_loaded > 0 && (visible_count.is_some() || runtime_id.is_none()) {
+                match self.fetch_earlier_visible(&stored_id, before_loaded).await {
+                    Ok(mut earlier) => {
+                        let prefix_len = earlier.len();
+                        earlier.extend(seed_fallback);
+                        (visible_count.map(|v| prefix_len + v), earlier)
+                    }
+                    Err(err) => {
+                        self.fail("branch", Some(stored_id), err).await;
+                        return;
+                    }
+                }
+            } else {
+                (visible_count, seed_fallback)
+            };
+        if let Some(rt) = runtime_id {
+            let params = branch_rpc_params(&rt, custom_title.as_deref(), total_visible);
+            if let Err(fault) = self
+                .send_rpc(
+                    "session.branch",
+                    params,
+                    JobKind::Branch {
+                        parent_stored_id: stored_id.clone(),
+                        parent_title,
+                        fallback_title,
+                        fallback_seed: full_seed,
+                    },
+                    RPC_TIMEOUT,
+                )
+                .await
+            {
+                self.fail(
+                    "branch",
+                    Some(stored_id),
+                    send_fault_message("branch", fault),
+                )
+                .await;
+            }
+        } else if total_visible.is_none() && custom_title.is_none() {
+            self.begin_stored_branch(stored_id, parent_title, fallback_title, full_seed)
+                .await;
+        } else {
+            self.begin_seeded_branch(stored_id, parent_title, fallback_title, full_seed)
+                .await;
+        }
+    }
+
+    async fn begin_stored_branch(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_seed: Vec<SeedMessage>,
+    ) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.branch_stored",
+                json!({"parent_session_id": parent_stored_id}),
+                JobKind::BranchStored {
+                    parent_stored_id: parent_stored_id.clone(),
+                    parent_title,
+                    fallback_title,
+                    fallback_seed,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn begin_seeded_branch(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        title: String,
+        seed: Vec<SeedMessage>,
+    ) {
+        if seed.is_empty() {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                "Nothing to branch — send a message first.",
+            )
+            .await;
+            return;
+        }
+        let params = seeded_branch_params(&title, &parent_stored_id, &seed);
+        let seed_count = seed.len();
+        if let Err(fault) = self
+            .send_rpc(
+                "session.create",
+                params,
+                JobKind::BranchSeeded {
+                    parent_stored_id: parent_stored_id.clone(),
+                    parent_title,
+                    title,
+                    seed_count,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn fetch_earlier_visible(
+        &self,
+        stored_id: &str,
+        before_loaded: usize,
+    ) -> Result<Vec<SeedMessage>, String> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset < before_loaded {
+            let limit = (before_loaded - offset).min(PAGE);
+            let page = fetch_history(&self.http, &self.origin, stored_id, offset, limit).await?;
+            out.extend(seed_messages_through(&page, None));
+            offset += limit;
+        }
+        Ok(out)
+    }
+
+    async fn begin_undo(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+    ) {
+        self.send_undo(stored_id, runtime_id, mode, prompt_text, 0)
+            .await;
+    }
+
+    async fn send_undo(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        attempts: u8,
+    ) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.undo",
+                undo_rpc_params(&runtime_id, mode),
+                JobKind::Undo {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                    mode,
+                    prompt_text,
+                    attempts,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail("undo", Some(stored_id), send_fault_message("undo", fault))
+                .await;
         }
     }
 
@@ -925,16 +1538,292 @@ impl Link {
 
     async fn list(&mut self, offset: usize) {
         match fetch_sessions(&self.http, &self.origin, offset).await {
-            Ok(event) => {
-                if let Event::Sessions { sessions, .. } = &event {
-                    for session in sessions {
-                        self.note_listed(session);
-                    }
+            Ok(mut event) => {
+                if let Event::Sessions { sessions, .. } = &mut event {
+                    self.note_and_clean_listed(sessions);
                 }
                 self.emit(event).await;
             }
             Err(message) => self.fail("list", None, message).await,
         }
+    }
+
+    fn note_and_clean_listed(&mut self, sessions: &mut [SessionSummary]) {
+        for session in sessions {
+            session.title = self.clean(std::mem::take(&mut session.title));
+            session.preview = self.clean(std::mem::take(&mut session.preview));
+            self.note_listed(session);
+        }
+    }
+
+    async fn search_sessions(&self, query: String, request_seq: u64) {
+        let trimmed = query.trim().to_string();
+        if trimmed.is_empty() {
+            self.emit(Event::SearchResults {
+                query,
+                request_seq,
+                hits: Vec::new(),
+            })
+            .await;
+            return;
+        }
+        match fetch_search_hits(&self.http, &self.origin, &trimmed, &self.secrets).await {
+            Ok(mut hits) => {
+                for hit in &mut hits {
+                    if self.pinned_sessions.contains(&hit.stored_id) {
+                        hit.pinned = true;
+                    }
+                }
+                self.emit(Event::SearchResults {
+                    query,
+                    request_seq,
+                    hits,
+                })
+                .await;
+            }
+            Err(message) => {
+                self.emit(Event::SearchResults {
+                    query,
+                    request_seq,
+                    hits: Vec::new(),
+                })
+                .await;
+                self.fail("search", None, message).await;
+            }
+        }
+    }
+
+    async fn mutate_session(&mut self, stored_id: String, mutation: SessionMutation) {
+        if matches!(mutation, SessionMutation::Archive) {
+            self.begin_archive(stored_id).await;
+            return;
+        }
+        let body = recall::mutation_patch_body(&mutation);
+        match patch_session_http(&self.http, &self.origin, &stored_id, &body).await {
+            Ok(PatchOutcome::Applied) => self.finish_applied_mutation(stored_id, mutation).await,
+            Ok(PatchOutcome::NotFound) if self.is_unpersisted_live(&stored_id) => {
+                self.apply_unpersisted_mutation(stored_id, mutation).await;
+            }
+            Ok(PatchOutcome::NotFound) => {
+                self.fail("curation", Some(stored_id), "Session not found.")
+                    .await;
+            }
+            Ok(PatchOutcome::Conflict) => {
+                self.fail(
+                    "curation",
+                    Some(stored_id),
+                    "Could not update active conversation (HTTP 409).",
+                )
+                .await;
+            }
+            Err(message) => self.fail("curation", Some(stored_id), message).await,
+        }
+    }
+
+    async fn begin_archive(&mut self, stored_id: String) {
+        if self.is_unpersisted_live(&stored_id) {
+            self.apply_unpersisted_mutation(stored_id, SessionMutation::Archive)
+                .await;
+            return;
+        }
+        if let Some(runtime_id) = self.runtime_of.remove(&stored_id)
+            && self
+                .close_runtime_for_archive(&stored_id, &runtime_id, false)
+                .await
+        {
+            return;
+        }
+        self.request_archive_patch(stored_id, false).await;
+    }
+
+    async fn close_runtime_for_archive(
+        &mut self,
+        stored_id: &str,
+        runtime_id: &str,
+        retried: bool,
+    ) -> bool {
+        let _ = self
+            .send_rpc(
+                "session.interrupt",
+                json!({"session_id": runtime_id}),
+                JobKind::Ping,
+                RPC_TIMEOUT,
+            )
+            .await;
+        self.send_rpc(
+            "session.close",
+            json!({"session_id": runtime_id}),
+            JobKind::ArchiveClose {
+                stored_id: stored_id.to_string(),
+                retried,
+            },
+            RPC_TIMEOUT,
+        )
+        .await
+        .is_ok()
+    }
+
+    async fn request_archive_patch(&mut self, stored_id: String, retried: bool) {
+        let body = recall::mutation_patch_body(&SessionMutation::Archive);
+        match patch_session_http(&self.http, &self.origin, &stored_id, &body).await {
+            Ok(PatchOutcome::Applied) => self.finish_archive(stored_id).await,
+            Ok(PatchOutcome::NotFound)
+                if self.message_counts.get(&stored_id).copied() == Some(0) =>
+            {
+                self.finish_archive(stored_id).await;
+            }
+            Ok(PatchOutcome::NotFound) => {
+                self.fail("curation", Some(stored_id), "Session not found.")
+                    .await;
+            }
+            Ok(PatchOutcome::Conflict) => {
+                self.retry_archive_after_conflict(stored_id, retried).await;
+            }
+            Err(message) => self.fail("curation", Some(stored_id), message).await,
+        }
+    }
+
+    async fn finish_archive(&mut self, stored_id: String) {
+        self.runtime_of.remove(&stored_id);
+        self.pinned_sessions.remove(&stored_id);
+        self.deferred_mutations.remove(&stored_id);
+        self.emit(Event::SessionMutated {
+            stored_id,
+            mutation: SessionMutation::Archive,
+        })
+        .await;
+    }
+
+    async fn retry_archive_after_conflict(&mut self, stored_id: String, retried: bool) {
+        if !retried
+            && !self.refused.contains(&stored_id)
+            && self
+                .send_rpc(
+                    "session.resume",
+                    json!({
+                        "session_id": stored_id,
+                        "inline_images": false,
+                        "omit_messages": true
+                    }),
+                    JobKind::ArchiveResume {
+                        stored_id: stored_id.clone(),
+                    },
+                    RPC_TIMEOUT,
+                )
+                .await
+                .is_ok()
+        {
+            return;
+        }
+        self.fail(
+            "curation",
+            Some(stored_id),
+            "Could not archive active conversation (HTTP 409).",
+        )
+        .await;
+    }
+
+    fn set_pinned_cache(&mut self, stored_id: &str, pinned: bool) {
+        if pinned {
+            self.pinned_sessions.insert(stored_id.to_string());
+        } else {
+            self.pinned_sessions.remove(stored_id);
+        }
+    }
+
+    async fn finish_applied_mutation(&mut self, stored_id: String, mutation: SessionMutation) {
+        if let SessionMutation::SetPinned(pinned) = mutation {
+            self.set_pinned_cache(&stored_id, pinned);
+        }
+        self.clear_deferred_field(&stored_id, &mutation);
+        self.emit(Event::SessionMutated {
+            stored_id,
+            mutation,
+        })
+        .await;
+    }
+
+    fn is_unpersisted_live(&self, stored_id: &str) -> bool {
+        self.runtime_of.contains_key(stored_id)
+            && self.message_counts.get(stored_id).copied().unwrap_or(0) == 0
+    }
+
+    async fn apply_unpersisted_mutation(&mut self, stored_id: String, mutation: SessionMutation) {
+        if matches!(mutation, SessionMutation::Archive) {
+            self.pinned_sessions.remove(&stored_id);
+            self.deferred_mutations.remove(&stored_id);
+            self.close_live_runtime_quietly(&stored_id).await;
+        } else {
+            if let SessionMutation::SetPinned(pinned) = mutation {
+                self.set_pinned_cache(&stored_id, pinned);
+            }
+            self.record_deferred_mutation(&stored_id, &mutation);
+        }
+        self.emit(Event::SessionMutated {
+            stored_id,
+            mutation,
+        })
+        .await;
+    }
+
+    fn record_deferred_mutation(&mut self, stored_id: &str, mutation: &SessionMutation) {
+        let entry = self
+            .deferred_mutations
+            .entry(stored_id.to_string())
+            .or_insert((None, None));
+        match mutation {
+            SessionMutation::Rename(title) => entry.0 = Some(title.trim().to_string()),
+            SessionMutation::SetPinned(pinned) => entry.1 = Some(*pinned),
+            SessionMutation::Archive => {}
+        }
+    }
+
+    fn clear_deferred_field(&mut self, stored_id: &str, mutation: &SessionMutation) {
+        let Some(entry) = self.deferred_mutations.get_mut(stored_id) else {
+            return;
+        };
+        match mutation {
+            SessionMutation::Rename(_) => entry.0 = None,
+            SessionMutation::SetPinned(_) => entry.1 = None,
+            SessionMutation::Archive => {}
+        }
+        if entry.0.is_none() && entry.1.is_none() {
+            self.deferred_mutations.remove(stored_id);
+        }
+    }
+
+    async fn close_live_runtime_quietly(&mut self, stored_id: &str) {
+        if let Some(runtime_id) = self.runtime_of.remove(stored_id) {
+            let _ = self
+                .send_rpc(
+                    "session.close",
+                    json!({"session_id": runtime_id}),
+                    JobKind::Ping,
+                    RPC_TIMEOUT,
+                )
+                .await;
+        }
+    }
+
+    async fn flush_deferred_for_runtime(&mut self, runtime_id: &str) {
+        let Some(stored_id) = self.stored_id_for_runtime(runtime_id) else {
+            return;
+        };
+        let count = self.message_counts.entry(stored_id.clone()).or_insert(0);
+        *count = (*count).max(2);
+        let Some((title, pinned)) = self.deferred_mutations.remove(&stored_id) else {
+            return;
+        };
+        let Some(body) = deferred_patch_body(title, pinned) else {
+            return;
+        };
+        let _ = patch_session_http(&self.http, &self.origin, &stored_id, &body).await;
+    }
+
+    fn stored_id_for_runtime(&self, runtime_id: &str) -> Option<String> {
+        self.runtime_of
+            .iter()
+            .find_map(|(stored, rt)| (rt == runtime_id).then(|| stored.clone()))
     }
 
     async fn history(&self, stored_id: String, before: usize) {
@@ -1213,55 +2102,21 @@ impl Link {
             "message.start" => self.on_message_start(&runtime_id, payload).await,
             "message.delta" => self.on_delta(&runtime_id, payload).await,
             "message.complete" => self.on_complete(&runtime_id, payload).await,
-            "thinking.delta" | "reasoning.delta" => {
-                self.activity(&runtime_id, "Hermes is thinking…").await
+            "thinking.delta"
+            | "reasoning.delta"
+            | "reasoning.available"
+            | "btw.complete"
+            | "session.usage"
+            | "session.info" => {
+                self.on_inspector_event(&runtime_id, event_type, payload)
+                    .await
             }
-            "tool.start" | "tool.generating" | "tool.complete" => {
-                self.on_tool_event(&runtime_id, event_type, payload).await
-            }
-            "request.cancel" => {
-                let Some(raw_id) = payload.get("id").or_else(|| payload.get("request_id")) else {
-                    return;
-                };
-                let Some((owner, request_id)) = self.take_ask(raw_id) else {
-                    return;
-                };
-                let waiting = self.asks.values().any(|ask| ask.runtime_id == owner);
-                if !waiting && let Some(turn) = self.turns.get_mut(&owner) {
-                    turn.note_withdraw();
-                }
-                self.emit(Event::InteractionCancelled {
-                    runtime_id: owner,
-                    request_id,
-                })
-                .await;
-            }
-            "error" => {
-                if self
-                    .turns
-                    .get(&runtime_id)
-                    .is_some_and(|turn| turn.phase == TurnPhase::Terminal)
-                {
-                    return;
-                }
-                if let Some(turn) = self.turns.get_mut(&runtime_id) {
-                    let _ = turn.finish();
-                }
-                self.retire_turn_jobs(&runtime_id);
-                let message = payload
-                    .get("message")
-                    .or_else(|| payload.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("The gateway reported an error.");
-                self.fail(
-                    "gateway",
-                    Some(runtime_id).filter(|s| !s.is_empty()),
-                    message,
-                )
-                .await;
-            }
-            "session.info" | "session.title" | "sessions.changed" | "platforms.changed"
-            | "message.interim" => {}
+            "tool.start" | "tool.generating" | "tool.progress" | "tool.output_risk"
+            | "tool.complete" => self.on_tool_event(&runtime_id, event_type, payload).await,
+            "request.cancel" => self.on_request_cancel(payload).await,
+            "error" => self.on_gateway_error(runtime_id, payload).await,
+            "session.title" => self.on_session_title(&runtime_id, payload).await,
+            "sessions.changed" | "platforms.changed" | "message.interim" => {}
             // Named `event` frames are notifications: they need no response.
             // An unknown name is unrelated metadata, not a conversation failure.
             // `error` and failed `message.complete` stay above. A missing type
@@ -1280,6 +2135,179 @@ impl Link {
                 }
             }
         }
+    }
+
+    async fn on_inspector_event(&mut self, runtime_id: &str, event_type: &str, payload: &Value) {
+        if runtime_id.is_empty() {
+            return;
+        }
+        match event_type {
+            "thinking.delta" | "reasoning.delta" => {
+                self.activity(runtime_id, "Hermes is thinking…").await;
+                self.emit_reasoning_payload(runtime_id, payload, false)
+                    .await;
+            }
+            "reasoning.available" => {
+                self.emit_reasoning_payload(runtime_id, payload, true).await;
+            }
+            "btw.complete" => self.on_btw_complete(runtime_id, payload).await,
+            "session.usage" => {
+                if let Some(telemetry) = parse_telemetry_payload(payload) {
+                    self.emit(Event::Telemetry {
+                        runtime_id: runtime_id.to_string(),
+                        telemetry,
+                    })
+                    .await;
+                }
+            }
+            "session.info" => {
+                self.emit_live_info(runtime_id, &json!({"info": payload}))
+                    .await
+            }
+            _ => {}
+        }
+    }
+
+    async fn emit_reasoning_payload(&self, runtime_id: &str, payload: &Value, replace: bool) {
+        let Some(raw) = payload.get("text").and_then(Value::as_str) else {
+            return;
+        };
+        if raw.is_empty() {
+            return;
+        }
+        self.emit(Event::Reasoning {
+            runtime_id: runtime_id.to_string(),
+            text: redact_secrets(raw, &self.secrets),
+            replace,
+        })
+        .await;
+    }
+
+    async fn on_btw_complete(&self, runtime_id: &str, payload: &Value) {
+        let task_id = payload
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let question = payload
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.emit(Event::SideComplete {
+            runtime_id: runtime_id.to_string(),
+            task_id,
+            question: redact_secrets(&question, &self.secrets),
+            text: redact_secrets(&text, &self.secrets),
+        })
+        .await;
+    }
+
+    async fn emit_live_info(&self, runtime_id: &str, result: &Value) {
+        if runtime_id.is_empty() {
+            return;
+        }
+        if let Some(telemetry) = parse_live_info_telemetry(result) {
+            self.emit(Event::Telemetry {
+                runtime_id: runtime_id.to_string(),
+                telemetry,
+            })
+            .await;
+        }
+    }
+
+    async fn on_request_cancel(&mut self, payload: &Value) {
+        let Some(raw_id) = payload.get("id").or_else(|| payload.get("request_id")) else {
+            return;
+        };
+        let Some((owner, request_id)) = self.take_ask(raw_id) else {
+            return;
+        };
+        let waiting = self.asks.values().any(|ask| ask.runtime_id == owner);
+        if !waiting && let Some(turn) = self.turns.get_mut(&owner) {
+            turn.note_withdraw();
+        }
+        self.emit(Event::InteractionCancelled {
+            runtime_id: owner,
+            request_id,
+        })
+        .await;
+    }
+
+    async fn on_gateway_error(&mut self, runtime_id: String, payload: &Value) {
+        if self
+            .turns
+            .get(&runtime_id)
+            .is_some_and(|turn| turn.phase == TurnPhase::Terminal)
+        {
+            return;
+        }
+        if let Some(turn) = self.turns.get_mut(&runtime_id) {
+            let _ = turn.finish();
+        }
+        self.retire_turn_jobs(&runtime_id);
+        let message = payload
+            .get("message")
+            .or_else(|| payload.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("The gateway reported an error.");
+        self.fail(
+            "gateway",
+            Some(runtime_id).filter(|s| !s.is_empty()),
+            message,
+        )
+        .await;
+    }
+
+    async fn on_session_title(&mut self, runtime_id: &str, payload: &Value) {
+        let Some(raw_title) = payload
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let session_id = self.resolve_title_session_id(runtime_id, payload);
+        if session_id.is_empty() {
+            return;
+        }
+        self.emit(Event::SessionTitle {
+            session_id,
+            title: self.clean(raw_title.to_string()),
+        })
+        .await;
+    }
+
+    fn resolve_title_session_id(&self, runtime_id: &str, payload: &Value) -> String {
+        if let Some(stored) = payload
+            .get("stored_session_id")
+            .or_else(|| payload.get("session_key"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return stored.to_string();
+        }
+        if let Some(stored) = self
+            .runtime_of
+            .iter()
+            .find_map(|(stored, rt)| (rt == runtime_id).then(|| stored.clone()))
+        {
+            return stored;
+        }
+        if !runtime_id.is_empty() {
+            return runtime_id.to_string();
+        }
+        payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
     }
 
     /// Turn-rollover handling for message.start, in the documented order:
@@ -1305,17 +2333,22 @@ impl Link {
     }
 
     async fn on_tool_event(&mut self, runtime_id: &str, event_type: &str, payload: &Value) {
-        let name = payload
-            .get("name")
-            .or_else(|| payload.get("tool"))
-            .or_else(|| payload.get("tool_name"))
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
+        let name = tool_name_from(payload);
         let label = match event_type {
             "tool.complete" => format!("Tool finished: {}", truncate(name, 80)),
+            "tool.output_risk" => format!("Tool flagged output: {}", truncate(name, 80)),
             _ => format!("Using tool: {}", truncate(name, 80)),
         };
         self.activity(runtime_id, &label).await;
+        if !runtime_id.is_empty()
+            && let Some(update) = parse_tool_event(event_type, payload, &self.secrets)
+        {
+            self.emit(Event::ToolTraceEvent {
+                runtime_id: runtime_id.to_string(),
+                update,
+            })
+            .await;
+        }
     }
 
     async fn on_delta(&mut self, runtime_id: &str, payload: &Value) {
@@ -1384,6 +2417,14 @@ impl Link {
             status,
         })
         .await;
+        self.flush_deferred_for_runtime(runtime_id).await;
+        self.emit_complete_metadata(runtime_id, payload).await;
+    }
+
+    async fn emit_complete_metadata(&self, runtime_id: &str, payload: &Value) {
+        if runtime_id.is_empty() {
+            return;
+        }
         // The completion's usage names the model this inference actually ran on. That is
         // the only direct evidence of an effective model, so it reconciles the display.
         if let Some(model) = payload
@@ -1395,6 +2436,25 @@ impl Link {
             self.emit(Event::ModelObserved {
                 runtime_id: runtime_id.to_string(),
                 model: model.to_string(),
+            })
+            .await;
+        }
+        if let Some(reasoning) = payload
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .filter(|r| !r.trim().is_empty())
+        {
+            self.emit(Event::Reasoning {
+                runtime_id: runtime_id.to_string(),
+                text: redact_secrets(reasoning, &self.secrets),
+                replace: true,
+            })
+            .await;
+        }
+        if let Some(telemetry) = parse_telemetry_payload(payload) {
+            self.emit(Event::Telemetry {
+                runtime_id: runtime_id.to_string(),
+                telemetry,
             })
             .await;
         }
@@ -1448,7 +2508,12 @@ impl Link {
 
     fn retire_submit_jobs(&mut self, runtime_id: &str) {
         self.jobs.retain(|_, job| {
-            !matches!(&job.kind, JobKind::Submit { runtime_id: id, .. } if id == runtime_id)
+            !matches!(
+                &job.kind,
+                JobKind::Submit { runtime_id: id, .. }
+                    | JobKind::AttachImage { runtime_id: id, .. }
+                    if id == runtime_id
+            )
         });
     }
 
@@ -1456,7 +2521,10 @@ impl Link {
         self.jobs.retain(|_, job| {
             !matches!(
                 &job.kind,
-                JobKind::Submit { runtime_id: id, .. } | JobKind::Interrupt { runtime_id: id, .. } if id == runtime_id
+                JobKind::Submit { runtime_id: id, .. }
+                    | JobKind::AttachImage { runtime_id: id, .. }
+                    | JobKind::Interrupt { runtime_id: id, .. }
+                    if id == runtime_id
             )
         });
     }
@@ -1606,70 +2674,22 @@ impl Link {
             JobKind::Submit {
                 runtime_id,
                 generation,
+            } => self.on_submit_reply(runtime_id, generation).await,
+            JobKind::AttachImage {
+                runtime_id,
+                generation,
+                remaining_paths,
+                prompt_text,
             } => {
-                if self
-                    .turns
-                    .get_mut(&runtime_id)
-                    .is_some_and(|turn| turn.acknowledge(generation))
-                {
-                    self.emit(Event::Submitted { runtime_id }).await;
-                }
+                self.advance_attach_or_submit(runtime_id, generation, remaining_paths, prompt_text)
+                    .await;
             }
             JobKind::Interrupt {
                 runtime_id,
                 generation,
-            } => {
-                let accepted = self
-                    .turns
-                    .get_mut(&runtime_id)
-                    .is_some_and(|turn| turn.accept_interrupt(generation));
-                if accepted {
-                    self.emit(Event::Interrupting { runtime_id }).await;
-                }
-            }
+            } => self.on_interrupt_reply(runtime_id, generation).await,
             JobKind::Steer { runtime_id, text } => {
-                let status = result
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("rejected");
-                match status {
-                    "redirected" => {
-                        self.emit(Event::SteerAccepted {
-                            runtime_id,
-                            outcome: SteerOutcome::Redirected,
-                        })
-                        .await;
-                    }
-                    "queued" => {
-                        self.emit(Event::SteerAccepted {
-                            runtime_id,
-                            outcome: SteerOutcome::Queued,
-                        })
-                        .await;
-                    }
-                    // Not running or inapplicable: queue as the next prompt,
-                    // mirroring the upstream TUI fallback.
-                    _ => {
-                        if let Err(fault) = self
-                            .send_rpc(
-                                "prompt.submit",
-                                queued_submit_params(&runtime_id, &text),
-                                JobKind::Queue {
-                                    runtime_id: runtime_id.clone(),
-                                },
-                                RPC_TIMEOUT,
-                            )
-                            .await
-                        {
-                            self.fail(
-                                "steer",
-                                Some(runtime_id),
-                                send_fault_message("steer", fault),
-                            )
-                            .await;
-                        }
-                    }
-                }
+                self.on_steer_reply(runtime_id, text, result).await
             }
             JobKind::Queue { runtime_id } => {
                 self.emit(Event::SteerAccepted {
@@ -1678,18 +2698,7 @@ impl Link {
                 })
                 .await;
             }
-            JobKind::Catalog => match Catalog::parse(result) {
-                Ok(catalog) => self.emit(Event::Catalog { catalog }).await,
-                Err(error) => {
-                    self.emit(Event::Catalog {
-                        catalog: Catalog {
-                            error: Some(self.clean(error)),
-                            ..Default::default()
-                        },
-                    })
-                    .await
-                }
-            },
+            JobKind::Catalog => self.on_catalog_reply(result).await,
             JobKind::Prime {
                 runtime_id,
                 target,
@@ -1703,45 +2712,670 @@ impl Link {
             JobKind::Switch {
                 runtime_id, target, ..
             } => self.model_reply(runtime_id, target, result).await,
+            JobKind::SideQuestion {
+                runtime_id,
+                client_id,
+            } => self.on_side_reply(runtime_id, client_id, result).await,
             JobKind::Delete { stored_id, .. } => {
                 self.runtime_of.remove(&stored_id);
+                self.pinned_sessions.remove(&stored_id);
+                self.deferred_mutations.remove(&stored_id);
                 self.emit(Event::Deleted { stored_id }).await;
             }
             JobKind::DeleteResume { stored_id } => {
+                self.on_delete_resume_reply(stored_id, result).await
+            }
+            kind => self.on_timeline_job(kind, result).await,
+        }
+    }
+
+    async fn on_timeline_job(&mut self, kind: JobKind, result: &Value) {
+        match kind {
+            JobKind::Branch {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                self.on_live_branch_reply(
+                    parent_stored_id,
+                    parent_title,
+                    fallback_title,
+                    fallback_seed.len(),
+                    result,
+                )
+                .await;
+            }
+            JobKind::BranchClose(pending) => self.reopen_branched(pending).await,
+            JobKind::BranchResume(pending) => {
+                self.finish_reopened_branch(pending, result).await;
+            }
+            JobKind::BranchStored {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                self.on_branched(
+                    parent_stored_id,
+                    parent_title,
+                    fallback_title,
+                    fallback_seed.len(),
+                    result,
+                )
+                .await;
+            }
+            JobKind::BranchSeeded {
+                parent_stored_id,
+                parent_title,
+                title,
+                seed_count,
+            } => {
+                self.on_branched(parent_stored_id, parent_title, title, seed_count, result)
+                    .await;
+            }
+            JobKind::Undo {
+                stored_id,
+                runtime_id,
+                mode,
+                prompt_text,
+                ..
+            } => {
+                self.on_undo_reply(stored_id, runtime_id, mode, prompt_text, result)
+                    .await;
+            }
+            JobKind::UndoSync {
+                stored_id,
+                runtime_id,
+                removed,
+                mode,
+                prompt_text,
+            } => {
+                self.on_undo_sync_reply(stored_id, runtime_id, removed, mode, prompt_text, result)
+                    .await;
+            }
+            other => self.on_curation_job(other, result).await,
+        }
+    }
+
+    async fn on_curation_job(&mut self, kind: JobKind, result: &Value) {
+        match kind {
+            JobKind::ArchiveClose { stored_id, retried } => {
+                self.request_archive_patch(stored_id, retried).await;
+            }
+            JobKind::ArchiveResume { stored_id } => {
                 if let Some(runtime_id) = result
                     .get("session_id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
-                {
-                    self.runtime_of
-                        .insert(stored_id.clone(), runtime_id.to_string());
-                    let _ = self
-                        .send_rpc(
-                            "session.interrupt",
-                            json!({"session_id": runtime_id}),
-                            JobKind::Ping,
-                            RPC_TIMEOUT,
-                        )
-                        .await;
-                    if self
-                        .send_rpc(
-                            "session.close",
-                            json!({"session_id": runtime_id}),
-                            JobKind::Close {
-                                stored_id: stored_id.clone(),
-                                retried: true,
-                            },
-                            RPC_TIMEOUT,
-                        )
+                    && self
+                        .close_runtime_for_archive(&stored_id, runtime_id, true)
                         .await
-                        .is_ok()
-                    {
-                        return;
-                    }
+                {
+                    return;
                 }
-                self.request_delete(stored_id, true).await;
+                self.request_archive_patch(stored_id, true).await;
+            }
+            JobKind::Compress {
+                stored_id,
+                runtime_id,
+            } => {
+                self.on_compress_reply(stored_id, runtime_id, result).await;
+            }
+            JobKind::CompressSync {
+                stored_id,
+                runtime_id,
+                summary,
+            } => {
+                self.on_compress_sync_reply(stored_id, runtime_id, summary, result)
+                    .await;
+            }
+            JobKind::SessionInfo { runtime_id } => {
+                self.emit_live_info(&runtime_id, result).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn on_compress_reply(&mut self, stored_id: String, runtime_id: String, result: &Value) {
+        self.emit_live_info(&runtime_id, result).await;
+        if let Some(telemetry) = parse_telemetry_payload(result) {
+            self.emit(Event::Telemetry {
+                runtime_id: runtime_id.clone(),
+                telemetry,
+            })
+            .await;
+        }
+        let creds = self.credential_secrets();
+        let summary = studio::parse_compress_summary(result, &creds);
+        if summary.noop {
+            self.emit(Event::Compressed {
+                stored_id,
+                runtime_id,
+                messages: None,
+                before: 0,
+                summary,
+            })
+            .await;
+            return;
+        }
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::CompressSync {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                    summary,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "compress",
+                Some(stored_id),
+                send_fault_message("compress", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn on_compress_sync_reply(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        summary: CompressSummary,
+        result: &Value,
+    ) {
+        let effective_runtime = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(runtime_id);
+        self.runtime_of
+            .insert(stored_id.clone(), effective_runtime.clone());
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        self.message_counts.insert(stored_id.clone(), count);
+        let before = count.saturating_sub(PAGE);
+        let messages =
+            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    self.fail("compress", Some(stored_id), err).await;
+                    return;
+                }
+            };
+        self.emit(Event::Compressed {
+            stored_id,
+            runtime_id: effective_runtime,
+            messages: Some(messages),
+            before,
+            summary,
+        })
+        .await;
+    }
+
+    fn build_pending_branch(
+        &self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_count: usize,
+        result: &Value,
+    ) -> Option<PendingBranch> {
+        let (temp_runtime_id, stored_id) = extract_session_ids(result)?;
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .map_or(fallback_count, |n| n as usize);
+        let raw_title = payload_str(result, &["title"]);
+        let title = if raw_title.is_empty() {
+            fallback_title
+        } else {
+            self.clean(raw_title)
+        };
+        let fallback_messages = result
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|rows| messages_from(rows))
+            .unwrap_or_default();
+        Some(PendingBranch {
+            stored_id,
+            temp_runtime_id,
+            parent_stored_id,
+            parent_title,
+            title,
+            count,
+            fallback_messages,
+            model: model_identity(result),
+        })
+    }
+
+    /// Hermes v0.23.0 `session.branch` leaves `branch_db = None` on the child's initial
+    /// runtime in the default profile (`methods_session_branch.py:33`), while the branch row
+    /// and copied messages are already persisted in SQLite. Closing that transient runtime and
+    /// immediately resuming `stored_id` binds a full DB-backed runtime so subsequent turns and
+    /// `session.undo` rewinds persist cleanly.
+    async fn on_live_branch_reply(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_count: usize,
+        result: &Value,
+    ) {
+        let Some(pending) = self.build_pending_branch(
+            parent_stored_id.clone(),
+            parent_title,
+            fallback_title,
+            fallback_count,
+            result,
+        ) else {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                "The gateway did not return a branched conversation id.",
+            )
+            .await;
+            return;
+        };
+        let temp_rt = pending.temp_runtime_id.clone();
+        let parent_id = pending.parent_stored_id.clone();
+        if let Err(fault) = self
+            .send_rpc(
+                "session.close",
+                json!({"session_id": temp_rt}),
+                JobKind::BranchClose(pending),
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn reopen_branched(&mut self, pending: PendingBranch) {
+        let stored_id = pending.stored_id.clone();
+        let parent_id = pending.parent_stored_id.clone();
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::BranchResume(pending),
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "branch",
+                Some(parent_id),
+                send_fault_message("branch", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn finish_reopened_branch(&mut self, pending: PendingBranch, result: &Value) {
+        let runtime_id = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| pending.temp_runtime_id.clone());
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .map_or(pending.count, |n| n as usize);
+        let model = model_identity(result).or(pending.model.clone());
+        self.emit_branched_session(
+            pending.stored_id,
+            runtime_id.clone(),
+            pending.parent_stored_id,
+            pending.parent_title,
+            pending.title,
+            count,
+            pending.fallback_messages,
+            model,
+        )
+        .await;
+        self.emit_live_info(&runtime_id, result).await;
+        self.request_session_info_if_needed(&runtime_id, result)
+            .await;
+    }
+
+    async fn on_branched(
+        &mut self,
+        parent_stored_id: String,
+        parent_title: String,
+        fallback_title: String,
+        fallback_count: usize,
+        result: &Value,
+    ) {
+        let Some(pending) = self.build_pending_branch(
+            parent_stored_id.clone(),
+            parent_title,
+            fallback_title,
+            fallback_count,
+            result,
+        ) else {
+            self.fail(
+                "branch",
+                Some(parent_stored_id),
+                "The gateway did not return a branched conversation id.",
+            )
+            .await;
+            return;
+        };
+        let runtime_id = pending.temp_runtime_id.clone();
+        self.emit_branched_session(
+            pending.stored_id,
+            runtime_id.clone(),
+            pending.parent_stored_id,
+            pending.parent_title,
+            pending.title,
+            pending.count,
+            pending.fallback_messages,
+            pending.model,
+        )
+        .await;
+        self.emit_live_info(&runtime_id, result).await;
+        self.request_session_info_if_needed(&runtime_id, result)
+            .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_branched_session(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        parent_stored_id: String,
+        parent_title: String,
+        title: String,
+        count: usize,
+        fallback_messages: Vec<ChatMessage>,
+        model: Option<ModelIdentity>,
+    ) {
+        self.runtime_of
+            .insert(stored_id.clone(), runtime_id.clone());
+        self.message_counts.insert(stored_id.clone(), count);
+        let before = count.saturating_sub(PAGE);
+        let messages = self
+            .load_branch_messages(&stored_id, before, count - before, fallback_messages)
+            .await;
+        let model_name = model
+            .as_ref()
+            .map_or_else(String::new, |entry| entry.model.clone());
+        self.emit(Event::Branched {
+            session: SessionSummary {
+                stored_id,
+                title,
+                source: "tui".into(),
+                updated_at: crate::palette::now_epoch_secs().to_string(),
+                read_only_reason: None,
+                message_count: before + messages.len(),
+                parent_session_id: Some(parent_stored_id),
+                is_branch: true,
+                pinned: false,
+                preview: String::new(),
+                model: model_name,
+            },
+            parent_title,
+            runtime_id,
+            messages,
+            before,
+            model,
+        })
+        .await;
+    }
+
+    async fn load_branch_messages(
+        &self,
+        stored_id: &str,
+        before: usize,
+        limit: usize,
+        fallback: Vec<ChatMessage>,
+    ) -> Vec<ChatMessage> {
+        if let Ok(rows) = fetch_history(&self.http, &self.origin, stored_id, before, limit).await
+            && !rows.is_empty()
+        {
+            return rows;
+        }
+        fallback
+    }
+
+    async fn on_undo_reply(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        result: &Value,
+    ) {
+        let removed = result.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if removed == 0 {
+            self.fail(
+                "undo",
+                Some(stored_id),
+                "Nothing to rewind in this conversation.",
+            )
+            .await;
+            return;
+        }
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::UndoSync {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                    removed,
+                    mode,
+                    prompt_text,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail("undo", Some(stored_id), send_fault_message("undo", fault))
+                .await;
+        }
+    }
+
+    async fn on_undo_sync_reply(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        removed: usize,
+        mode: RewindMode,
+        prompt_text: String,
+        result: &Value,
+    ) {
+        let effective_runtime = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(runtime_id);
+        self.runtime_of
+            .insert(stored_id.clone(), effective_runtime.clone());
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        self.message_counts.insert(stored_id.clone(), count);
+        let before = count.saturating_sub(PAGE);
+        let messages =
+            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    self.fail("undo", Some(stored_id), err).await;
+                    return;
+                }
+            };
+        self.emit(Event::Undone {
+            stored_id,
+            runtime_id: effective_runtime,
+            removed,
+            messages,
+            before,
+            mode,
+            prompt_text,
+        })
+        .await;
+    }
+
+    async fn on_submit_reply(&mut self, runtime_id: String, generation: u64) {
+        if self
+            .turns
+            .get_mut(&runtime_id)
+            .is_some_and(|turn| turn.acknowledge(generation))
+        {
+            self.emit(Event::Submitted { runtime_id }).await;
+        }
+    }
+
+    async fn on_interrupt_reply(&mut self, runtime_id: String, generation: u64) {
+        let accepted = self
+            .turns
+            .get_mut(&runtime_id)
+            .is_some_and(|turn| turn.accept_interrupt(generation));
+        if accepted {
+            self.emit(Event::Interrupting { runtime_id }).await;
+        }
+    }
+
+    async fn on_steer_reply(&mut self, runtime_id: String, text: String, result: &Value) {
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("rejected");
+        match status {
+            "redirected" => {
+                self.emit(Event::SteerAccepted {
+                    runtime_id,
+                    outcome: SteerOutcome::Redirected,
+                })
+                .await;
+            }
+            "queued" => {
+                self.emit(Event::SteerAccepted {
+                    runtime_id,
+                    outcome: SteerOutcome::Queued,
+                })
+                .await;
+            }
+            // Not running or inapplicable: queue as the next prompt,
+            // mirroring the upstream TUI fallback.
+            _ => {
+                if let Err(fault) = self
+                    .send_rpc(
+                        "prompt.submit",
+                        queued_submit_params(&runtime_id, &text),
+                        JobKind::Queue {
+                            runtime_id: runtime_id.clone(),
+                        },
+                        RPC_TIMEOUT,
+                    )
+                    .await
+                {
+                    self.fail(
+                        "steer",
+                        Some(runtime_id),
+                        send_fault_message("steer", fault),
+                    )
+                    .await;
+                }
             }
         }
+    }
+
+    async fn on_catalog_reply(&self, result: &Value) {
+        match Catalog::parse(result) {
+            Ok(catalog) => self.emit(Event::Catalog { catalog }).await,
+            Err(error) => {
+                self.emit(Event::Catalog {
+                    catalog: Catalog {
+                        error: Some(self.clean(error)),
+                        ..Default::default()
+                    },
+                })
+                .await
+            }
+        }
+    }
+
+    async fn on_side_reply(&self, runtime_id: String, client_id: u64, result: &Value) {
+        if let Some(task_id) = result
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.emit(Event::SideStarted {
+                runtime_id,
+                client_id,
+                task_id: task_id.to_string(),
+            })
+            .await;
+        }
+    }
+
+    async fn on_delete_resume_reply(&mut self, stored_id: String, result: &Value) {
+        if let Some(runtime_id) = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.runtime_of
+                .insert(stored_id.clone(), runtime_id.to_string());
+            let _ = self
+                .send_rpc(
+                    "session.interrupt",
+                    json!({"session_id": runtime_id}),
+                    JobKind::Ping,
+                    RPC_TIMEOUT,
+                )
+                .await;
+            if self
+                .send_rpc(
+                    "session.close",
+                    json!({"session_id": runtime_id}),
+                    JobKind::Close {
+                        stored_id: stored_id.clone(),
+                        retried: true,
+                    },
+                    RPC_TIMEOUT,
+                )
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.request_delete(stored_id, true).await;
     }
 
     async fn fail_model_request(&mut self, kind: JobKind, code: i64, message: &str) {
@@ -1792,48 +3426,233 @@ impl Link {
             JobKind::Submit {
                 runtime_id,
                 generation,
-            } => {
-                let applies = self
-                    .turns
-                    .get_mut(&runtime_id)
-                    .is_some_and(|turn| turn.fail_submit(generation));
-                if !applies {
-                    return;
-                }
-                self.fail(
-                    "submit",
-                    Some(runtime_id),
-                    format!("{message} The prompt will not be sent again."),
-                )
-                .await
             }
+            | JobKind::AttachImage {
+                runtime_id,
+                generation,
+                ..
+            } => self.fail_submit_job(runtime_id, generation, message).await,
             JobKind::Interrupt {
                 runtime_id,
                 generation,
             } => {
-                if !self
-                    .turns
-                    .get(&runtime_id)
-                    .is_some_and(|turn| turn.fail_interrupt(generation))
-                {
-                    return;
-                }
-                self.fail("interrupt", Some(runtime_id), message).await
+                self.fail_interrupt_job(runtime_id, generation, message)
+                    .await
             }
             // A failed steer must not end the live turn: "steer" is not
             // "submit" in `operation_failed`, so the status stays busy.
             JobKind::Steer { runtime_id, .. } | JobKind::Queue { runtime_id, .. } => {
                 self.fail("steer", Some(runtime_id), message).await
             }
+            JobKind::SideQuestion {
+                runtime_id,
+                client_id,
+            } => {
+                self.fail_side_job(runtime_id, client_id, code, message)
+                    .await
+            }
             kind @ (JobKind::Catalog | JobKind::Prime { .. } | JobKind::Switch { .. }) => {
                 self.fail_model_request(kind, code, message).await;
             }
+            kind @ (JobKind::Close { .. }
+            | JobKind::DeleteResume { .. }
+            | JobKind::Delete { .. }) => {
+                self.fail_delete_job(kind, code, message).await;
+            }
+            kind => self.fail_timeline_job(kind, code, message).await,
+        }
+    }
+
+    async fn fail_timeline_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
+            JobKind::Undo {
+                stored_id,
+                runtime_id,
+                mode,
+                prompt_text,
+                attempts,
+            } => {
+                self.fail_undo_job(
+                    stored_id,
+                    runtime_id,
+                    mode,
+                    prompt_text,
+                    attempts,
+                    code,
+                    message,
+                )
+                .await;
+            }
+            JobKind::UndoSync {
+                stored_id,
+                runtime_id,
+                removed,
+                mode,
+                prompt_text,
+            } => {
+                if code == 4007 {
+                    self.message_counts.insert(stored_id.clone(), 0);
+                    self.emit(Event::Undone {
+                        stored_id,
+                        runtime_id,
+                        removed,
+                        messages: Vec::new(),
+                        before: 0,
+                        mode,
+                        prompt_text,
+                    })
+                    .await;
+                } else {
+                    self.fail("undo", Some(stored_id), message).await;
+                }
+            }
+            branch_kind => self.fail_branch_job(branch_kind, code, message).await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_undo_job(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        mode: RewindMode,
+        prompt_text: String,
+        attempts: u8,
+        code: i64,
+        message: &str,
+    ) {
+        if code == 4009 && attempts < 3 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            self.send_undo(stored_id, runtime_id, mode, prompt_text, attempts + 1)
+                .await;
+            return;
+        }
+        self.fail("undo", Some(stored_id), message).await;
+    }
+
+    async fn fail_branch_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
+            JobKind::Branch {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                if matches!(code, -32601 | 4007) && !fallback_seed.is_empty() {
+                    self.begin_seeded_branch(
+                        parent_stored_id,
+                        parent_title,
+                        fallback_title,
+                        fallback_seed,
+                    )
+                    .await;
+                } else {
+                    self.fail("branch", Some(parent_stored_id), message).await;
+                }
+            }
+            JobKind::BranchClose(pending) => {
+                if code == -32000 {
+                    self.fail("branch", Some(pending.parent_stored_id), message)
+                        .await;
+                } else {
+                    self.reopen_branched(pending).await;
+                }
+            }
+            JobKind::BranchResume(pending) => {
+                self.fail("branch", Some(pending.parent_stored_id), message)
+                    .await;
+            }
+            JobKind::BranchStored {
+                parent_stored_id,
+                parent_title,
+                fallback_title,
+                fallback_seed,
+            } => {
+                if code != -32000 && !fallback_seed.is_empty() {
+                    self.begin_seeded_branch(
+                        parent_stored_id,
+                        parent_title,
+                        fallback_title,
+                        fallback_seed,
+                    )
+                    .await;
+                } else {
+                    self.fail("branch", Some(parent_stored_id), message).await;
+                }
+            }
+            JobKind::BranchSeeded {
+                parent_stored_id, ..
+            } => self.fail("branch", Some(parent_stored_id), message).await,
+            other => self.fail_curation_job(other, code, message).await,
+        }
+    }
+
+    async fn fail_curation_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
+            JobKind::ArchiveClose { stored_id, retried } => {
+                self.request_archive_patch(stored_id, retried).await;
+            }
+            JobKind::ArchiveResume { stored_id } => {
+                if matches!(resume_disposition(code), ResumeDisposition::ReadOnly) {
+                    self.refused.insert(stored_id.clone());
+                }
+                self.fail("curation", Some(stored_id), message).await;
+            }
+            JobKind::Compress { stored_id, .. } | JobKind::CompressSync { stored_id, .. } => {
+                self.fail("compress", Some(stored_id), message).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn fail_submit_job(&mut self, runtime_id: String, generation: u64, message: &str) {
+        let applies = self
+            .turns
+            .get_mut(&runtime_id)
+            .is_some_and(|turn| turn.fail_submit(generation));
+        if applies {
+            self.fail(
+                "submit",
+                Some(runtime_id),
+                format!("{message} The prompt will not be sent again."),
+            )
+            .await;
+        }
+    }
+
+    async fn fail_interrupt_job(&self, runtime_id: String, generation: u64, message: &str) {
+        if self
+            .turns
+            .get(&runtime_id)
+            .is_some_and(|turn| turn.fail_interrupt(generation))
+        {
+            self.fail("interrupt", Some(runtime_id), message).await;
+        }
+    }
+
+    async fn fail_side_job(&self, runtime_id: String, client_id: u64, code: i64, message: &str) {
+        let detail = if code == -32601 {
+            "This Hermes gateway does not expose prompt.btw yet (requires Hermes v0.23+)."
+                .to_string()
+        } else {
+            self.clean(message.to_string())
+        };
+        self.emit(Event::SideFailed {
+            runtime_id,
+            client_id,
+            message: detail,
+        })
+        .await;
+    }
+
+    async fn fail_delete_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
             JobKind::Close { stored_id, retried } => self.request_delete(stored_id, retried).await,
             JobKind::DeleteResume { stored_id } => {
                 if matches!(resume_disposition(code), ResumeDisposition::ReadOnly) {
                     self.refused.insert(stored_id.clone());
                 }
-                self.fail("delete", Some(stored_id), message).await
+                self.fail("delete", Some(stored_id), message).await;
             }
             JobKind::Delete { stored_id, retried } => {
                 if code == 4132 {
@@ -1862,6 +3681,7 @@ impl Link {
                 }
                 self.fail("delete", Some(stored_id), message).await;
             }
+            _ => {}
         }
     }
 
@@ -1895,19 +3715,48 @@ impl Link {
             title
         };
         let model = model_identity(result);
+        let model_name = model
+            .as_ref()
+            .map_or_else(String::new, |entry| entry.model.clone());
         self.emit(Event::Created {
             session: SessionSummary {
                 stored_id,
                 title,
                 source: "tui".into(),
-                updated_at: String::new(),
+                updated_at: crate::palette::now_epoch_secs().to_string(),
                 read_only_reason: None,
                 message_count: 0,
+                parent_session_id: None,
+                is_branch: false,
+                pinned: false,
+                preview: String::new(),
+                model: model_name,
             },
-            runtime_id,
+            runtime_id: runtime_id.clone(),
             model,
         })
         .await;
+        self.emit_live_info(&runtime_id, result).await;
+        self.request_session_info_if_needed(&runtime_id, result)
+            .await;
+    }
+
+    async fn request_session_info_if_needed(&mut self, runtime_id: &str, result: &Value) {
+        if runtime_id.is_empty()
+            || parse_live_info_telemetry(result).is_some_and(|t| !t.cwd.is_empty())
+        {
+            return;
+        }
+        let _ = self
+            .send_rpc(
+                "session.info",
+                json!({"session_id": runtime_id}),
+                JobKind::SessionInfo {
+                    runtime_id: runtime_id.to_string(),
+                },
+                RPC_TIMEOUT,
+            )
+            .await;
     }
 
     async fn on_resumed(&mut self, stored_id: String, result: &Value) {
@@ -1920,17 +3769,7 @@ impl Link {
             self.runtime_of
                 .insert(stored_id.clone(), runtime_id.clone());
         }
-        let running = result
-            .get("running")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || matches!(
-                result.get("status").and_then(Value::as_str),
-                Some("streaming" | "running" | "resuming")
-            )
-            || result
-                .get("inflight")
-                .is_some_and(|value| value.is_object());
+        let running = is_resumed_running(result);
         let Some(count) = result
             .get("message_count")
             .and_then(Value::as_u64)
@@ -1964,6 +3803,10 @@ impl Link {
             model: model_identity(result),
         })
         .await;
+        if let Some(rt) = &runtime_id {
+            self.emit_live_info(rt, result).await;
+            self.request_session_info_if_needed(rt, result).await;
+        }
         if running && let Some(runtime_id) = runtime_id.clone() {
             self.next_turn_generation += 1;
             let generation = self.next_turn_generation;
@@ -2004,6 +3847,7 @@ impl Link {
     fn note_listed(&mut self, session: &SessionSummary) {
         self.message_counts
             .insert(session.stored_id.clone(), session.message_count);
+        self.set_pinned_cache(&session.stored_id, session.pinned);
         if session.source == "kanban" {
             self.refused.insert(session.stored_id.clone());
         }
@@ -2244,47 +4088,307 @@ fn parse_sessions(body: &Value, offset: usize) -> Result<Event, String> {
     })
 }
 
-fn session_summary(row: &Value) -> Result<SessionSummary, String> {
-    let stored_id = row
-        .get("id")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchOutcome {
+    Applied,
+    NotFound,
+    Conflict,
+}
+
+fn is_queueable_while_connecting(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::List { .. }
+            | Command::Create { .. }
+            | Command::Resume { .. }
+            | Command::SearchSessions { .. }
+            | Command::FetchStudio
+    )
+}
+
+fn unready_session_failure(command: &Command) -> Option<(&'static str, String)> {
+    match command {
+        Command::Undo { stored_id, .. } | Command::Branch { stored_id, .. } => {
+            Some(("timeline", stored_id.clone()))
+        }
+        Command::Compress { stored_id, .. } => Some(("compress", stored_id.clone())),
+        Command::MutateSession { stored_id, .. } => Some(("curation", stored_id.clone())),
+        _ => None,
+    }
+}
+
+fn deferred_patch_body(title: Option<String>, pinned: Option<bool>) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    if let Some(title) = title {
+        map.insert("title".into(), Value::String(title));
+    }
+    if let Some(pinned) = pinned {
+        map.insert("pinned".into(), Value::Bool(pinned));
+    }
+    (!map.is_empty()).then_some(Value::Object(map))
+}
+
+async fn fetch_search_hits(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    query: &str,
+    secrets: &[String],
+) -> Result<Vec<crate::model::SearchHit>, String> {
+    let mut url = endpoint(origin, "/api/sessions/search");
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("limit", &SEARCH_LIMIT.to_string());
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| "Could not search conversations.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not search conversations (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Search results were not usable.".to_string())?;
+    recall::parse_search_results(&body, secrets)
+}
+
+fn next_mutation_request_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("hn-mut-{nanos}-{seq}")
+}
+
+fn apply_mutation_snapshot(body: &Value, snapshot: &Value) -> Value {
+    let Some(mut map) = body.as_object().cloned() else {
+        return body.clone();
+    };
+    let Some(revision) = snapshot.get("runtime_revision").cloned() else {
+        return body.clone();
+    };
+    let generation = snapshot
+        .get("runtime_generation")
+        .cloned()
+        .unwrap_or(Value::Null);
+    map.insert(
+        "request_id".into(),
+        Value::String(next_mutation_request_id()),
+    );
+    map.insert("expected_revision".into(), revision);
+    map.insert("expected_generation".into(), generation);
+    Value::Object(map)
+}
+
+async fn build_fenced_patch_body(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    body: &Value,
+) -> Value {
+    let snap_path = format!("/api/sessions/{stored_id}/mutation-snapshot");
+    let Ok(resp) = http.get(endpoint(origin, &snap_path)).send().await else {
+        return body.clone();
+    };
+    if !resp.status().is_success() {
+        return body.clone();
+    };
+    let Ok(snapshot) = resp.json::<Value>().await else {
+        return body.clone();
+    };
+    apply_mutation_snapshot(body, &snapshot)
+}
+
+async fn send_fenced_patch(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    body: &Value,
+) -> Result<PatchOutcome, String> {
+    let payload = build_fenced_patch_body(http, origin, stored_id, body).await;
+    let path = format!("/api/sessions/{stored_id}");
+    let response = http
+        .patch(endpoint(origin, &path))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| "Could not update conversation.".to_string())?;
+    let code = response.status().as_u16();
+    if response.status().is_success() {
+        return Ok(PatchOutcome::Applied);
+    }
+    if code == 404 {
+        return Ok(PatchOutcome::NotFound);
+    }
+    if code == 409 {
+        return Ok(PatchOutcome::Conflict);
+    }
+    Err(format!("Could not update conversation (HTTP {code})."))
+}
+
+async fn patch_session_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    body: &Value,
+) -> Result<PatchOutcome, String> {
+    let first = send_fenced_patch(http, origin, stored_id, body).await?;
+    if first != PatchOutcome::Conflict {
+        return Ok(first);
+    }
+    send_fenced_patch(http, origin, stored_id, body).await
+}
+
+async fn fetch_workspaces_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    secrets: &[String],
+) -> Result<WorkspaceCatalog, String> {
+    let response = http
+        .get(endpoint(origin, "/api/chat/workspaces"))
+        .send()
+        .await
+        .map_err(|_| "Could not load remote workspaces.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not load remote workspaces (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Workspace catalog was not usable.".to_string())?;
+    studio::parse_workspaces(&body, secrets)
+}
+
+async fn fetch_skills_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    secrets: &[String],
+) -> Result<Vec<SkillSummary>, String> {
+    let response = http
+        .get(endpoint(origin, "/api/skills"))
+        .send()
+        .await
+        .map_err(|_| "Could not load remote skills.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not load remote skills (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Skills catalog was not usable.".to_string())?;
+    studio::parse_skills(&body, secrets)
+}
+
+async fn upload_chat_image_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    image: &StagedImage,
+) -> Result<String, String> {
+    let response = http
+        .post(endpoint(origin, "/api/chat/image-upload"))
+        .json(&json!({
+            "data_url": image.data_url(),
+            "filename": image.filename,
+        }))
+        .send()
+        .await
+        .map_err(|_| format!("Could not upload {}.", image.filename))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Image upload failed for {} (HTTP {}).",
+            image.filename,
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Image upload reply was not usable.".to_string())?;
+    body.get("path")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "The conversation list was not usable.".to_string())?
-        .to_string();
+        .map(str::to_string)
+        .ok_or_else(|| "Gateway did not return an uploaded image path.".into())
+}
+
+fn session_summary(row: &Value) -> Result<SessionSummary, String> {
+    let stored_id = optional_trimmed_str(row, "id")
+        .ok_or_else(|| "The conversation list was not usable.".to_string())?;
     let count = row
         .get("message_count")
         .and_then(Value::as_u64)
         .ok_or_else(|| "The conversation list was not usable.".to_string())?;
     let message_count =
         usize::try_from(count).map_err(|_| "The conversation list was not usable.".to_string())?;
-    let title = row
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let updated = row
-        .get("last_active")
-        .or_else(|| row.get("last_activity_at"))
-        .or_else(|| row.get("started_at"))
-        .and_then(Value::as_i64)
-        .map(|n| n.to_string())
-        .unwrap_or_default();
+    let title = session_summary_title(row);
+    let raw_preview = row.get("preview").and_then(Value::as_str).unwrap_or("");
     Ok(SessionSummary {
         stored_id,
-        title: if title.is_empty() {
-            "Untitled".into()
-        } else {
-            title.to_string()
-        },
-        source: row
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        updated_at: updated,
+        preview: recall::clean_session_preview(raw_preview, &title),
+        title,
+        source: optional_trimmed_str(row, "source").unwrap_or_default(),
+        updated_at: extract_epoch_string(row),
         read_only_reason: None,
         message_count,
+        parent_session_id: optional_trimmed_str(row, "parent_session_id"),
+        is_branch: false,
+        pinned: row.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+        model: optional_trimmed_str(row, "model").unwrap_or_default(),
     })
+}
+
+fn session_summary_title(row: &Value) -> String {
+    match optional_trimmed_str(row, "title") {
+        Some(title) => title,
+        None => "Untitled".into(),
+    }
+}
+
+fn optional_trimmed_str(row: &Value, key: &str) -> Option<String> {
+    row.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn value_as_epoch(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                .filter(|f| f.is_finite() && *f > 0.0)
+                .map(|f| f as i64)
+        })
+        .filter(|&n| n > 0)
+}
+
+fn extract_epoch_string(row: &Value) -> String {
+    [
+        "last_active",
+        "last_activity_at",
+        "updated_at",
+        "ended_at",
+        "started_at",
+    ]
+    .into_iter()
+    .find_map(|key| row.get(key).and_then(value_as_epoch))
+    .map(|n| n.to_string())
+    .unwrap_or_default()
 }
 
 async fn fetch_history(
@@ -2722,6 +4826,119 @@ fn classify_unhandled_event(event_type: &str) -> UnhandledGatewayEvent {
     } else {
         UnhandledGatewayEvent::Ignore
     }
+}
+
+fn is_resumed_running(result: &Value) -> bool {
+    result
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("streaming" | "running" | "resuming")
+        )
+        || result
+            .get("inflight")
+            .is_some_and(|value| value.is_object())
+}
+
+fn tool_name_from(payload: &Value) -> &str {
+    payload
+        .get("name")
+        .or_else(|| payload.get("tool"))
+        .or_else(|| payload.get("tool_name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tool")
+}
+
+fn payload_str(payload: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|k| payload.get(*k).and_then(Value::as_str).map(str::trim))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+fn parse_tool_event(
+    event_type: &str,
+    payload: &Value,
+    secrets: &[String],
+) -> Option<ToolEventUpdate> {
+    let tool_id = payload_str(payload, &["tool_id", "call_id", "id"]);
+    let name = tool_name_from(payload).to_string();
+    match event_type {
+        "tool.generating" | "tool.start" => Some(ToolEventUpdate::Started {
+            tool_id,
+            name,
+            detail: compact_tool_detail(
+                &payload_str(payload, &["preview", "context", "args_text"]),
+                secrets,
+            ),
+        }),
+        "tool.progress" => Some(ToolEventUpdate::Progress {
+            tool_id,
+            name,
+            percent: extract_progress_pct(payload),
+            message: compact_tool_detail(
+                &payload_str(payload, &["message", "text", "status"]),
+                secrets,
+            ),
+        }),
+        "tool.output_risk" => {
+            let raw = payload_str(payload, &["risk", "reason", "level"]);
+            Some(ToolEventUpdate::Risk {
+                tool_id,
+                name,
+                risk: if raw.is_empty() {
+                    "flagged output".into()
+                } else {
+                    compact_tool_detail(&raw, secrets)
+                },
+            })
+        }
+        "tool.complete" => Some(ToolEventUpdate::Completed {
+            tool_id,
+            name,
+            duration_s: payload
+                .get("duration_s")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.0),
+            summary: compact_tool_detail(&payload_str(payload, &["summary", "preview"]), secrets),
+        }),
+        _ => None,
+    }
+}
+
+fn extract_progress_pct(payload: &Value) -> Option<u8> {
+    payload
+        .get("percent")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+        .map(|f| f.clamp(0.0, 100.0) as u8)
+}
+
+fn compact_tool_detail(raw: &str, secrets: &[String]) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let single_line = redact_secrets(raw, secrets)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    truncate(&single_line, 140)
+}
+
+fn redact_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if secret.len() >= 3 {
+            out = out.replace(secret, "[REDACTED]");
+        }
+    }
+    out
 }
 
 fn string_list(value: Option<&Value>) -> Option<Vec<String>> {
@@ -3660,6 +5877,755 @@ mod tests {
             }
             assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
             assert_eq!(link.turns["rt"].generation, 4);
+        });
+    }
+
+    #[test]
+    fn session_title_event_maps_runtime_to_stored_session() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(4);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.runtime_of.insert("stored-42".into(), "rt-42".into());
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "session.title",
+                    "session_id": "rt-42",
+                    "payload": {"title": "  Hyprland Command Palette  "}
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("title event") {
+                Event::SessionTitle { session_id, title } => {
+                    assert_eq!(session_id, "stored-42");
+                    assert_eq!(title, "Hyprland Command Palette");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn session_list_parses_float_timestamps_from_hermes_sqlite() {
+        let parsed = parse_sessions(
+            &json!({
+                "total": 1,
+                "sessions": [{
+                    "id": "s-float",
+                    "title": "Float epoch test",
+                    "source": "tui",
+                    "message_count": 12,
+                    "started_at": 1_794_452_594.819_234
+                }]
+            }),
+            0,
+        )
+        .expect("sessions");
+        let Event::Sessions { sessions, .. } = parsed else {
+            panic!("expected sessions");
+        };
+        assert_eq!(sessions[0].updated_at, "1794452594");
+    }
+
+    #[test]
+    fn side_question_events_redact_secrets_and_never_interrupt_live_turns() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "alice".into(),
+                    password: "top-secret-value".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.turns
+                .insert("rt-1".into(), Turn::streaming("msg-1".into(), 9));
+
+            link.on_job(
+                Job {
+                    kind: JobKind::SideQuestion {
+                        runtime_id: "rt-1".into(),
+                        client_id: 7,
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"result": {"task_id": "btw_abc"}}),
+            )
+            .await;
+            match incoming.try_recv().expect("side started") {
+                Event::SideStarted {
+                    runtime_id,
+                    client_id,
+                    task_id,
+                } => {
+                    assert_eq!(runtime_id, "rt-1");
+                    assert_eq!(client_id, 7);
+                    assert_eq!(task_id, "btw_abc");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "btw.complete",
+                    "session_id": "rt-1",
+                    "payload": {
+                        "task_id": "btw_abc",
+                        "question": "Check secret",
+                        "text": "Line 1\nSecret: top-secret-value"
+                    }
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("side complete") {
+                Event::SideComplete { task_id, text, .. } => {
+                    assert_eq!(task_id, "btw_abc");
+                    assert_eq!(text, "Line 1\nSecret: [REDACTED]");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+
+            // A side-question RPC error must emit SideFailed and leave the live turn Streaming:
+            link.on_job(
+                Job {
+                    kind: JobKind::SideQuestion {
+                        runtime_id: "rt-1".into(),
+                        client_id: 8,
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"error": {"code": -32601, "message": "method not found"}}),
+            )
+            .await;
+            match incoming.try_recv().expect("side failed") {
+                Event::SideFailed {
+                    client_id, message, ..
+                } => {
+                    assert_eq!(client_id, 8);
+                    assert!(message.contains("prompt.btw"));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert_eq!(link.turns["rt-1"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt-1"].generation, 9);
+        });
+    }
+
+    #[test]
+    fn reasoning_tool_trace_and_usage_events_stream_into_flight_deck() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.turns
+                .insert("rt-2".into(), Turn::streaming("msg-2".into(), 1));
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "reasoning.delta",
+                    "session_id": "rt-2",
+                    "payload": {"text": "Thinking about layout…"}
+                }
+            }))
+            .await;
+            assert!(matches!(incoming.try_recv().unwrap(), Event::Activity { .. }));
+            match incoming.try_recv().expect("reasoning") {
+                Event::Reasoning { text, replace, .. } => {
+                    assert_eq!(text, "Thinking about layout…");
+                    assert!(!replace);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "tool.start",
+                    "session_id": "rt-2",
+                    "payload": {"tool_id": "t1", "name": "read_file", "preview": "src/ui.rs"}
+                }
+            }))
+            .await;
+            assert!(matches!(incoming.try_recv().unwrap(), Event::Activity { .. }));
+            assert!(matches!(
+                incoming.try_recv().unwrap(),
+                Event::ToolTraceEvent {
+                    update: ToolEventUpdate::Started { .. },
+                    ..
+                }
+            ));
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "session.usage",
+                    "session_id": "rt-2",
+                    "payload": {"usage": {"input": 2000, "output": 400, "context_used": 2400, "context_max": 128000}}
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("telemetry") {
+                Event::Telemetry { telemetry, .. } => {
+                    assert_eq!(telemetry.input_tokens, 2000);
+                    assert_eq!(telemetry.context_used, Some(2400));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn branch_and_undo_rpc_params_and_session_summary_parse_lineage() {
+        assert_eq!(
+            default_branch_title("Hyprland setup", None),
+            "Hyprland setup (branch)"
+        );
+        assert_eq!(
+            default_branch_title("Hyprland setup", Some("  Waybar fork  ")),
+            "Waybar fork"
+        );
+        assert_eq!(
+            branch_rpc_params("rt-1", None, None),
+            json!({"session_id": "rt-1"})
+        );
+        assert_eq!(
+            branch_rpc_params("rt-1", Some("Alt"), Some(2)),
+            json!({"session_id": "rt-1", "name": "Alt", "count": 2})
+        );
+        let seeded = seeded_branch_params(
+            "Alt",
+            "parent-1",
+            &[SeedMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            }],
+        );
+        assert_eq!(seeded["title"], json!("Alt"));
+        assert_eq!(seeded["parent_session_id"], json!("parent-1"));
+        assert_eq!(seeded["messages"][0]["content"], json!("Hi"));
+        assert_eq!(
+            undo_rpc_params("rt-1", RewindMode::Undo),
+            json!({"session_id": "rt-1", "intent": "undo"})
+        );
+        assert_eq!(
+            undo_rpc_params("rt-1", RewindMode::EditRetry),
+            json!({"session_id": "rt-1", "intent": "retry"})
+        );
+        assert_eq!(
+            extract_session_ids(&json!({"session_id": "rt-9", "stored_session_id": "st-9"})),
+            Some(("rt-9".into(), "st-9".into()))
+        );
+        let summary = session_summary(&json!({
+            "id": "fork-1",
+            "title": "Demo (branch)",
+            "source": "tui",
+            "message_count": 4,
+            "parent_session_id": "root-1"
+        }))
+        .expect("summary");
+        assert_eq!(summary.parent_session_id.as_deref(), Some("root-1"));
+    }
+
+    #[test]
+    fn undo_empty_reply_and_4007_sync_settle_cleanly() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.on_undo_reply(
+                "st-1".into(),
+                "rt-1".into(),
+                RewindMode::Undo,
+                "prompt".into(),
+                &json!({"removed": 0}),
+            )
+            .await;
+            assert!(matches!(
+                incoming.try_recv().expect("undo error"),
+                Event::Error { ref operation, .. } if operation == "undo"
+            ));
+
+            link.fail_timeline_job(
+                JobKind::UndoSync {
+                    stored_id: "st-1".into(),
+                    runtime_id: "rt-1".into(),
+                    removed: 2,
+                    mode: RewindMode::EditRetry,
+                    prompt_text: "original".into(),
+                },
+                4007,
+                "Session not found",
+            )
+            .await;
+            match incoming.try_recv().expect("undone empty") {
+                Event::Undone {
+                    stored_id,
+                    removed,
+                    messages,
+                    mode,
+                    prompt_text,
+                    ..
+                } => {
+                    assert_eq!(stored_id, "st-1");
+                    assert_eq!(removed, 2);
+                    assert!(messages.is_empty());
+                    assert_eq!(mode, RewindMode::EditRetry);
+                    assert_eq!(prompt_text, "original");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn timeline_branch_fallback_and_inline_branched_messages_emit_branched_event() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("http://127.0.0.1:9").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            // Disconnected timeline commands emit clean non-fatal branch/undo errors.
+            link.timeline_command(Command::Branch {
+                stored_id: "root-1".into(),
+                runtime_id: None,
+                parent_title: "Root".into(),
+                before_loaded: 0,
+                visible_count: None,
+                custom_title: None,
+                seed_fallback: vec![SeedMessage {
+                    role: "user".into(),
+                    content: "Hi".into(),
+                }],
+            })
+            .await;
+            assert!(matches!(
+                incoming.try_recv().expect("branch not connected"),
+                Event::Error { ref operation, .. } if operation == "branch"
+            ));
+
+            // Inline branch reply falls back to result["messages"] when HTTP tail fetch fails.
+            link.on_branched(
+                "root-1".into(),
+                "Root".into(),
+                "Root (branch)".into(),
+                1,
+                &json!({
+                    "session_id": "rt-fork",
+                    "stored_session_id": "st-fork",
+                    "message_count": 1,
+                    "messages": [{"id": "m1", "role": "user", "content": "Seeded turn"}]
+                }),
+            )
+            .await;
+            match incoming.try_recv().expect("branched") {
+                Event::Branched {
+                    session,
+                    runtime_id,
+                    messages,
+                    ..
+                } => {
+                    assert_eq!(session.stored_id, "st-fork");
+                    assert_eq!(session.title, "Root (branch)");
+                    assert!(session.is_branch);
+                    assert_eq!(runtime_id, "rt-fork");
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(messages[0].text, "Seeded turn");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+
+            // Re-opened live branch swaps the transient branch runtime for the DB-backed resume runtime.
+            let pending = link
+                .build_pending_branch(
+                    "root-1".into(),
+                    "Root".into(),
+                    "Root (branch)".into(),
+                    1,
+                    &json!({
+                        "session_id": "rt-transient",
+                        "stored_session_id": "st-reopened",
+                        "title": "Custom fork",
+                        "message_count": 1,
+                        "messages": [{"id": "m1", "role": "user", "content": "Persisted turn"}]
+                    }),
+                )
+                .expect("pending branch");
+            link.finish_reopened_branch(
+                pending,
+                &json!({"session_id": "rt-resumed", "message_count": 1}),
+            )
+            .await;
+            assert_eq!(
+                link.runtime_of.get("st-reopened").map(String::as_str),
+                Some("rt-resumed")
+            );
+            match incoming.try_recv().expect("reopened branched") {
+                Event::Branched {
+                    session,
+                    runtime_id,
+                    messages,
+                    ..
+                } => {
+                    assert_eq!(session.stored_id, "st-reopened");
+                    assert_eq!(session.title, "Custom fork");
+                    assert_eq!(runtime_id, "rt-resumed");
+                    assert_eq!(messages.len(), 1);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn session_summary_extracts_pinned_preview_and_model_fields() {
+        let summary = session_summary(&json!({
+            "id": "s-curated",
+            "title": "Wayland compositor research",
+            "source": "tui",
+            "model": "claude-opus-4-6",
+            "pinned": true,
+            "preview": "  Investigated   layer-shell   anchoring  ",
+            "message_count": 14,
+            "last_active": 1794452594.0
+        }))
+        .expect("summary");
+        assert!(summary.pinned);
+        assert_eq!(summary.model, "claude-opus-4-6");
+        assert_eq!(summary.preview, "Investigated layer-shell anchoring");
+        assert_eq!(summary.message_count, 14);
+    }
+
+    #[test]
+    fn unready_and_deferred_mutation_helpers_cover_curation_and_search() {
+        assert!(is_queueable_while_connecting(&Command::SearchSessions {
+            query: "hyprland".into(),
+            request_seq: 1,
+        }));
+        assert!(!is_queueable_while_connecting(&Command::MutateSession {
+            stored_id: "s1".into(),
+            mutation: SessionMutation::Archive,
+        }));
+        assert_eq!(
+            unready_session_failure(&Command::MutateSession {
+                stored_id: "s1".into(),
+                mutation: SessionMutation::SetPinned(true),
+            }),
+            Some(("curation", "s1".to_string()))
+        );
+        assert_eq!(
+            deferred_patch_body(Some("Curated".into()), Some(true)),
+            Some(json!({"title": "Curated", "pinned": true}))
+        );
+        assert_eq!(deferred_patch_body(None, None), None);
+    }
+
+    #[test]
+    fn unpersisted_zero_turn_sessions_defer_curation_until_turn_or_archive() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "alice".into(),
+                    password: "top-secret-value".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.runtime_of.insert("st-new".into(), "rt-new".into());
+            link.message_counts.insert("st-new".into(), 0);
+            assert!(link.is_unpersisted_live("st-new"));
+
+            link.apply_unpersisted_mutation("st-new".into(), SessionMutation::SetPinned(true))
+                .await;
+            link.apply_unpersisted_mutation(
+                "st-new".into(),
+                SessionMutation::Rename("Fresh".into()),
+            )
+            .await;
+            assert_eq!(
+                link.deferred_mutations.get("st-new"),
+                Some(&(Some("Fresh".into()), Some(true)))
+            );
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated { .. })
+            ));
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated { .. })
+            ));
+
+            link.apply_unpersisted_mutation("st-new".into(), SessionMutation::Archive)
+                .await;
+            assert!(!link.deferred_mutations.contains_key("st-new"));
+            assert!(!link.runtime_of.contains_key("st-new"));
+        });
+    }
+
+    async fn spawn_one_http_status(status_line: &'static str, body: &'static str) -> url::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (st, bd) = if req.contains("/mutation-snapshot") {
+                    ("404 Not Found", "{}")
+                } else {
+                    (status_line, body)
+                };
+                let reply = format!(
+                    "HTTP/1.1 {st}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bd}",
+                    bd.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    #[test]
+    fn archive_close_and_http_patch_outcomes_cover_conflict_and_completion() {
+        let fenced = apply_mutation_snapshot(
+            &json!({"pinned": true}),
+            &json!({"exists": true, "runtime_revision": 7, "runtime_generation": "gen-2"}),
+        );
+        assert_eq!(fenced.get("expected_revision"), Some(&json!(7)));
+        assert_eq!(fenced.get("expected_generation"), Some(&json!("gen-2")));
+        assert!(
+            fenced
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with("hn-mut-"))
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let http = reqwest::Client::new();
+            let ok_url = spawn_one_http_status("200 OK", "{}").await;
+            assert_eq!(
+                patch_session_http(&http, &ok_url, "s1", &json!({"pinned": true})).await,
+                Ok(PatchOutcome::Applied)
+            );
+            let missing_url = spawn_one_http_status("404 Not Found", "{}").await;
+            assert_eq!(
+                patch_session_http(&http, &missing_url, "s1", &json!({"pinned": true})).await,
+                Ok(PatchOutcome::NotFound)
+            );
+            let conflict_url = spawn_one_http_status("409 Conflict", "{}").await;
+            assert_eq!(
+                patch_session_http(&http, &conflict_url, "s1", &json!({"archived": true})).await,
+                Ok(PatchOutcome::Conflict)
+            );
+
+            let archive_url = spawn_one_http_status("200 OK", "{}").await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: archive_url,
+                    username: "alice".into(),
+                    password: "top-secret-value".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.on_curation_job(
+                JobKind::ArchiveClose {
+                    stored_id: "st-arc".into(),
+                    retried: false,
+                },
+                &json!({"closed": true}),
+            )
+            .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated {
+                    stored_id,
+                    mutation: SessionMutation::Archive
+                }) if stored_id == "st-arc"
+            ));
+
+            link.fail_curation_job(
+                JobKind::ArchiveResume {
+                    stored_id: "st-ro".into(),
+                },
+                4132,
+                "active elsewhere",
+            )
+            .await;
+            assert!(link.refused.contains("st-ro"));
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Error { operation, .. }) if operation == "curation"
+            ));
+        });
+    }
+
+    #[test]
+    fn studio_http_helpers_create_params_and_compress_noop_roundtrip() {
+        assert_eq!(
+            create_rpc_params("Work", Some(" /home/alice/repo ")),
+            json!({"title": "Work", "cwd": "/home/alice/repo"})
+        );
+        assert_eq!(
+            create_rpc_params("Work", Some("  ")),
+            json!({"title": "Work"})
+        );
+        assert!(is_queueable_while_connecting(&Command::FetchStudio));
+        assert_eq!(
+            unready_session_failure(&Command::Compress {
+                stored_id: "s-comp".into(),
+                runtime_id: "rt-1".into()
+            }),
+            Some(("compress", "s-comp".into()))
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let http = reqwest::Client::new();
+            let ws_url = spawn_one_http_status(
+                "200 OK",
+                r#"{"default_cwd":"/home/alice/.hermes","home":"/home/alice","repos":[{"root":"/home/alice/app","label":"app","sessions":2}]}"#,
+            )
+            .await;
+            let cat = fetch_workspaces_http(&http, &ws_url, &[]).await.unwrap();
+            assert_eq!(cat.options.len(), 2);
+
+            let sk_url = spawn_one_http_status(
+                "200 OK",
+                r#"[{"name":"b-plan","description":"Plan","category":"buck-workflow","enabled":true,"usage":3}]"#,
+            )
+            .await;
+            let skills = fetch_skills_http(&http, &sk_url, &[]).await.unwrap();
+            assert_eq!(skills.len(), 1);
+
+            let up_url = spawn_one_http_status(
+                "200 OK",
+                r#"{"ok":true,"path":"/home/alice/.hermes/cache/images/p.png"}"#,
+            )
+            .await;
+            let png = vec![
+                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+            ];
+            let img = StagedImage::from_bytes(1, "p.png", png).unwrap();
+            let uploaded = upload_chat_image_http(&http, &up_url, &img).await.unwrap();
+            assert_eq!(uploaded, "/home/alice/.hermes/cache/images/p.png");
+
+            let base_url = spawn_one_http_status("200 OK", "{}").await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: base_url,
+                    username: "alice".into(),
+                    password: "secret".into(),
+                },
+                events.clone(),
+            )
+            .expect("link");
+            link.on_compress_reply(
+                "st-1".into(),
+                "rt-1".into(),
+                &json!({"status": "compressed", "removed": 0, "summary": {"noop": true, "headline": "Already compact"}}),
+            )
+            .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Compressed { stored_id, messages: None, .. }) if stored_id == "st-1"
+            ));
+
+            let hist_url = spawn_one_http_status(
+                "200 OK",
+                r#"{"messages":[{"role":"system","content":"Compacted summary"},{"role":"assistant","content":"Ready"}]}"#,
+            )
+            .await;
+            let mut sync_link = Link::new(
+                Config {
+                    url: hist_url,
+                    username: "alice".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("sync link");
+            let summary = studio::parse_compress_summary(
+                &json!({"status": "compressed", "removed": 4, "summary": {"noop": false, "headline": "Compacted 4 rows"}}),
+                &[],
+            );
+            sync_link
+                .on_compress_sync_reply(
+                    "st-2".into(),
+                    "rt-2".into(),
+                    summary,
+                    &json!({"session_id": "rt-2b", "message_count": 2}),
+                )
+                .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Compressed { stored_id, runtime_id, messages: Some(rows), .. })
+                    if stored_id == "st-2" && runtime_id == "rt-2b" && rows.len() == 2
+            ));
         });
     }
 }

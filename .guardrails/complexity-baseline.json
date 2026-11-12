@@ -11,23 +11,13 @@
   },
   {
     "file": "src/ui.rs",
-    "function": "build",
-    "complexity": 12
-  },
-  {
-    "file": "src/ui.rs",
     "function": "connect_actions",
-    "complexity": 24
+    "complexity": 13
   },
   {
     "file": "src/ui.rs",
     "function": "refresh",
-    "complexity": 17
-  },
-  {
-    "file": "src/ui.rs",
-    "function": "refresh_controls",
-    "complexity": 13
+    "complexity": 14
   },
   {
     "file": "src/ui.rs",
@@ -41,18 +31,13 @@
   },
   {
     "file": "src/backend.rs",
-    "function": "handle",
-    "complexity": 13
-  },
-  {
-    "file": "src/backend.rs",
     "function": "maintain",
     "complexity": 11
   },
   {
     "file": "examples/remote_smoke.rs",
     "function": "run",
-    "complexity": 22
+    "complexity": 17
   },
   {
     "file": "examples/remote_smoke.rs",

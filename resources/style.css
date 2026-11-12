@@ -1,9 +1,32 @@
 .hermes-sidebar { background: @sidebar_bg_color; }
 .hermes-brand { font-size: 18px; font-weight: 800; letter-spacing: 3px; }
 .hermes-caption { font-size: 11px; letter-spacing: 1px; opacity: 0.58; }
-.session-row { padding: 13px 16px; border-radius: 10px; }
+.session-row { padding: 11px 14px; border-radius: 10px; }
 .session-title { font-weight: 600; }
-.session-meta { font-size: 11px; opacity: 0.58; }
+.session-meta { font-size: 11px; opacity: 0.62; }
+.palette-trigger { padding: 4px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.05); }
+.palette-trigger:hover { background: alpha(@window_fg_color, 0.10); }
+.palette-trigger-label { font-size: 12px; font-weight: 600; }
+.kbd-badge { font-family: monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 5px; background: alpha(@window_fg_color, 0.08); border: 1px solid alpha(@window_fg_color, 0.14); opacity: 0.85; }
+.triage-bar { background: alpha(@window_fg_color, 0.05); border-radius: 9px; padding: 3px; }
+.triage-pill { font-size: 11px; font-weight: 700; padding: 4px 6px; border-radius: 7px; min-height: 24px; opacity: 0.72; }
+.triage-pill:checked { background: alpha(@accent_bg_color, 0.24); color: @accent_color; opacity: 1; }
+.sidebar-search { min-height: 30px; font-size: 12px; border-radius: 8px; }
+.triage-empty { font-size: 12px; opacity: 0.58; padding: 8px 4px; }
+.source-badge { font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: 0.6px; padding: 1px 6px; border-radius: 5px; background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.source-auto { background: alpha(@warning_color, 0.15); color: @warning_color; }
+.shortcut-strip { margin-top: 6px; }
+.shortcut-chip { padding: 4px 8px; border-radius: 8px; background: alpha(@window_fg_color, 0.04); }
+.shortcut-desc { font-size: 11px; opacity: 0.68; }
+.palette-search { font-size: 14px; min-height: 36px; border-radius: 10px; }
+.palette-list { background: transparent; }
+.palette-row { padding: 9px 12px; border-radius: 9px; }
+.palette-row-active { background: alpha(@accent_bg_color, 0.12); }
+.palette-icon { opacity: 0.8; }
+.palette-title { font-size: 13px; font-weight: 600; }
+.palette-subtitle { font-size: 11px; opacity: 0.62; }
+.palette-destructive { color: @error_color; }
+.palette-footer { padding-top: 6px; border-top: 1px solid alpha(@window_fg_color, 0.08); }
 .hermes-transcript { background: @window_bg_color; }
 .message { padding: 16px 12px; border-radius: 12px; }
 .message-user { background: alpha(@accent_bg_color, 0.12); }
@@ -64,3 +87,83 @@
 .md-code-copy { font-size: 12px; }
 .md-table { border-spacing: 0; }
 .interaction-scroll { min-height: 0; }
+.inspector-trigger { padding: 4px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.05); }
+.inspector-trigger:hover { background: alpha(@window_fg_color, 0.10); }
+.inspector-trigger.inspector-open { background: alpha(@accent_bg_color, 0.24); color: @accent_color; }
+.inspector-trigger-badge { font-family: monospace; font-size: 11px; font-weight: 700; }
+.flight-deck { background: @sidebar_bg_color; border-left: 1px solid alpha(@window_fg_color, 0.08); }
+.flight-deck-kicker { font-size: 11px; font-weight: 800; letter-spacing: 1.4px; opacity: 0.65; }
+.flight-deck-branch { font-family: monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 6px; background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.flight-tab-btn { font-size: 11px; font-weight: 700; min-height: 26px; }
+.side-ask-explainer { font-size: 11px; opacity: 0.62; line-height: 1.35; }
+.inspector-card { background: alpha(@window_fg_color, 0.045); border: 1px solid alpha(@window_fg_color, 0.08); border-radius: 11px; padding: 11px 12px; }
+.inspector-section-title { font-size: 13px; font-weight: 700; }
+.inspector-kicker { font-size: 10px; font-weight: 800; letter-spacing: 1px; opacity: 0.62; }
+.side-suggestion-chip { font-size: 11px; padding: 4px 9px; border-radius: 7px; background: alpha(@accent_bg_color, 0.12); color: @accent_color; }
+.side-card { background: @view_bg_color; border: 1px solid alpha(@window_fg_color, 0.10); border-radius: 11px; padding: 10px 12px; }
+.side-card.pending { border-color: alpha(@accent_color, 0.40); }
+.side-card.failed { border-color: alpha(@error_color, 0.45); background: alpha(@error_color, 0.05); }
+.side-question-title { font-size: 13px; font-weight: 700; }
+.side-status-badge { font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: 0.6px; padding: 2px 6px; border-radius: 5px; }
+.side-badge-pending { background: alpha(@warning_color, 0.18); color: @warning_color; }
+.side-badge-ok { background: alpha(@success_color, 0.16); color: @success_color; }
+.side-badge-err { background: alpha(@error_color, 0.18); color: @error_color; }
+.side-error-text { font-size: 12px; color: @error_color; }
+.side-action-btn { font-size: 11px; font-weight: 600; padding: 2px 8px; min-height: 24px; border-radius: 6px; background: alpha(@window_fg_color, 0.05); }
+.side-ask-entry { font-size: 13px; min-height: 32px; border-radius: 8px; }
+.context-meter trough { min-height: 6px; border-radius: 4px; }
+.context-meter progress { min-height: 6px; border-radius: 4px; }
+.context-meter.warn progress { background-color: @warning_color; }
+.context-meter.high progress { background-color: @error_color; }
+.workspace-meta-line { font-family: monospace; font-size: 11px; opacity: 0.72; }
+.metric-chip { background: alpha(@window_fg_color, 0.04); border-radius: 8px; padding: 6px 8px; }
+.metric-label { font-size: 10px; opacity: 0.58; }
+.metric-value { font-family: monospace; font-size: 12px; font-weight: 700; }
+.reasoning-body { font-family: monospace; font-size: 12px; line-height: 1.45; }
+.tool-trace-row { background: alpha(@window_fg_color, 0.04); border-radius: 8px; padding: 7px 9px; }
+.tool-trace-name { font-family: monospace; font-size: 12px; font-weight: 700; }
+.outline-row { padding: 8px 10px; border-radius: 9px; }
+.outline-turn-num { font-family: monospace; font-size: 11px; font-weight: 800; color: @accent_color; }
+.outline-turn-title { font-size: 12px; font-weight: 600; }
+.fork-badge { font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: 0.6px; padding: 2px 6px; border-radius: 5px; background: alpha(@purple_3, 0.20); color: @purple_3; }
+.lineage-bar { background: alpha(@purple_3, 0.10); border: 1px solid alpha(@purple_3, 0.26); border-radius: 10px; padding: 6px 10px; }
+.lineage-label { font-size: 12px; font-weight: 600; opacity: 0.88; }
+.lineage-btn { font-size: 11px; font-weight: 700; padding: 3px 9px; min-height: 24px; border-radius: 7px; background: alpha(@window_fg_color, 0.06); }
+.lineage-btn:hover { background: alpha(@purple_3, 0.22); color: @purple_3; }
+.branch-popover-row { font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 7px; }
+.message-action-btn { font-size: 11px; font-weight: 600; padding: 2px 8px; min-height: 22px; border-radius: 6px; opacity: 0.65; }
+.message-action-btn:hover { opacity: 1; background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.readonly-fork-btn { font-size: 12px; font-weight: 700; padding: 4px 11px; border-radius: 8px; }
+.session-row-pinned { background: alpha(@warning_color, 0.08); border-left: 3px solid alpha(@warning_color, 0.72); }
+.session-row-fts { background: alpha(@accent_bg_color, 0.08); border-left: 3px solid alpha(@accent_color, 0.65); }
+.session-preview { font-size: 11.5px; opacity: 0.76; line-height: 1.3; }
+.pin-badge { background: alpha(@warning_color, 0.20); color: @warning_color; }
+.fts-badge { background: alpha(@success_color, 0.18); color: @success_color; }
+.pin-active { color: @warning_color; background: alpha(@warning_color, 0.14); }
+.transcript-find-bar { background: @view_bg_color; border: 1px solid alpha(@accent_color, 0.34); border-radius: 11px; padding: 6px 10px; }
+.transcript-find-entry { font-size: 13px; min-height: 30px; border-radius: 8px; }
+.find-status-badge { font-family: monospace; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 6px; background: alpha(@window_fg_color, 0.06); opacity: 0.85; }
+.message-match { border: 1px solid alpha(@warning_color, 0.45); background: alpha(@warning_color, 0.09); }
+.message-match-active { border: 2px solid @accent_color; background: alpha(@accent_bg_color, 0.18); }
+.match-badge { background: alpha(@warning_color, 0.22); color: @warning_color; }
+.message-match-active .match-badge { background: alpha(@accent_bg_color, 0.28); color: @accent_color; }
+.hermes-composer.composer-drop-active { border: 2px solid @accent_color; background: alpha(@accent_bg_color, 0.10); }
+.workspace-trigger { background: alpha(@window_fg_color, 0.04); }
+.workspace-trigger:hover { background: alpha(@window_fg_color, 0.09); }
+.workspace-icon { opacity: 0.76; }
+.slash-deck { background: @view_bg_color; border: 1px solid alpha(@accent_color, 0.30); border-radius: 12px; padding: 8px 10px; }
+.slash-row { padding: 6px 8px; border-radius: 8px; }
+.slash-row-active { background: alpha(@accent_bg_color, 0.18); }
+.slash-token { font-family: monospace; font-size: 12.5px; font-weight: 800; color: @accent_color; min-width: 110px; }
+.slash-skill-badge { background: alpha(@purple_3, 0.20); color: @purple_3; }
+.slash-desc { font-size: 12px; opacity: 0.78; }
+.attach-trigger { padding: 4px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.045); }
+.attach-trigger:hover { background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.attachment-strip { padding-bottom: 4px; border-bottom: 1px solid alpha(@window_fg_color, 0.08); }
+.attachment-pill { background: alpha(@window_fg_color, 0.055); border: 1px solid alpha(@window_fg_color, 0.12); border-radius: 9px; padding: 4px 6px 4px 6px; }
+.attachment-thumb { border-radius: 5px; }
+.attachment-name { font-size: 11.5px; font-weight: 700; }
+.attachment-remove { min-width: 22px; min-height: 22px; padding: 0; opacity: 0.68; }
+.attachment-remove:hover { opacity: 1; color: @error_color; }
+.compress-btn { font-size: 11px; font-weight: 700; padding: 2px 8px; min-height: 24px; border-radius: 6px; background: alpha(@accent_bg_color, 0.14); color: @accent_color; }
+.compress-btn:hover { background: alpha(@accent_bg_color, 0.24); }
