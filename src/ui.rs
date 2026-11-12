@@ -2448,6 +2448,8 @@ impl Ui {
 
     fn run_palette_curation_action(self: &Rc<Self>, action: PaletteAction) {
         match action {
+            PaletteAction::CopyTranscript => self.copy_transcript(),
+            PaletteAction::ExportTranscript => self.export_transcript(),
             PaletteAction::TogglePinCurrent => self.toggle_pin_current(),
             PaletteAction::RenameCurrent => self.prompt_rename_current(),
             PaletteAction::ArchiveCurrent => self.archive_current(),
@@ -3295,6 +3297,53 @@ impl Ui {
             self.refresh();
             self.editor.grab_focus();
         }
+    }
+
+    fn current_transcript(&self) -> Option<(String, String)> {
+        let state = self.state.borrow();
+        let id = state.selected.as_ref()?;
+        let messages = &state.conversations.get(id)?.messages;
+        let title = state
+            .sessions
+            .iter()
+            .find(|s| &s.stored_id == id)
+            .map_or_else(|| "Conversation".to_string(), |s| s.title.clone());
+        Some((title.clone(), transcript_markdown(&title, messages)))
+    }
+
+    fn copy_transcript(&self) {
+        let Some((_, md)) = self.current_transcript() else {
+            return;
+        };
+        self.window.clipboard().set_text(&md);
+        self.state.borrow_mut().notice = "Conversation copied as Markdown".into();
+        self.refresh();
+    }
+
+    fn export_transcript(self: &Rc<Self>) {
+        let Some((title, md)) = self.current_transcript() else {
+            return;
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title("Export conversation")
+            .initial_name(export_file_name(&title))
+            .build();
+        let weak = Rc::downgrade(self);
+        let win = self.window.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(file) = dialog.save_future(Some(&win)).await else {
+                return;
+            };
+            let notice = match file.path().map(|p| std::fs::write(&p, md)) {
+                Some(Ok(())) => "Conversation exported".to_string(),
+                Some(Err(e)) => format!("Export failed: {e}"),
+                None => "Export failed: not a local path".to_string(),
+            };
+            if let Some(ui) = weak.upgrade() {
+                ui.state.borrow_mut().notice = notice;
+                ui.refresh();
+            }
+        });
     }
 
     fn compress_current(&self) {

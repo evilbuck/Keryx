@@ -2250,6 +2250,45 @@ fn ensure_tool_entry<'a>(
     tools.last_mut().expect("inserted tool trace")
 }
 
+/// Renders a transcript as portable Markdown, one `##` heading per turn.
+pub fn transcript_markdown(title: &str, messages: &[ChatMessage]) -> String {
+    let mut out = format!("# {}\n", title.trim());
+    for m in messages {
+        let label = match m.role {
+            Role::User => "You",
+            Role::Assistant => "Hermes",
+            Role::Tool => "Tool",
+            Role::System => "System",
+        };
+        out.push_str(&format!("\n## {label}\n\n{}\n", m.text.trim_end()));
+    }
+    out
+}
+
+/// Derives a safe `.md` file name from a session title.
+pub fn export_file_name(title: &str) -> String {
+    let slug: String = title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug: String = slug.chars().take(60).collect();
+    if slug.is_empty() {
+        "conversation.md".into()
+    } else {
+        format!("{slug}.md")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     NewChat,
@@ -2264,6 +2303,8 @@ pub enum PaletteAction {
     OpenInspector(InspectorTab),
     FocusFilter,
     FindInTranscript,
+    CopyTranscript,
+    ExportTranscript,
     TogglePinCurrent,
     RenameCurrent,
     ArchiveCurrent,
@@ -2953,6 +2994,22 @@ fn palette_curation_commands(
             "Ctrl+Shift+F",
         ));
     }
+    if conversation.is_some_and(|c| !c.messages.is_empty()) {
+        out.push(PaletteEntry::command(
+            PaletteAction::CopyTranscript,
+            "edit-copy-symbolic",
+            "Copy conversation as Markdown",
+            "Put the whole transcript on the clipboard",
+            "",
+        ));
+        out.push(PaletteEntry::command(
+            PaletteAction::ExportTranscript,
+            "document-save-symbolic",
+            "Export conversation to file…",
+            "Save the transcript as a .md file",
+            "",
+        ));
+    }
     if connected && state.selected.is_some() {
         let pinned = state.is_selected_pinned();
         let mut pin = PaletteEntry::command(
@@ -3323,6 +3380,26 @@ fn session_palette_icon(source: &str, pinned: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transcript_export_renders_roles_and_safe_names() {
+        let msgs = vec![
+            ChatMessage {
+                id: "1".into(),
+                role: Role::User,
+                text: "hi".into(),
+            },
+            ChatMessage {
+                id: "2".into(),
+                role: Role::Assistant,
+                text: "yo\n".into(),
+            },
+        ];
+        let md = transcript_markdown(" Title ", &msgs);
+        assert_eq!(md, "# Title\n\n## You\n\nhi\n\n## Hermes\n\nyo\n");
+        assert_eq!(export_file_name("Fix: the /bug!"), "fix-the-bug.md");
+        assert_eq!(export_file_name("???"), "conversation.md");
+    }
+
     use super::*;
     #[test]
     fn public_plaintext_is_rejected_even_with_trust_flag() {
