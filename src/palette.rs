@@ -452,15 +452,24 @@ pub fn build_palette_trigger() -> gtk::Button {
 }
 
 pub fn build_shortcut_hints() -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    row.set_halign(gtk::Align::Center);
-    row.add_css_class("shortcut-strip");
-    for (key, desc) in [
+    let stack = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    stack.set_halign(gtk::Align::Center);
+    stack.add_css_class("shortcut-strip");
+    stack.append(&shortcut_hint_row(&[
         ("Enter", "Start chat"),
         ("Ctrl+K", "Palette"),
-        ("Ctrl+B", "Sidebar"),
-        ("Ctrl+F", "Filter"),
-    ] {
+    ]));
+    stack.append(&shortcut_hint_row(&[
+        ("Ctrl+I", "Flight Deck"),
+        ("Alt+Enter", "Side-Ask"),
+    ]));
+    stack
+}
+
+fn shortcut_hint_row(items: &[(&str, &str)]) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.set_halign(gtk::Align::Center);
+    for (key, desc) in items {
         let item = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         item.add_css_class("shortcut-chip");
         let kbd = gtk::Label::new(Some(key));

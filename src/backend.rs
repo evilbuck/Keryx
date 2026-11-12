@@ -9,7 +9,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use crate::model::{
     Catalog, ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event,
     InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, Role, SessionSummary,
-    SteerOutcome, TurnStatus,
+    SteerOutcome, ToolEventUpdate, TurnStatus, parse_live_info_telemetry, parse_telemetry_payload,
 };
 
 const PAGE: usize = 50;
@@ -270,6 +270,10 @@ enum JobKind {
     Switch {
         runtime_id: String,
         target: ModelIdentity,
+    },
+    SideQuestion {
+        runtime_id: String,
+        client_id: u64,
     },
 }
 
@@ -624,134 +628,160 @@ impl Link {
         if (!self.ready || self.write.is_none())
             && !matches!(command, Command::Reconnect | Command::Shutdown)
         {
-            if self.write.is_some()
-                || matches!(
-                    command,
-                    Command::List { .. } | Command::Create { .. } | Command::Resume { .. }
-                )
-            {
-                self.queued.push_back(command);
-                return;
-            }
-            self.fail("connect", None, "Not connected. Reconnect to try again.")
-                .await;
+            self.handle_unready_command(command).await;
             return;
         }
         match command {
-            Command::Reconnect => {} // The supervisor handles connection cancellation.
-            Command::Shutdown => {}
+            Command::Reconnect | Command::Shutdown => {}
             Command::List { offset } => self.list(offset).await,
-            Command::Create { title } => {
-                if let Err(fault) = self
-                    .send_rpc(
-                        "session.create",
-                        json!({"title": title}),
-                        JobKind::Create { title },
-                        RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    self.fail("create", None, send_fault_message("create", fault))
-                        .await;
-                }
-            }
-            Command::Resume { stored_id } => {
-                if let Err(fault) = self
-                    .send_rpc(
-                        "session.resume",
-                        json!({
-                            "session_id": stored_id,
-                            "inline_images": false,
-                            "omit_messages": true
-                        }),
-                        JobKind::Resume {
-                            stored_id: stored_id.clone(),
-                        },
-                        RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    self.fail(
-                        "resume",
-                        Some(stored_id),
-                        send_fault_message("resume", fault),
-                    )
-                    .await;
-                }
-            }
+            Command::Create { title } => self.begin_create(title).await,
+            Command::Resume { stored_id } => self.begin_resume(stored_id).await,
             Command::History { stored_id, before } => self.history(stored_id, before).await,
             Command::Submit { runtime_id, text } => {
-                if self
+                if !self
                     .turns
                     .get(&runtime_id)
                     .is_some_and(|turn| turn.phase == TurnPhase::Stopping)
                 {
-                    return;
-                }
-                self.begin_submit(runtime_id, text).await;
-            }
-            Command::Steer { runtime_id, text } => match steer_route(self.turns.get(&runtime_id)) {
-                SteerRoute::Drop => {}
-                SteerRoute::Redirect => {
-                    if let Err(fault) = self
-                        .send_rpc(
-                            "session.redirect",
-                            json!({"session_id": runtime_id, "text": text}),
-                            JobKind::Steer {
-                                runtime_id: runtime_id.clone(),
-                                text,
-                            },
-                            RPC_TIMEOUT,
-                        )
-                        .await
-                    {
-                        // A failed steer must not end the live turn: the
-                        // "steer" operation is deliberately not "submit".
-                        self.fail(
-                            "steer",
-                            Some(runtime_id),
-                            send_fault_message("steer", fault),
-                        )
-                        .await;
-                    }
-                }
-                // Idle or already-settled turn: this is a normal next prompt.
-                SteerRoute::Submit => self.begin_submit(runtime_id, text).await,
-            },
-            Command::Interrupt { runtime_id } => {
-                let generation = self
-                    .turns
-                    .get(&runtime_id)
-                    .map_or(0, |turn| turn.generation);
-                if let Err(fault) = self
-                    .send_rpc(
-                        "session.interrupt",
-                        json!({"session_id": runtime_id}),
-                        JobKind::Interrupt {
-                            runtime_id: runtime_id.clone(),
-                            generation,
-                        },
-                        RPC_TIMEOUT,
-                    )
-                    .await
-                {
-                    self.fail(
-                        "interrupt",
-                        Some(runtime_id),
-                        send_fault_message("interrupt", fault),
-                    )
-                    .await;
+                    self.begin_submit(runtime_id, text).await;
                 }
             }
+            Command::Steer { runtime_id, text } => self.begin_steer(runtime_id, text).await,
+            Command::Interrupt { runtime_id } => self.begin_interrupt(runtime_id).await,
             Command::Respond {
                 runtime_id,
                 request_id,
                 answer,
             } => self.respond(runtime_id, request_id, answer).await,
             Command::Delete { stored_id } => self.begin_delete(stored_id).await,
-            Command::FetchModels | Command::SetModel { .. } => {
+            Command::FetchModels | Command::SetModel { .. } | Command::AskSide { .. } => {
                 self.model_command(command).await;
             }
+        }
+    }
+
+    async fn handle_unready_command(&mut self, command: Command) {
+        if self.write.is_some()
+            || matches!(
+                command,
+                Command::List { .. } | Command::Create { .. } | Command::Resume { .. }
+            )
+        {
+            self.queued.push_back(command);
+            return;
+        }
+        if let Command::AskSide {
+            runtime_id,
+            client_id,
+            ..
+        } = command
+        {
+            self.emit(Event::SideFailed {
+                runtime_id,
+                client_id,
+                message: "Not connected. Reconnect to try again.".into(),
+            })
+            .await;
+            return;
+        }
+        self.fail("connect", None, "Not connected. Reconnect to try again.")
+            .await;
+    }
+
+    async fn begin_create(&mut self, title: String) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.create",
+                json!({"title": title}),
+                JobKind::Create { title },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail("create", None, send_fault_message("create", fault))
+                .await;
+        }
+    }
+
+    async fn begin_resume(&mut self, stored_id: String) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::Resume {
+                    stored_id: stored_id.clone(),
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "resume",
+                Some(stored_id),
+                send_fault_message("resume", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn begin_steer(&mut self, runtime_id: String, text: String) {
+        match steer_route(self.turns.get(&runtime_id)) {
+            SteerRoute::Drop => {}
+            SteerRoute::Redirect => {
+                if let Err(fault) = self
+                    .send_rpc(
+                        "session.redirect",
+                        json!({"session_id": runtime_id, "text": text}),
+                        JobKind::Steer {
+                            runtime_id: runtime_id.clone(),
+                            text,
+                        },
+                        RPC_TIMEOUT,
+                    )
+                    .await
+                {
+                    // A failed steer must not end the live turn: the
+                    // "steer" operation is deliberately not "submit".
+                    self.fail(
+                        "steer",
+                        Some(runtime_id),
+                        send_fault_message("steer", fault),
+                    )
+                    .await;
+                }
+            }
+            // Idle or already-settled turn: this is a normal next prompt.
+            SteerRoute::Submit => self.begin_submit(runtime_id, text).await,
+        }
+    }
+
+    async fn begin_interrupt(&mut self, runtime_id: String) {
+        let generation = self
+            .turns
+            .get(&runtime_id)
+            .map_or(0, |turn| turn.generation);
+        if let Err(fault) = self
+            .send_rpc(
+                "session.interrupt",
+                json!({"session_id": runtime_id}),
+                JobKind::Interrupt {
+                    runtime_id: runtime_id.clone(),
+                    generation,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "interrupt",
+                Some(runtime_id),
+                send_fault_message("interrupt", fault),
+            )
+            .await;
         }
     }
 
@@ -803,7 +833,37 @@ impl Link {
                         .await;
                 }
             }
+            Command::AskSide {
+                runtime_id,
+                client_id,
+                question,
+            } => {
+                self.begin_side_question(runtime_id, client_id, question)
+                    .await;
+            }
             _ => {}
+        }
+    }
+
+    async fn begin_side_question(&mut self, runtime_id: String, client_id: u64, question: String) {
+        if let Err(fault) = self
+            .send_rpc(
+                "prompt.btw",
+                json!({"session_id": runtime_id, "text": question}),
+                JobKind::SideQuestion {
+                    runtime_id: runtime_id.clone(),
+                    client_id,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.emit(Event::SideFailed {
+                runtime_id,
+                client_id,
+                message: send_fault_message("btw", fault),
+            })
+            .await;
         }
     }
 
@@ -1213,16 +1273,21 @@ impl Link {
             "message.start" => self.on_message_start(&runtime_id, payload).await,
             "message.delta" => self.on_delta(&runtime_id, payload).await,
             "message.complete" => self.on_complete(&runtime_id, payload).await,
-            "thinking.delta" | "reasoning.delta" => {
-                self.activity(&runtime_id, "Hermes is thinking…").await
+            "thinking.delta"
+            | "reasoning.delta"
+            | "reasoning.available"
+            | "btw.complete"
+            | "session.usage"
+            | "session.info" => {
+                self.on_inspector_event(&runtime_id, event_type, payload)
+                    .await
             }
-            "tool.start" | "tool.generating" | "tool.complete" => {
-                self.on_tool_event(&runtime_id, event_type, payload).await
-            }
+            "tool.start" | "tool.generating" | "tool.progress" | "tool.output_risk"
+            | "tool.complete" => self.on_tool_event(&runtime_id, event_type, payload).await,
             "request.cancel" => self.on_request_cancel(payload).await,
             "error" => self.on_gateway_error(runtime_id, payload).await,
             "session.title" => self.on_session_title(&runtime_id, payload).await,
-            "session.info" | "sessions.changed" | "platforms.changed" | "message.interim" => {}
+            "sessions.changed" | "platforms.changed" | "message.interim" => {}
             // Named `event` frames are notifications: they need no response.
             // An unknown name is unrelated metadata, not a conversation failure.
             // `error` and failed `message.complete` stay above. A missing type
@@ -1240,6 +1305,90 @@ impl Link {
                     .await;
                 }
             }
+        }
+    }
+
+    async fn on_inspector_event(&mut self, runtime_id: &str, event_type: &str, payload: &Value) {
+        if runtime_id.is_empty() {
+            return;
+        }
+        match event_type {
+            "thinking.delta" | "reasoning.delta" => {
+                self.activity(runtime_id, "Hermes is thinking…").await;
+                self.emit_reasoning_payload(runtime_id, payload, false)
+                    .await;
+            }
+            "reasoning.available" => {
+                self.emit_reasoning_payload(runtime_id, payload, true).await;
+            }
+            "btw.complete" => self.on_btw_complete(runtime_id, payload).await,
+            "session.usage" => {
+                if let Some(telemetry) = parse_telemetry_payload(payload) {
+                    self.emit(Event::Telemetry {
+                        runtime_id: runtime_id.to_string(),
+                        telemetry,
+                    })
+                    .await;
+                }
+            }
+            "session.info" => {
+                self.emit_live_info(runtime_id, &json!({"info": payload}))
+                    .await
+            }
+            _ => {}
+        }
+    }
+
+    async fn emit_reasoning_payload(&self, runtime_id: &str, payload: &Value, replace: bool) {
+        let Some(raw) = payload.get("text").and_then(Value::as_str) else {
+            return;
+        };
+        if raw.is_empty() {
+            return;
+        }
+        self.emit(Event::Reasoning {
+            runtime_id: runtime_id.to_string(),
+            text: redact_secrets(raw, &self.secrets),
+            replace,
+        })
+        .await;
+    }
+
+    async fn on_btw_complete(&self, runtime_id: &str, payload: &Value) {
+        let task_id = payload
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let question = payload
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        self.emit(Event::SideComplete {
+            runtime_id: runtime_id.to_string(),
+            task_id,
+            question: redact_secrets(&question, &self.secrets),
+            text: redact_secrets(&text, &self.secrets),
+        })
+        .await;
+    }
+
+    async fn emit_live_info(&self, runtime_id: &str, result: &Value) {
+        if runtime_id.is_empty() {
+            return;
+        }
+        if let Some(telemetry) = parse_live_info_telemetry(result) {
+            self.emit(Event::Telemetry {
+                runtime_id: runtime_id.to_string(),
+                telemetry,
+            })
+            .await;
         }
     }
 
@@ -1355,17 +1504,22 @@ impl Link {
     }
 
     async fn on_tool_event(&mut self, runtime_id: &str, event_type: &str, payload: &Value) {
-        let name = payload
-            .get("name")
-            .or_else(|| payload.get("tool"))
-            .or_else(|| payload.get("tool_name"))
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
+        let name = tool_name_from(payload);
         let label = match event_type {
             "tool.complete" => format!("Tool finished: {}", truncate(name, 80)),
+            "tool.output_risk" => format!("Tool flagged output: {}", truncate(name, 80)),
             _ => format!("Using tool: {}", truncate(name, 80)),
         };
         self.activity(runtime_id, &label).await;
+        if !runtime_id.is_empty()
+            && let Some(update) = parse_tool_event(event_type, payload, &self.secrets)
+        {
+            self.emit(Event::ToolTraceEvent {
+                runtime_id: runtime_id.to_string(),
+                update,
+            })
+            .await;
+        }
     }
 
     async fn on_delta(&mut self, runtime_id: &str, payload: &Value) {
@@ -1434,6 +1588,13 @@ impl Link {
             status,
         })
         .await;
+        self.emit_complete_metadata(runtime_id, payload).await;
+    }
+
+    async fn emit_complete_metadata(&self, runtime_id: &str, payload: &Value) {
+        if runtime_id.is_empty() {
+            return;
+        }
         // The completion's usage names the model this inference actually ran on. That is
         // the only direct evidence of an effective model, so it reconciles the display.
         if let Some(model) = payload
@@ -1445,6 +1606,25 @@ impl Link {
             self.emit(Event::ModelObserved {
                 runtime_id: runtime_id.to_string(),
                 model: model.to_string(),
+            })
+            .await;
+        }
+        if let Some(reasoning) = payload
+            .get("reasoning")
+            .and_then(Value::as_str)
+            .filter(|r| !r.trim().is_empty())
+        {
+            self.emit(Event::Reasoning {
+                runtime_id: runtime_id.to_string(),
+                text: redact_secrets(reasoning, &self.secrets),
+                replace: true,
+            })
+            .await;
+        }
+        if let Some(telemetry) = parse_telemetry_payload(payload) {
+            self.emit(Event::Telemetry {
+                runtime_id: runtime_id.to_string(),
+                telemetry,
             })
             .await;
         }
@@ -1656,70 +1836,13 @@ impl Link {
             JobKind::Submit {
                 runtime_id,
                 generation,
-            } => {
-                if self
-                    .turns
-                    .get_mut(&runtime_id)
-                    .is_some_and(|turn| turn.acknowledge(generation))
-                {
-                    self.emit(Event::Submitted { runtime_id }).await;
-                }
-            }
+            } => self.on_submit_reply(runtime_id, generation).await,
             JobKind::Interrupt {
                 runtime_id,
                 generation,
-            } => {
-                let accepted = self
-                    .turns
-                    .get_mut(&runtime_id)
-                    .is_some_and(|turn| turn.accept_interrupt(generation));
-                if accepted {
-                    self.emit(Event::Interrupting { runtime_id }).await;
-                }
-            }
+            } => self.on_interrupt_reply(runtime_id, generation).await,
             JobKind::Steer { runtime_id, text } => {
-                let status = result
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("rejected");
-                match status {
-                    "redirected" => {
-                        self.emit(Event::SteerAccepted {
-                            runtime_id,
-                            outcome: SteerOutcome::Redirected,
-                        })
-                        .await;
-                    }
-                    "queued" => {
-                        self.emit(Event::SteerAccepted {
-                            runtime_id,
-                            outcome: SteerOutcome::Queued,
-                        })
-                        .await;
-                    }
-                    // Not running or inapplicable: queue as the next prompt,
-                    // mirroring the upstream TUI fallback.
-                    _ => {
-                        if let Err(fault) = self
-                            .send_rpc(
-                                "prompt.submit",
-                                queued_submit_params(&runtime_id, &text),
-                                JobKind::Queue {
-                                    runtime_id: runtime_id.clone(),
-                                },
-                                RPC_TIMEOUT,
-                            )
-                            .await
-                        {
-                            self.fail(
-                                "steer",
-                                Some(runtime_id),
-                                send_fault_message("steer", fault),
-                            )
-                            .await;
-                        }
-                    }
-                }
+                self.on_steer_reply(runtime_id, text, result).await
             }
             JobKind::Queue { runtime_id } => {
                 self.emit(Event::SteerAccepted {
@@ -1728,18 +1851,7 @@ impl Link {
                 })
                 .await;
             }
-            JobKind::Catalog => match Catalog::parse(result) {
-                Ok(catalog) => self.emit(Event::Catalog { catalog }).await,
-                Err(error) => {
-                    self.emit(Event::Catalog {
-                        catalog: Catalog {
-                            error: Some(self.clean(error)),
-                            ..Default::default()
-                        },
-                    })
-                    .await
-                }
-            },
+            JobKind::Catalog => self.on_catalog_reply(result).await,
             JobKind::Prime {
                 runtime_id,
                 target,
@@ -1753,45 +1865,148 @@ impl Link {
             JobKind::Switch {
                 runtime_id, target, ..
             } => self.model_reply(runtime_id, target, result).await,
+            JobKind::SideQuestion {
+                runtime_id,
+                client_id,
+            } => self.on_side_reply(runtime_id, client_id, result).await,
             JobKind::Delete { stored_id, .. } => {
                 self.runtime_of.remove(&stored_id);
                 self.emit(Event::Deleted { stored_id }).await;
             }
             JobKind::DeleteResume { stored_id } => {
-                if let Some(runtime_id) = result
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    self.runtime_of
-                        .insert(stored_id.clone(), runtime_id.to_string());
-                    let _ = self
-                        .send_rpc(
-                            "session.interrupt",
-                            json!({"session_id": runtime_id}),
-                            JobKind::Ping,
-                            RPC_TIMEOUT,
-                        )
-                        .await;
-                    if self
-                        .send_rpc(
-                            "session.close",
-                            json!({"session_id": runtime_id}),
-                            JobKind::Close {
-                                stored_id: stored_id.clone(),
-                                retried: true,
-                            },
-                            RPC_TIMEOUT,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        return;
-                    }
-                }
-                self.request_delete(stored_id, true).await;
+                self.on_delete_resume_reply(stored_id, result).await
             }
         }
+    }
+
+    async fn on_submit_reply(&mut self, runtime_id: String, generation: u64) {
+        if self
+            .turns
+            .get_mut(&runtime_id)
+            .is_some_and(|turn| turn.acknowledge(generation))
+        {
+            self.emit(Event::Submitted { runtime_id }).await;
+        }
+    }
+
+    async fn on_interrupt_reply(&mut self, runtime_id: String, generation: u64) {
+        let accepted = self
+            .turns
+            .get_mut(&runtime_id)
+            .is_some_and(|turn| turn.accept_interrupt(generation));
+        if accepted {
+            self.emit(Event::Interrupting { runtime_id }).await;
+        }
+    }
+
+    async fn on_steer_reply(&mut self, runtime_id: String, text: String, result: &Value) {
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("rejected");
+        match status {
+            "redirected" => {
+                self.emit(Event::SteerAccepted {
+                    runtime_id,
+                    outcome: SteerOutcome::Redirected,
+                })
+                .await;
+            }
+            "queued" => {
+                self.emit(Event::SteerAccepted {
+                    runtime_id,
+                    outcome: SteerOutcome::Queued,
+                })
+                .await;
+            }
+            // Not running or inapplicable: queue as the next prompt,
+            // mirroring the upstream TUI fallback.
+            _ => {
+                if let Err(fault) = self
+                    .send_rpc(
+                        "prompt.submit",
+                        queued_submit_params(&runtime_id, &text),
+                        JobKind::Queue {
+                            runtime_id: runtime_id.clone(),
+                        },
+                        RPC_TIMEOUT,
+                    )
+                    .await
+                {
+                    self.fail(
+                        "steer",
+                        Some(runtime_id),
+                        send_fault_message("steer", fault),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn on_catalog_reply(&self, result: &Value) {
+        match Catalog::parse(result) {
+            Ok(catalog) => self.emit(Event::Catalog { catalog }).await,
+            Err(error) => {
+                self.emit(Event::Catalog {
+                    catalog: Catalog {
+                        error: Some(self.clean(error)),
+                        ..Default::default()
+                    },
+                })
+                .await
+            }
+        }
+    }
+
+    async fn on_side_reply(&self, runtime_id: String, client_id: u64, result: &Value) {
+        if let Some(task_id) = result
+            .get("task_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.emit(Event::SideStarted {
+                runtime_id,
+                client_id,
+                task_id: task_id.to_string(),
+            })
+            .await;
+        }
+    }
+
+    async fn on_delete_resume_reply(&mut self, stored_id: String, result: &Value) {
+        if let Some(runtime_id) = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.runtime_of
+                .insert(stored_id.clone(), runtime_id.to_string());
+            let _ = self
+                .send_rpc(
+                    "session.interrupt",
+                    json!({"session_id": runtime_id}),
+                    JobKind::Ping,
+                    RPC_TIMEOUT,
+                )
+                .await;
+            if self
+                .send_rpc(
+                    "session.close",
+                    json!({"session_id": runtime_id}),
+                    JobKind::Close {
+                        stored_id: stored_id.clone(),
+                        retried: true,
+                    },
+                    RPC_TIMEOUT,
+                )
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.request_delete(stored_id, true).await;
     }
 
     async fn fail_model_request(&mut self, kind: JobKind, code: i64, message: &str) {
@@ -1842,48 +2057,85 @@ impl Link {
             JobKind::Submit {
                 runtime_id,
                 generation,
-            } => {
-                let applies = self
-                    .turns
-                    .get_mut(&runtime_id)
-                    .is_some_and(|turn| turn.fail_submit(generation));
-                if !applies {
-                    return;
-                }
-                self.fail(
-                    "submit",
-                    Some(runtime_id),
-                    format!("{message} The prompt will not be sent again."),
-                )
-                .await
-            }
+            } => self.fail_submit_job(runtime_id, generation, message).await,
             JobKind::Interrupt {
                 runtime_id,
                 generation,
             } => {
-                if !self
-                    .turns
-                    .get(&runtime_id)
-                    .is_some_and(|turn| turn.fail_interrupt(generation))
-                {
-                    return;
-                }
-                self.fail("interrupt", Some(runtime_id), message).await
+                self.fail_interrupt_job(runtime_id, generation, message)
+                    .await
             }
             // A failed steer must not end the live turn: "steer" is not
             // "submit" in `operation_failed`, so the status stays busy.
             JobKind::Steer { runtime_id, .. } | JobKind::Queue { runtime_id, .. } => {
                 self.fail("steer", Some(runtime_id), message).await
             }
+            JobKind::SideQuestion {
+                runtime_id,
+                client_id,
+            } => {
+                self.fail_side_job(runtime_id, client_id, code, message)
+                    .await
+            }
             kind @ (JobKind::Catalog | JobKind::Prime { .. } | JobKind::Switch { .. }) => {
                 self.fail_model_request(kind, code, message).await;
             }
+            kind @ (JobKind::Close { .. }
+            | JobKind::DeleteResume { .. }
+            | JobKind::Delete { .. }) => {
+                self.fail_delete_job(kind, code, message).await;
+            }
+        }
+    }
+
+    async fn fail_submit_job(&mut self, runtime_id: String, generation: u64, message: &str) {
+        let applies = self
+            .turns
+            .get_mut(&runtime_id)
+            .is_some_and(|turn| turn.fail_submit(generation));
+        if applies {
+            self.fail(
+                "submit",
+                Some(runtime_id),
+                format!("{message} The prompt will not be sent again."),
+            )
+            .await;
+        }
+    }
+
+    async fn fail_interrupt_job(&self, runtime_id: String, generation: u64, message: &str) {
+        if self
+            .turns
+            .get(&runtime_id)
+            .is_some_and(|turn| turn.fail_interrupt(generation))
+        {
+            self.fail("interrupt", Some(runtime_id), message).await;
+        }
+    }
+
+    async fn fail_side_job(&self, runtime_id: String, client_id: u64, code: i64, message: &str) {
+        let detail = if code == -32601 {
+            "This Hermes gateway does not expose prompt.btw yet (requires Hermes v0.23+)."
+                .to_string()
+        } else {
+            self.clean(message.to_string())
+        };
+        self.emit(Event::SideFailed {
+            runtime_id,
+            client_id,
+            message: detail,
+        })
+        .await;
+    }
+
+    async fn fail_delete_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
             JobKind::Close { stored_id, retried } => self.request_delete(stored_id, retried).await,
             JobKind::DeleteResume { stored_id } => {
                 if matches!(resume_disposition(code), ResumeDisposition::ReadOnly) {
                     self.refused.insert(stored_id.clone());
                 }
-                self.fail("delete", Some(stored_id), message).await
+                self.fail("delete", Some(stored_id), message).await;
             }
             JobKind::Delete { stored_id, retried } => {
                 if code == 4132 {
@@ -1912,6 +2164,7 @@ impl Link {
                 }
                 self.fail("delete", Some(stored_id), message).await;
             }
+            _ => {}
         }
     }
 
@@ -1954,10 +2207,11 @@ impl Link {
                 read_only_reason: None,
                 message_count: 0,
             },
-            runtime_id,
+            runtime_id: runtime_id.clone(),
             model,
         })
         .await;
+        self.emit_live_info(&runtime_id, result).await;
     }
 
     async fn on_resumed(&mut self, stored_id: String, result: &Value) {
@@ -1970,17 +2224,7 @@ impl Link {
             self.runtime_of
                 .insert(stored_id.clone(), runtime_id.clone());
         }
-        let running = result
-            .get("running")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || matches!(
-                result.get("status").and_then(Value::as_str),
-                Some("streaming" | "running" | "resuming")
-            )
-            || result
-                .get("inflight")
-                .is_some_and(|value| value.is_object());
+        let running = is_resumed_running(result);
         let Some(count) = result
             .get("message_count")
             .and_then(Value::as_u64)
@@ -2014,6 +2258,9 @@ impl Link {
             model: model_identity(result),
         })
         .await;
+        if let Some(rt) = &runtime_id {
+            self.emit_live_info(rt, result).await;
+        }
         if running && let Some(runtime_id) = runtime_id.clone() {
             self.next_turn_generation += 1;
             let generation = self.next_turn_generation;
@@ -2793,6 +3040,119 @@ fn classify_unhandled_event(event_type: &str) -> UnhandledGatewayEvent {
     } else {
         UnhandledGatewayEvent::Ignore
     }
+}
+
+fn is_resumed_running(result: &Value) -> bool {
+    result
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("streaming" | "running" | "resuming")
+        )
+        || result
+            .get("inflight")
+            .is_some_and(|value| value.is_object())
+}
+
+fn tool_name_from(payload: &Value) -> &str {
+    payload
+        .get("name")
+        .or_else(|| payload.get("tool"))
+        .or_else(|| payload.get("tool_name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tool")
+}
+
+fn payload_str(payload: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|k| payload.get(*k).and_then(Value::as_str).map(str::trim))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+fn parse_tool_event(
+    event_type: &str,
+    payload: &Value,
+    secrets: &[String],
+) -> Option<ToolEventUpdate> {
+    let tool_id = payload_str(payload, &["tool_id", "call_id", "id"]);
+    let name = tool_name_from(payload).to_string();
+    match event_type {
+        "tool.generating" | "tool.start" => Some(ToolEventUpdate::Started {
+            tool_id,
+            name,
+            detail: compact_tool_detail(
+                &payload_str(payload, &["preview", "context", "args_text"]),
+                secrets,
+            ),
+        }),
+        "tool.progress" => Some(ToolEventUpdate::Progress {
+            tool_id,
+            name,
+            percent: extract_progress_pct(payload),
+            message: compact_tool_detail(
+                &payload_str(payload, &["message", "text", "status"]),
+                secrets,
+            ),
+        }),
+        "tool.output_risk" => {
+            let raw = payload_str(payload, &["risk", "reason", "level"]);
+            Some(ToolEventUpdate::Risk {
+                tool_id,
+                name,
+                risk: if raw.is_empty() {
+                    "flagged output".into()
+                } else {
+                    compact_tool_detail(&raw, secrets)
+                },
+            })
+        }
+        "tool.complete" => Some(ToolEventUpdate::Completed {
+            tool_id,
+            name,
+            duration_s: payload
+                .get("duration_s")
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v >= 0.0),
+            summary: compact_tool_detail(&payload_str(payload, &["summary", "preview"]), secrets),
+        }),
+        _ => None,
+    }
+}
+
+fn extract_progress_pct(payload: &Value) -> Option<u8> {
+    payload
+        .get("percent")
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+        .map(|f| f.clamp(0.0, 100.0) as u8)
+}
+
+fn compact_tool_detail(raw: &str, secrets: &[String]) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let single_line = redact_secrets(raw, secrets)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    truncate(&single_line, 140)
+}
+
+fn redact_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if secret.len() >= 3 {
+            out = out.replace(secret, "[REDACTED]");
+        }
+    }
+    out
 }
 
 fn string_list(value: Option<&Value>) -> Option<Vec<String>> {
@@ -3790,5 +4150,169 @@ mod tests {
             panic!("expected sessions");
         };
         assert_eq!(sessions[0].updated_at, "1794452594");
+    }
+
+    #[test]
+    fn side_question_events_redact_secrets_and_never_interrupt_live_turns() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "alice".into(),
+                    password: "top-secret-value".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.turns
+                .insert("rt-1".into(), Turn::streaming("msg-1".into(), 9));
+
+            link.on_job(
+                Job {
+                    kind: JobKind::SideQuestion {
+                        runtime_id: "rt-1".into(),
+                        client_id: 7,
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"result": {"task_id": "btw_abc"}}),
+            )
+            .await;
+            match incoming.try_recv().expect("side started") {
+                Event::SideStarted {
+                    runtime_id,
+                    client_id,
+                    task_id,
+                } => {
+                    assert_eq!(runtime_id, "rt-1");
+                    assert_eq!(client_id, 7);
+                    assert_eq!(task_id, "btw_abc");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "btw.complete",
+                    "session_id": "rt-1",
+                    "payload": {
+                        "task_id": "btw_abc",
+                        "question": "Check secret",
+                        "text": "Line 1\nSecret: top-secret-value"
+                    }
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("side complete") {
+                Event::SideComplete { task_id, text, .. } => {
+                    assert_eq!(task_id, "btw_abc");
+                    assert_eq!(text, "Line 1\nSecret: [REDACTED]");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+
+            // A side-question RPC error must emit SideFailed and leave the live turn Streaming:
+            link.on_job(
+                Job {
+                    kind: JobKind::SideQuestion {
+                        runtime_id: "rt-1".into(),
+                        client_id: 8,
+                    },
+                    deadline: Instant::now(),
+                },
+                &json!({"error": {"code": -32601, "message": "method not found"}}),
+            )
+            .await;
+            match incoming.try_recv().expect("side failed") {
+                Event::SideFailed {
+                    client_id, message, ..
+                } => {
+                    assert_eq!(client_id, 8);
+                    assert!(message.contains("prompt.btw"));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert_eq!(link.turns["rt-1"].phase, TurnPhase::Streaming);
+            assert_eq!(link.turns["rt-1"].generation, 9);
+        });
+    }
+
+    #[test]
+    fn reasoning_tool_trace_and_usage_events_stream_into_flight_deck() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.turns
+                .insert("rt-2".into(), Turn::streaming("msg-2".into(), 1));
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "reasoning.delta",
+                    "session_id": "rt-2",
+                    "payload": {"text": "Thinking about layout…"}
+                }
+            }))
+            .await;
+            assert!(matches!(incoming.try_recv().unwrap(), Event::Activity { .. }));
+            match incoming.try_recv().expect("reasoning") {
+                Event::Reasoning { text, replace, .. } => {
+                    assert_eq!(text, "Thinking about layout…");
+                    assert!(!replace);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "tool.start",
+                    "session_id": "rt-2",
+                    "payload": {"tool_id": "t1", "name": "read_file", "preview": "src/ui.rs"}
+                }
+            }))
+            .await;
+            assert!(matches!(incoming.try_recv().unwrap(), Event::Activity { .. }));
+            assert!(matches!(
+                incoming.try_recv().unwrap(),
+                Event::ToolTraceEvent {
+                    update: ToolEventUpdate::Started { .. },
+                    ..
+                }
+            ));
+
+            link.on_event(&json!({
+                "method": "event",
+                "params": {
+                    "type": "session.usage",
+                    "session_id": "rt-2",
+                    "payload": {"usage": {"input": 2000, "output": 400, "context_used": 2400, "context_max": 128000}}
+                }
+            }))
+            .await;
+            match incoming.try_recv().expect("telemetry") {
+                Event::Telemetry { telemetry, .. } => {
+                    assert_eq!(telemetry.input_tokens, 2000);
+                    assert_eq!(telemetry.context_used, Some(2400));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
     }
 }

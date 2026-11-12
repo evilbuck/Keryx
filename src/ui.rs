@@ -7,6 +7,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
 use crate::backend::{self, Backend};
+use crate::inspector::{InspectorAction, InspectorPanel};
 use crate::markdown;
 use crate::model::*;
 use crate::palette::{self, CommandPalette, TriageBar};
@@ -20,11 +21,15 @@ struct Ui {
     triage: Rc<TriageBar>,
     palette: RefCell<Option<Rc<CommandPalette>>>,
     palette_trigger: gtk::Button,
+    inspector: InspectorPanel,
+    inspector_toggle: gtk::Button,
+    inspector_badge: gtk::Label,
     delete_chat: gtk::Button,
     composer_hint: gtk::Label,
     sessions: gio::ListStore,
     selection: gtk::SingleSelection,
     messages: gio::ListStore,
+    message_list: gtk::ListView,
     transcript: gtk::ScrolledWindow,
     content: gtk::Stack,
     title: gtk::Label,
@@ -217,10 +222,14 @@ fn editor_editable(state: &AppState) -> bool {
 }
 
 fn can_send_in_conversation(c: &Conversation) -> bool {
-    c.runtime_id.is_some()
-        && c.read_only_reason.is_none()
-        && c.status != TurnStatus::Stopping
-        && !c.draft.trim().is_empty()
+    if c.runtime_id.is_none() || c.read_only_reason.is_some() {
+        return false;
+    }
+    match parse_composer_input(&c.draft) {
+        ComposerIntent::Empty => false,
+        ComposerIntent::SideQuestion(_) => true,
+        ComposerIntent::Prompt(_) => c.status != TurnStatus::Stopping,
+    }
 }
 
 fn composer_send_sensitive(state: &AppState, reload_pending: bool) -> bool {
@@ -245,15 +254,55 @@ fn composer_hint_text(state: &AppState) -> &'static str {
         return "Enter to start a new chat · Shift+Enter new line · Ctrl+K commands";
     };
     let Some(c) = state.conversations.get(id) else {
-        return "Enter to send · Shift+Enter for a new line · Ctrl+K commands";
+        return "Enter to send · Alt+Enter side-ask (/btw) · Ctrl+I Flight Deck";
     };
+    composer_conversation_hint(c)
+}
+
+fn composer_conversation_hint(c: &Conversation) -> &'static str {
     if c.read_only_reason.is_some() {
-        "Read-only conversation · Ctrl+N for a new chat"
-    } else if c.status.steerable() {
-        "Enter to steer active turn · Shift+Enter for a new line"
-    } else {
-        "Enter to send · Shift+Enter for a new line · Ctrl+K commands"
+        return "Read-only conversation · Ctrl+N for a new chat · Ctrl+I Flight Deck";
     }
+    let trimmed = c.draft.trim_start();
+    if trimmed.starts_with("/btw") || trimmed.starts_with("/ask") {
+        return "Enter to ask snapshot side question (/btw) · never saved to history";
+    }
+    if c.status.steerable() {
+        "Enter to steer active turn · Alt+Enter or /btw side-ask · Ctrl+I Flight Deck"
+    } else {
+        "Enter to send · Alt+Enter or /btw side-ask · Ctrl+I Flight Deck"
+    }
+}
+
+fn build_inspector_trigger() -> (gtk::Button, gtk::Label) {
+    let inner = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    inner.append(&gtk::Image::from_icon_name(
+        "utilities-system-monitor-symbolic",
+    ));
+    let badge = gtk::Label::new(Some("Deck"));
+    badge.add_css_class("inspector-trigger-badge");
+    inner.append(&badge);
+    let button = gtk::Button::new();
+    button.set_child(Some(&inner));
+    button.add_css_class("flat");
+    button.add_css_class("inspector-trigger");
+    button.set_tooltip_text(Some(
+        "Toggle Flight Deck: /btw Side-Ask, Live Trace & Outline · Ctrl+I",
+    ));
+    button.update_property(&[gtk::accessible::Property::Label("Flight Deck inspector")]);
+    (button, badge)
+}
+
+fn build_workspace_split(main: &gtk::Box, inspector_root: &gtk::Box) -> gtk::Paned {
+    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    split.set_start_child(Some(main));
+    split.set_end_child(Some(inspector_root));
+    split.set_resize_start_child(true);
+    split.set_resize_end_child(false);
+    split.set_shrink_start_child(true);
+    split.set_shrink_end_child(true);
+    split.set_wide_handle(true);
+    split
 }
 
 pub fn build(app: &adw::Application, config: Result<Config, String>) {
@@ -276,6 +325,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     header.pack_start(&palette_trigger);
     let connection = gtk::Label::new(Some("Connecting…"));
     connection.add_css_class("connection-label");
+    let (inspector_toggle, inspector_badge) = build_inspector_trigger();
     let reconnect = icon_button(
         "view-refresh-symbolic",
         "Reconnect and reload server history",
@@ -283,6 +333,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     let delete_chat = icon_button("user-trash-symbolic", "Delete conversation");
     delete_chat.add_css_class("flat");
     delete_chat.set_visible(false);
+    header.pack_end(&inspector_toggle);
     header.pack_end(&reconnect);
     header.pack_end(&delete_chat);
     header.pack_end(&connection);
@@ -561,13 +612,15 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         .build();
     main.append(&footer_column);
 
+    let inspector = InspectorPanel::new();
+    let workspace_split = build_workspace_split(&main, &inspector.root);
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     paned.set_start_child(Some(&sidebar));
-    paned.set_end_child(Some(&main));
+    paned.set_end_child(Some(&workspace_split));
     paned.set_position(285);
     paned.set_resize_start_child(false);
     paned.set_shrink_start_child(false);
-    paned.set_shrink_end_child(false);
+    paned.set_shrink_end_child(true);
     paned.set_wide_handle(true);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -594,11 +647,15 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         triage,
         palette: RefCell::new(None),
         palette_trigger,
+        inspector,
+        inspector_toggle,
+        inspector_badge,
         delete_chat,
         composer_hint,
         sessions,
         selection,
         messages,
+        message_list,
         transcript,
         content,
         title,
@@ -967,13 +1024,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
     let key = gtk::EventControllerKey::new();
     let weak = Rc::downgrade(ui);
     key.connect_key_pressed(move |_, key, _, modifiers| {
-        if (key == gdk::Key::Return || key == gdk::Key::KP_Enter)
-            && !modifiers.contains(gdk::ModifierType::SHIFT_MASK)
-        {
-            let _ = weak.upgrade().map(|ui| ui.submit());
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
+        handle_composer_key(weak.upgrade().as_deref(), key, modifiers)
     });
     ui.editor.add_controller(key);
     connect_model_picker(ui);
@@ -985,6 +1036,26 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
                 .set(adjustment.value() + adjustment.page_size() >= adjustment.upper() - 64.0);
         }
     });
+}
+
+fn handle_composer_key(
+    ui: Option<&Ui>,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> glib::Propagation {
+    if (key != gdk::Key::Return && key != gdk::Key::KP_Enter)
+        || modifiers.contains(gdk::ModifierType::SHIFT_MASK)
+    {
+        return glib::Propagation::Proceed;
+    }
+    if let Some(ui) = ui {
+        if modifiers.contains(gdk::ModifierType::ALT_MASK) {
+            ui.submit_composer_as_side();
+        } else {
+            ui.submit();
+        }
+    }
+    glib::Propagation::Stop
 }
 
 fn connect_workspace(ui: &Rc<Ui>) {
@@ -1008,6 +1079,7 @@ fn connect_workspace(ui: &Rc<Ui>) {
     ui.delete_chat.connect_clicked(move |_| {
         let _ = weak.upgrade().map(|ui| ui.confirm_delete_current());
     });
+    connect_inspector(ui);
 
     let weak_filter = Rc::downgrade(ui);
     let weak_query = Rc::downgrade(ui);
@@ -1043,6 +1115,17 @@ fn connect_workspace(ui: &Rc<Ui>) {
     ui.window.add_controller(shortcuts);
 }
 
+fn connect_inspector(ui: &Rc<Ui>) {
+    let weak = Rc::downgrade(ui);
+    ui.inspector_toggle.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.toggle_inspector());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.inspector.connect(move |action| {
+        let _ = weak.upgrade().map(|ui| ui.handle_inspector_action(action));
+    });
+}
+
 fn shortcut_command(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<char> {
     let clean = modifiers
         & (gdk::ModifierType::CONTROL_MASK
@@ -1062,8 +1145,18 @@ fn handle_window_shortcut(
     let Some(ch) = shortcut_command(key, modifiers) else {
         return glib::Propagation::Proceed;
     };
+    if ch == 'k' {
+        ui.toggle_palette();
+        return glib::Propagation::Stop;
+    }
+    if !dispatch_workspace_shortcut(ui, ch) {
+        return glib::Propagation::Proceed;
+    }
+    glib::Propagation::Stop
+}
+
+fn dispatch_workspace_shortcut(ui: &Rc<Ui>, ch: char) -> bool {
     match ch {
-        'k' => ui.toggle_palette(),
         'n' => {
             ui.close_palette();
             ui.create();
@@ -1071,6 +1164,10 @@ fn handle_window_shortcut(
         'b' => {
             ui.close_palette();
             ui.toggle_sidebar();
+        }
+        'i' => {
+            ui.close_palette();
+            ui.toggle_inspector();
         }
         'f' => {
             ui.close_palette();
@@ -1084,9 +1181,9 @@ fn handle_window_shortcut(
             ui.close_palette();
             ui.reload_or_reconnect();
         }
-        _ => return glib::Propagation::Proceed,
+        _ => return false,
     }
-    glib::Propagation::Stop
+    true
 }
 
 fn visible_selected_position(state: &AppState, visible_indices: &[usize]) -> u32 {
@@ -1192,38 +1289,36 @@ impl Ui {
             self.submit_from_launch();
             return;
         }
-        let reload_pending = self
+        let Some((id, runtime_id, draft)) = self.extract_submit_target() else {
+            return;
+        };
+        match parse_composer_input(&draft) {
+            ComposerIntent::Empty => {}
+            ComposerIntent::SideQuestion(question) => {
+                self.dispatch_composer_side_question(&id, question);
+            }
+            ComposerIntent::Prompt(text) => self.dispatch_prompt_or_steer(id, runtime_id, text),
+        }
+    }
+
+    fn extract_submit_target(&self) -> Option<(String, String, String)> {
+        let state = self.state.borrow();
+        let id = state.selected.as_ref()?;
+        if self.pending_resumes.borrow().contains(id) || !self.send.is_sensitive() {
+            return None;
+        }
+        let c = state.conversations.get(id)?;
+        let runtime_id = c.runtime_id.as_ref()?;
+        Some((id.clone(), runtime_id.clone(), c.draft.clone()))
+    }
+
+    fn dispatch_prompt_or_steer(&self, id: String, runtime_id: String, text: String) {
+        let busy = self
             .state
             .borrow()
-            .selected
-            .as_ref()
-            .is_some_and(|id| self.pending_resumes.borrow().contains(id));
-        if reload_pending || !self.send.is_sensitive() {
-            return;
-        }
-        let request = {
-            let state = self.state.borrow();
-            state.selected.as_ref().and_then(|id| {
-                state.conversations.get(id).and_then(|c| {
-                    c.runtime_id
-                        .as_ref()
-                        .map(|runtime| (id.clone(), runtime.clone(), c.draft.trim().to_string()))
-                })
-            })
-        };
-        let Some((id, runtime_id, text)) = request else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-        let busy = {
-            let state = self.state.borrow();
-            state
-                .conversations
-                .get(&id)
-                .is_some_and(|c| c.status.steerable())
-        };
+            .conversations
+            .get(&id)
+            .is_some_and(|c| c.status.steerable());
         if busy {
             self.steer(id, runtime_id, text);
             return;
@@ -1236,8 +1331,8 @@ impl Ui {
             return;
         }
         self.sequence.set(self.sequence.get() + 1);
-        let mut state = self.state.borrow_mut();
-        if let Some(c) = state.conversations.get_mut(&id) {
+        if let Some(c) = self.state.borrow_mut().conversations.get_mut(&id) {
+            c.clear_turn_reasoning();
             c.record_message(ChatMessage {
                 id: format!("client-{}", self.sequence.get()),
                 role: Role::User,
@@ -1247,7 +1342,6 @@ impl Ui {
             c.status = TurnStatus::Submitting;
             c.activity = "Sending…".into();
         }
-        drop(state);
         self.set_editor_text("");
         self.follow_bottom.set(true);
         self.refresh();
@@ -1283,6 +1377,7 @@ impl Ui {
         }
         self.sequence.set(self.sequence.get() + 1);
         if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
+            c.clear_turn_reasoning();
             c.record_message(ChatMessage {
                 id: format!("client-{}", self.sequence.get()),
                 role: Role::User,
@@ -1294,6 +1389,155 @@ impl Ui {
         }
         self.follow_bottom.set(true);
         self.refresh();
+    }
+
+    fn submit_composer_as_side(&self) {
+        let candidate = {
+            let state = self.state.borrow();
+            let Some(id) = state.selected.clone() else {
+                return;
+            };
+            let Some(c) = state.conversations.get(&id) else {
+                return;
+            };
+            let question = match parse_composer_input(&c.draft) {
+                ComposerIntent::Empty => String::new(),
+                ComposerIntent::SideQuestion(q) | ComposerIntent::Prompt(q) => q,
+            };
+            (id, question)
+        };
+        let (id, question) = candidate;
+        if question.is_empty() {
+            self.open_inspector(InspectorTab::SideAsk);
+            return;
+        }
+        self.dispatch_composer_side_question(&id, question);
+    }
+
+    fn dispatch_composer_side_question(&self, id: &str, question: String) {
+        if !self.submit_side_question(question) {
+            return;
+        }
+        if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
+            c.draft.clear();
+        }
+        self.set_editor_text("");
+        self.refresh();
+    }
+
+    fn submit_side_question(&self, question: String) -> bool {
+        let prepared = {
+            let mut state = self.state.borrow_mut();
+            if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+                return false;
+            }
+            let Some(id) = state.selected.clone() else {
+                return false;
+            };
+            let runtime_id = state
+                .conversations
+                .get(&id)
+                .filter(|c| c.read_only_reason.is_none())
+                .and_then(|c| c.runtime_id.clone());
+            let Some(runtime_id) = runtime_id else {
+                return false;
+            };
+            let client_id = state.allocate_side_id();
+            state.inspector_open = true;
+            state.inspector_tab = InspectorTab::SideAsk;
+            if let Some(c) = state.conversations.get_mut(&id) {
+                c.begin_side_question(client_id, question.clone());
+            }
+            (id, runtime_id, client_id)
+        };
+        let (id, runtime_id, client_id) = prepared;
+        if !self.command(Command::AskSide {
+            runtime_id,
+            client_id,
+            question,
+        }) {
+            let msg = self.state.borrow().notice.clone();
+            if let Some(c) = self.state.borrow_mut().conversations.get_mut(&id) {
+                c.fail_side_question(client_id, msg);
+            }
+        }
+        self.refresh();
+        true
+    }
+
+    fn toggle_inspector(&self) {
+        let (open, tab) = {
+            let mut state = self.state.borrow_mut();
+            state.inspector_open = !state.inspector_open;
+            (state.inspector_open, state.inspector_tab)
+        };
+        self.refresh();
+        if open && tab == InspectorTab::SideAsk {
+            self.inspector.focus_side_entry();
+        } else if !open {
+            self.editor.grab_focus();
+        }
+    }
+
+    fn open_inspector(&self, tab: InspectorTab) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.inspector_open = true;
+            state.inspector_tab = tab;
+        }
+        self.refresh();
+        if tab == InspectorTab::SideAsk {
+            self.inspector.focus_side_entry();
+        }
+    }
+
+    fn handle_inspector_action(&self, action: InspectorAction) {
+        match action {
+            InspectorAction::Close => {
+                self.state.borrow_mut().inspector_open = false;
+                self.refresh();
+                self.editor.grab_focus();
+            }
+            InspectorAction::SelectTab(tab) => {
+                self.state.borrow_mut().inspector_tab = tab;
+                self.refresh();
+            }
+            InspectorAction::AskSide(question) => {
+                let _ = self.submit_side_question(question);
+            }
+            InspectorAction::InsertDraft(snippet) => self.insert_into_composer(&snippet),
+            InspectorAction::JumpToMessage(index) => self.jump_to_message(index),
+        }
+    }
+
+    fn insert_into_composer(&self, snippet: &str) {
+        let clean = snippet.trim();
+        if clean.is_empty() || !self.editor.is_editable() {
+            return;
+        }
+        let combined = {
+            let mut state = self.state.borrow_mut();
+            let current = state.active_draft().trim_end();
+            let next = if current.is_empty() {
+                clean.to_string()
+            } else {
+                format!("{current}\n\n{clean}")
+            };
+            state.set_active_draft(next.clone());
+            next
+        };
+        self.set_editor_text(&combined);
+        self.refresh_controls();
+        self.editor.grab_focus();
+    }
+
+    fn jump_to_message(&self, index: usize) {
+        if (index as u32) >= self.messages.n_items() {
+            return;
+        }
+        self.follow_bottom.set(false);
+        self.message_list
+            .scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
     }
 
     fn toggle_palette(&self) {
@@ -1435,6 +1679,8 @@ impl Ui {
 
     fn run_palette_session_action(self: &Rc<Self>, action: PaletteAction) {
         match action {
+            PaletteAction::ToggleInspector => self.toggle_inspector(),
+            PaletteAction::OpenInspector(tab) => self.open_inspector(tab),
             PaletteAction::ReloadHistory => self.reload_current(),
             PaletteAction::LoadMoreSessions => self.load_more_sessions(),
             PaletteAction::Reconnect => self.trigger_reconnect(),
@@ -1709,31 +1955,100 @@ impl Ui {
         }
     }
 
+    fn apply_inspector(&self, event: &Event) -> bool {
+        let mut state = self.state.borrow_mut();
+        match event {
+            Event::SideStarted {
+                runtime_id,
+                client_id,
+                task_id,
+            } => {
+                with_conversation(&mut state, runtime_id, |c| {
+                    c.bind_side_task(*client_id, task_id.clone())
+                });
+            }
+            Event::SideComplete {
+                runtime_id,
+                task_id,
+                question,
+                text,
+            } => {
+                with_conversation(&mut state, runtime_id, |c| {
+                    c.complete_side_question(task_id, question, text.clone())
+                });
+            }
+            Event::SideFailed {
+                runtime_id,
+                client_id,
+                message,
+            } => {
+                with_conversation(&mut state, runtime_id, |c| {
+                    c.fail_side_question(*client_id, message.clone())
+                });
+            }
+            Event::Reasoning {
+                runtime_id,
+                text,
+                replace,
+            } => {
+                with_conversation(&mut state, runtime_id, |c| {
+                    c.append_reasoning(text, *replace)
+                });
+            }
+            Event::ToolTraceEvent { runtime_id, update } => {
+                with_conversation(&mut state, runtime_id, |c| {
+                    c.apply_tool_event(update.clone())
+                });
+            }
+            Event::Telemetry {
+                runtime_id,
+                telemetry,
+            } => {
+                with_conversation(&mut state, runtime_id, |c| {
+                    c.apply_telemetry(telemetry.clone())
+                });
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn note_connection(&self, connection: ConnectionState) {
+        let connected = connection == ConnectionState::Connected;
+        let selected = {
+            let mut state = self.state.borrow_mut();
+            if !connected {
+                state.disconnect();
+                // A catalog belongs to one connection; keep no stale rows across a reconnect.
+                state.catalog = Catalog::default();
+                self.pending_resumes.borrow_mut().clear();
+            }
+            state.connection = Some(connection);
+            state.creating = false;
+            state.list_loading = connected;
+            state.selected.clone()
+        };
+        if connected {
+            self.command(Command::List { offset: 0 });
+            if let Some(id) = selected {
+                self.resume(&id);
+            }
+        }
+    }
+
+    fn apply_auxiliary(self: &Rc<Self>, event: &Event) -> bool {
+        self.apply_model(event) || self.apply_inspector(event)
+    }
+
     fn apply(self: &Rc<Self>, event: Event) {
-        if self.apply_model(&event) {
+        if self.apply_auxiliary(&event) {
             return;
         }
         let mut state = self.state.borrow_mut();
         match event {
             Event::Connection(connection) => {
-                let connected = connection == ConnectionState::Connected;
-                if !connected {
-                    state.disconnect();
-                    // A catalog belongs to one connection; keep no stale rows across a reconnect.
-                    state.catalog = Catalog::default();
-                    self.pending_resumes.borrow_mut().clear();
-                }
-                state.connection = Some(connection);
-                state.creating = false;
-                state.list_loading = connected;
-                let selected = state.selected.clone();
                 drop(state);
-                if connected {
-                    self.command(Command::List { offset: 0 });
-                    if let Some(id) = selected {
-                        self.resume(&id);
-                    }
-                }
+                self.note_connection(connection);
             }
             Event::Sessions {
                 sessions,
@@ -1782,6 +2097,7 @@ impl Ui {
                 c.model = model.map_or(ModelState::Unknown, ModelState::Confirmed);
                 *self.model_pending.borrow_mut() = None;
                 c.revision += 1;
+                c.inspector_revision += 1;
             }
             Event::History {
                 stored_id,
@@ -2132,6 +2448,31 @@ impl Ui {
         );
         self.refresh_model_trigger(conversation, &state.catalog, writable);
         self.refresh_connection_badge(&state);
+        self.sync_inspector_chrome(&state, conversation, writable);
+    }
+
+    fn sync_inspector_chrome(
+        &self,
+        state: &AppState,
+        conversation: Option<&Conversation>,
+        writable: bool,
+    ) {
+        let badge = conversation
+            .and_then(|c| c.telemetry.header_badge())
+            .unwrap_or_else(|| "Deck".into());
+        self.inspector_badge.set_text(&badge);
+        if state.inspector_open {
+            self.inspector_toggle.add_css_class("inspector-open");
+        } else {
+            self.inspector_toggle.remove_css_class("inspector-open");
+        }
+        self.inspector.sync(
+            state.inspector_open,
+            state.inspector_tab,
+            state.selected.as_deref(),
+            conversation,
+            writable,
+        );
     }
 
     fn refresh_connection_badge(&self, state: &AppState) {
@@ -2755,5 +3096,26 @@ mod tests {
             shortcut_command(gdk::Key::k, gdk::ModifierType::empty()),
             None
         );
+    }
+
+    #[test]
+    fn btw_prefix_surfaces_snapshot_hint_and_allows_side_questions_while_stopping() {
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            selected: Some("chat-1".into()),
+            ..Default::default()
+        };
+        let mut chat = Conversation {
+            runtime_id: Some("rt-1".into()),
+            status: TurnStatus::Stopping,
+            draft: "normal prompt".into(),
+            ..Default::default()
+        };
+        assert!(!can_send_in_conversation(&chat));
+        chat.draft = "/btw what file did we edit?".into();
+        assert!(can_send_in_conversation(&chat));
+        state.conversations.insert("chat-1".into(), chat);
+        assert!(composer_send_sensitive(&state, false));
+        assert!(composer_hint_text(&state).contains("never saved to history"));
     }
 }

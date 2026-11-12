@@ -653,8 +653,488 @@ pub enum Command {
         target: ModelIdentity,
         confirm_expensive: bool,
     },
+    /// Ephemeral side-question over a snapshot of the live conversation (`prompt.btw`).
+    /// Never writes server history, alters turn alternation, or interrupts a busy turn.
+    AskSide {
+        runtime_id: String,
+        client_id: u64,
+        question: String,
+    },
     Reconnect,
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InspectorTab {
+    #[default]
+    SideAsk,
+    Trace,
+    Outline,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerIntent {
+    Empty,
+    Prompt(String),
+    SideQuestion(String),
+}
+
+pub fn parse_composer_input(raw: &str) -> ComposerIntent {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ComposerIntent::Empty;
+    }
+    for prefix in ["/btw", "/ask"] {
+        if let Some(rest) = strip_command_prefix(trimmed, prefix) {
+            return if rest.is_empty() {
+                ComposerIntent::Empty
+            } else {
+                ComposerIntent::SideQuestion(rest.to_string())
+            };
+        }
+    }
+    ComposerIntent::Prompt(trimmed.to_string())
+}
+
+fn strip_command_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let tail = text.strip_prefix(prefix)?;
+    if tail.is_empty() {
+        return Some("");
+    }
+    tail.chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+        .then(|| tail.trim())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideQuestionStatus {
+    Pending,
+    Answered,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SideQuestion {
+    pub client_id: u64,
+    pub task_id: Option<String>,
+    pub question: String,
+    pub answer: String,
+    pub status: SideQuestionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolState {
+    Running,
+    Finished,
+    RiskFlagged(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolTrace {
+    pub tool_id: String,
+    pub name: String,
+    pub detail: String,
+    pub progress_pct: Option<u8>,
+    pub duration_s: Option<f64>,
+    pub state: ToolState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ToolEventUpdate {
+    Started {
+        tool_id: String,
+        name: String,
+        detail: String,
+    },
+    Progress {
+        tool_id: String,
+        name: String,
+        percent: Option<u8>,
+        message: String,
+    },
+    Risk {
+        tool_id: String,
+        name: String,
+        risk: String,
+    },
+    Completed {
+        tool_id: String,
+        name: String,
+        duration_s: Option<f64>,
+        summary: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionTelemetry {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+    pub context_used: Option<u64>,
+    pub context_max: Option<u64>,
+    pub context_percent: Option<u8>,
+    pub tokens_per_sec: Option<f64>,
+    pub avg_latency_s: Option<f64>,
+    pub api_calls: u64,
+    pub compressions: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub cwd: String,
+    pub branch: String,
+}
+
+impl SessionTelemetry {
+    pub fn has_usage(&self) -> bool {
+        self.total_tokens > 0
+            || self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.context_used.is_some()
+            || self.api_calls > 0
+    }
+
+    pub fn merge(&mut self, next: Self) {
+        self.merge_tokens(&next);
+        self.merge_context(&next);
+        self.merge_rates(&next);
+        if !next.cwd.is_empty() {
+            self.cwd = next.cwd;
+        }
+        if !next.branch.is_empty() {
+            self.branch = next.branch;
+        }
+    }
+
+    fn merge_tokens(&mut self, next: &Self) {
+        if next.input_tokens > 0 {
+            self.input_tokens = next.input_tokens;
+        }
+        if next.output_tokens > 0 {
+            self.output_tokens = next.output_tokens;
+        }
+        if next.reasoning_tokens > 0 {
+            self.reasoning_tokens = next.reasoning_tokens;
+        }
+        if next.cache_read_tokens > 0 {
+            self.cache_read_tokens = next.cache_read_tokens;
+        }
+        if next.total_tokens > 0 {
+            self.total_tokens = next.total_tokens;
+        } else if self.total_tokens == 0 {
+            self.total_tokens = self.input_tokens.saturating_add(self.output_tokens);
+        }
+    }
+
+    fn merge_context(&mut self, next: &Self) {
+        if next.context_used.is_some() {
+            self.context_used = next.context_used;
+        }
+        if next.context_max.is_some() {
+            self.context_max = next.context_max;
+        }
+        if next.context_percent.is_some() {
+            self.context_percent = next.context_percent;
+        } else if let (Some(used), Some(max)) = (self.context_used, self.context_max)
+            && max > 0
+        {
+            self.context_percent = Some(percent_u8(used, max));
+        }
+    }
+
+    fn merge_rates(&mut self, next: &Self) {
+        if next.tokens_per_sec.is_some() {
+            self.tokens_per_sec = next.tokens_per_sec;
+        }
+        if next.avg_latency_s.is_some() {
+            self.avg_latency_s = next.avg_latency_s;
+        }
+        if next.api_calls > 0 {
+            self.api_calls = next.api_calls;
+        }
+        if next.compressions.is_some() {
+            self.compressions = next.compressions;
+        }
+        if next.cost_usd.is_some() {
+            self.cost_usd = next.cost_usd;
+        }
+    }
+
+    pub fn context_fraction(&self) -> Option<f64> {
+        if let (Some(used), Some(max)) = (self.context_used, self.context_max)
+            && max > 0
+        {
+            return Some((used as f64 / max as f64).clamp(0.0, 1.0));
+        }
+        self.context_percent
+            .map(|pct| (f64::from(pct) / 100.0).clamp(0.0, 1.0))
+    }
+
+    pub fn context_summary(&self) -> String {
+        if let (Some(used), Some(max)) = (self.context_used, self.context_max)
+            && max > 0
+        {
+            let pct = self
+                .context_percent
+                .unwrap_or_else(|| percent_u8(used, max));
+            return format!(
+                "{} / {} ({pct}%)",
+                format_compact_tokens(used),
+                format_compact_tokens(max)
+            );
+        }
+        if let Some(used) = self.context_used {
+            return format!("{} context tokens", format_compact_tokens(used));
+        }
+        if self.total_tokens > 0 {
+            return format!("{} total tokens", format_compact_tokens(self.total_tokens));
+        }
+        "Waiting for first inference…".into()
+    }
+
+    pub fn header_badge(&self) -> Option<String> {
+        if let Some(pct) = self.context_percent {
+            return Some(format!("{pct}% ctx"));
+        }
+        if self.total_tokens > 0 {
+            return Some(format!("{} tok", format_compact_tokens(self.total_tokens)));
+        }
+        None
+    }
+}
+
+fn percent_u8(used: u64, max: u64) -> u8 {
+    if max == 0 {
+        return 0;
+    }
+    ((used.saturating_mul(100)) / max).min(100) as u8
+}
+
+pub fn format_compact_tokens(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
+pub fn parse_telemetry_payload(value: &serde_json::Value) -> Option<SessionTelemetry> {
+    let core = value
+        .get("usage")
+        .filter(|nested| nested.is_object())
+        .unwrap_or(value);
+    if !core.is_object() {
+        return None;
+    }
+    let mut out = extract_token_counters(core, value);
+    extract_context_counters(&mut out, core, value);
+    extract_rate_counters(&mut out, core, value);
+    out.has_usage().then_some(out)
+}
+
+pub fn parse_live_info_telemetry(result: &serde_json::Value) -> Option<SessionTelemetry> {
+    let info = result.get("info").filter(|v| v.is_object())?;
+    let mut out = info
+        .get("usage")
+        .and_then(parse_telemetry_payload)
+        .unwrap_or_default();
+    out.cwd = json_str(info, &["cwd"]).unwrap_or_default();
+    out.branch = json_str(info, &["branch", "git_branch"]).unwrap_or_default();
+    (out.has_usage() || !out.cwd.is_empty() || !out.branch.is_empty()).then_some(out)
+}
+
+fn extract_token_counters(core: &serde_json::Value, outer: &serde_json::Value) -> SessionTelemetry {
+    let input = first_u64(
+        core,
+        outer,
+        &["input", "input_tokens", "prompt_tokens", "prompt"],
+    )
+    .unwrap_or(0);
+    let output = first_u64(
+        core,
+        outer,
+        &["output", "output_tokens", "completion_tokens", "completion"],
+    )
+    .unwrap_or(0);
+    let total = first_u64(core, outer, &["total", "total_tokens"])
+        .unwrap_or_else(|| input.saturating_add(output));
+    SessionTelemetry {
+        input_tokens: input,
+        output_tokens: output,
+        reasoning_tokens: first_u64(core, outer, &["reasoning", "reasoning_tokens"]).unwrap_or(0),
+        cache_read_tokens: first_u64(core, outer, &["cache_read", "cache_read_tokens"])
+            .unwrap_or(0),
+        total_tokens: total,
+        ..Default::default()
+    }
+}
+
+fn extract_context_counters(
+    out: &mut SessionTelemetry,
+    core: &serde_json::Value,
+    outer: &serde_json::Value,
+) {
+    out.context_used = first_u64(
+        core,
+        outer,
+        &["context_used", "context_tokens", "last_prompt_tokens"],
+    );
+    out.context_max = first_u64(
+        core,
+        outer,
+        &["context_max", "context_length", "config_context_length"],
+    )
+    .filter(|&max| max > 0);
+    out.context_percent = first_u64(core, outer, &["context_percent"])
+        .map(|pct| pct.min(100) as u8)
+        .or_else(|| {
+            out.context_used
+                .zip(out.context_max)
+                .map(|(used, max)| percent_u8(used, max))
+        });
+}
+
+fn extract_rate_counters(
+    out: &mut SessionTelemetry,
+    core: &serde_json::Value,
+    outer: &serde_json::Value,
+) {
+    out.tokens_per_sec = first_f64(core, outer, &["avg_tps", "tokens_per_s"]);
+    out.avg_latency_s = first_f64(core, outer, &["avg_latency_s"]);
+    out.api_calls = first_u64(core, outer, &["calls", "api_calls"]).unwrap_or(0);
+    out.compressions = first_u64(core, outer, &["compressions", "compression_count"]);
+    out.cost_usd = first_f64(core, outer, &["cost_usd", "actual_cost_usd"]);
+}
+
+fn first_u64(
+    primary: &serde_json::Value,
+    fallback: &serde_json::Value,
+    keys: &[&str],
+) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        primary
+            .get(*key)
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| fallback.get(*key).and_then(serde_json::Value::as_u64))
+    })
+}
+
+fn first_f64(
+    primary: &serde_json::Value,
+    fallback: &serde_json::Value,
+    keys: &[&str],
+) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        primary
+            .get(*key)
+            .and_then(serde_json::Value::as_f64)
+            .or_else(|| fallback.get(*key).and_then(serde_json::Value::as_f64))
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    })
+}
+
+fn json_str(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlineEntry {
+    pub turn_number: usize,
+    pub message_index: usize,
+    pub title: String,
+    pub meta: String,
+    pub code_blocks: usize,
+}
+
+pub fn build_outline(messages: &[ChatMessage]) -> Vec<OutlineEntry> {
+    let user_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| (msg.role == Role::User).then_some(idx))
+        .collect();
+    user_positions
+        .iter()
+        .enumerate()
+        .map(|(turn_idx, &start)| {
+            let end = user_positions
+                .get(turn_idx + 1)
+                .copied()
+                .unwrap_or(messages.len());
+            outline_for_slice(turn_idx + 1, start, &messages[start..end])
+        })
+        .collect()
+}
+
+fn outline_for_slice(
+    turn_number: usize,
+    message_index: usize,
+    slice: &[ChatMessage],
+) -> OutlineEntry {
+    let title = slice
+        .first()
+        .map(|m| derive_launch_title(&m.text))
+        .unwrap_or_else(|| format!("Turn {turn_number}"));
+    let mut tools = 0usize;
+    let mut code_blocks = 0usize;
+    let mut replied = false;
+    for msg in slice.iter().skip(1) {
+        if msg.role == Role::Tool {
+            tools += 1;
+        } else if msg.role == Role::Assistant {
+            replied = true;
+            code_blocks += count_fenced_blocks(&msg.text);
+        }
+    }
+    OutlineEntry {
+        turn_number,
+        message_index,
+        title,
+        meta: format_outline_meta(replied, tools, code_blocks),
+        code_blocks,
+    }
+}
+
+fn count_fenced_blocks(markdown: &str) -> usize {
+    let fences = markdown
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count();
+    fences / 2
+}
+
+fn format_outline_meta(replied: bool, tools: usize, code_blocks: usize) -> String {
+    let mut parts = Vec::new();
+    if tools > 0 {
+        parts.push(if tools == 1 {
+            "1 tool".into()
+        } else {
+            format!("{tools} tools")
+        });
+    }
+    if code_blocks > 0 {
+        parts.push(if code_blocks == 1 {
+            "1 code block".into()
+        } else {
+            format!("{code_blocks} code blocks")
+        });
+    }
+    if parts.is_empty() {
+        parts.push(if replied {
+            "replied".into()
+        } else {
+            "awaiting reply".into()
+        });
+    }
+    parts.join(" · ")
 }
 
 #[derive(Clone, Debug)]
@@ -761,12 +1241,51 @@ pub enum Event {
         runtime_id: String,
         model: String,
     },
+    /// Ephemeral `/btw` side-question accepted by the gateway (`prompt.btw`).
+    SideStarted {
+        runtime_id: String,
+        client_id: u64,
+        task_id: String,
+    },
+    /// Ephemeral `/btw` side-question answered (`btw.complete`).
+    SideComplete {
+        runtime_id: String,
+        task_id: String,
+        question: String,
+        text: String,
+    },
+    /// Ephemeral `/btw` side-question rejected or timed out without affecting the main turn.
+    SideFailed {
+        runtime_id: String,
+        client_id: u64,
+        message: String,
+    },
+    /// Streamed or completed model reasoning (`reasoning.delta`, `thinking.delta`, `reasoning.available`).
+    Reasoning {
+        runtime_id: String,
+        text: String,
+        replace: bool,
+    },
+    /// Live tool execution progress (`tool.start`, `tool.progress`, `tool.output_risk`, `tool.complete`).
+    ToolTraceEvent {
+        runtime_id: String,
+        update: ToolEventUpdate,
+    },
+    /// Session token, throughput, context-window, and workspace telemetry.
+    Telemetry {
+        runtime_id: String,
+        telemetry: SessionTelemetry,
+    },
     Error {
         operation: String,
         session_id: Option<String>,
         message: String,
     },
 }
+
+const MAX_REASONING_CHARS: usize = 24_000;
+const MAX_TOOL_TRACES: usize = 80;
+const MAX_SIDE_QUESTIONS: usize = 40;
 
 #[derive(Default)]
 pub struct Conversation {
@@ -781,7 +1300,12 @@ pub struct Conversation {
     pub history_before: usize,
     pub history_loading: bool,
     pub revision: u64,
+    pub inspector_revision: u64,
     pub model: ModelState,
+    pub reasoning: String,
+    pub tools: Vec<ToolTrace>,
+    pub side_questions: Vec<SideQuestion>,
+    pub telemetry: SessionTelemetry,
 }
 
 impl Conversation {
@@ -790,6 +1314,7 @@ impl Conversation {
         // Display rows include optimistic and streamed messages. They must not
         // move the absolute server-row cursor used by oldest-first paging.
         self.revision += 1;
+        self.inspector_revision += 1;
     }
 
     pub fn append_delta(&mut self, message_id: String, delta: String) {
@@ -823,6 +1348,7 @@ impl Conversation {
                 *old = message;
             }
             self.revision += 1;
+            self.inspector_revision += 1;
         } else if !message.text.is_empty() {
             self.record_message(message);
         }
@@ -849,6 +1375,7 @@ impl Conversation {
         self.history_before = next_before;
         self.messages.splice(0..0, messages);
         self.revision += 1;
+        self.inspector_revision += 1;
     }
 
     pub fn submit_acknowledged(&mut self) {
@@ -1029,6 +1556,278 @@ impl Conversation {
         self.model = next;
         self.revision += 1;
     }
+
+    pub fn clear_turn_reasoning(&mut self) {
+        if !self.reasoning.is_empty() {
+            self.reasoning.clear();
+            self.inspector_revision += 1;
+        }
+    }
+
+    pub fn append_reasoning(&mut self, text: &str, replace: bool) {
+        if text.is_empty() && !replace {
+            return;
+        }
+        if replace {
+            self.reasoning = text.to_string();
+        } else {
+            self.reasoning.push_str(text);
+        }
+        trim_front_chars(&mut self.reasoning, MAX_REASONING_CHARS);
+        self.inspector_revision += 1;
+    }
+
+    pub fn apply_tool_event(&mut self, update: ToolEventUpdate) {
+        upsert_tool_trace(&mut self.tools, update);
+        if self.tools.len() > MAX_TOOL_TRACES {
+            let overflow = self.tools.len() - MAX_TOOL_TRACES;
+            self.tools.drain(0..overflow);
+        }
+        self.inspector_revision += 1;
+    }
+
+    pub fn apply_telemetry(&mut self, incoming: SessionTelemetry) {
+        self.telemetry.merge(incoming);
+        self.inspector_revision += 1;
+    }
+
+    pub fn begin_side_question(&mut self, client_id: u64, question: String) {
+        self.side_questions.push(SideQuestion {
+            client_id,
+            task_id: None,
+            question,
+            answer: String::new(),
+            status: SideQuestionStatus::Pending,
+        });
+        if self.side_questions.len() > MAX_SIDE_QUESTIONS {
+            let overflow = self.side_questions.len() - MAX_SIDE_QUESTIONS;
+            self.side_questions.drain(0..overflow);
+        }
+        self.inspector_revision += 1;
+    }
+
+    pub fn bind_side_task(&mut self, client_id: u64, task_id: String) {
+        if let Some(entry) = self
+            .side_questions
+            .iter_mut()
+            .find(|q| q.client_id == client_id)
+        {
+            entry.task_id = Some(task_id);
+            self.inspector_revision += 1;
+        }
+    }
+
+    pub fn complete_side_question(&mut self, task_id: &str, question: &str, text: String) {
+        let status = side_answer_status(&text);
+        if let Some(idx) = find_side_question_index(&self.side_questions, task_id, question) {
+            let entry = &mut self.side_questions[idx];
+            if !task_id.is_empty() {
+                entry.task_id = Some(task_id.to_string());
+            }
+            entry.answer = text;
+            entry.status = status;
+        } else {
+            self.push_unsolicited_side(task_id, question, text, status);
+        }
+        self.inspector_revision += 1;
+    }
+
+    fn push_unsolicited_side(
+        &mut self,
+        task_id: &str,
+        question: &str,
+        answer: String,
+        status: SideQuestionStatus,
+    ) {
+        self.side_questions.push(SideQuestion {
+            client_id: 0,
+            task_id: (!task_id.is_empty()).then(|| task_id.to_string()),
+            question: if question.is_empty() {
+                "Side question".into()
+            } else {
+                question.to_string()
+            },
+            answer,
+            status,
+        });
+        if self.side_questions.len() > MAX_SIDE_QUESTIONS {
+            self.side_questions.remove(0);
+        }
+    }
+
+    pub fn fail_side_question(&mut self, client_id: u64, message: String) {
+        if let Some(entry) = self
+            .side_questions
+            .iter_mut()
+            .find(|q| q.client_id == client_id && q.status == SideQuestionStatus::Pending)
+        {
+            entry.answer = message;
+            entry.status = SideQuestionStatus::Failed;
+            self.inspector_revision += 1;
+        }
+    }
+
+    pub fn fail_pending_side_questions(&mut self, message: &str) {
+        let mut changed = false;
+        for entry in &mut self.side_questions {
+            if entry.status == SideQuestionStatus::Pending {
+                entry.answer = message.to_string();
+                entry.status = SideQuestionStatus::Failed;
+                changed = true;
+            }
+        }
+        if changed {
+            self.inspector_revision += 1;
+        }
+    }
+}
+
+fn trim_front_chars(buffer: &mut String, max_chars: usize) {
+    let total = buffer.chars().count();
+    if total <= max_chars {
+        return;
+    }
+    let drop_count = total - max_chars;
+    if let Some((byte_idx, _)) = buffer.char_indices().nth(drop_count) {
+        buffer.drain(..byte_idx);
+    }
+}
+
+fn side_answer_status(text: &str) -> SideQuestionStatus {
+    if text.trim_start().starts_with("error:") {
+        SideQuestionStatus::Failed
+    } else {
+        SideQuestionStatus::Answered
+    }
+}
+
+fn find_side_question_index(
+    items: &[SideQuestion],
+    task_id: &str,
+    question: &str,
+) -> Option<usize> {
+    if !task_id.is_empty()
+        && let Some(idx) = items
+            .iter()
+            .rposition(|q| q.task_id.as_deref() == Some(task_id))
+    {
+        return Some(idx);
+    }
+    items.iter().position(|q| {
+        q.status == SideQuestionStatus::Pending
+            && q.task_id.is_none()
+            && (question.is_empty() || q.question == question)
+    })
+}
+
+fn upsert_tool_trace(tools: &mut Vec<ToolTrace>, update: ToolEventUpdate) {
+    match update {
+        ToolEventUpdate::Started {
+            tool_id,
+            name,
+            detail,
+        } => upsert_started_tool(tools, tool_id, name, detail),
+        ToolEventUpdate::Progress {
+            tool_id,
+            name,
+            percent,
+            message,
+        } => {
+            let entry = ensure_tool_entry(tools, &tool_id, &name);
+            entry.progress_pct = percent.or(entry.progress_pct);
+            if !message.is_empty() {
+                entry.detail = message;
+            }
+        }
+        ToolEventUpdate::Risk {
+            tool_id,
+            name,
+            risk,
+        } => {
+            let entry = ensure_tool_entry(tools, &tool_id, &name);
+            entry.state = ToolState::RiskFlagged(risk);
+        }
+        ToolEventUpdate::Completed {
+            tool_id,
+            name,
+            duration_s,
+            summary,
+        } => finish_tool_entry(tools, &tool_id, &name, duration_s, summary),
+    }
+}
+
+fn upsert_started_tool(tools: &mut Vec<ToolTrace>, tool_id: String, name: String, detail: String) {
+    if !tool_id.is_empty()
+        && let Some(existing) = tools.iter_mut().rev().find(|t| t.tool_id == tool_id)
+    {
+        if !name.is_empty() {
+            existing.name = name;
+        }
+        if !detail.is_empty() {
+            existing.detail = detail;
+        }
+        return;
+    }
+    tools.push(ToolTrace {
+        tool_id,
+        name: if name.is_empty() { "tool".into() } else { name },
+        detail,
+        progress_pct: None,
+        duration_s: None,
+        state: ToolState::Running,
+    });
+}
+
+fn finish_tool_entry(
+    tools: &mut Vec<ToolTrace>,
+    tool_id: &str,
+    name: &str,
+    duration_s: Option<f64>,
+    summary: String,
+) {
+    let entry = ensure_tool_entry(tools, tool_id, name);
+    entry.duration_s = duration_s.or(entry.duration_s);
+    entry.progress_pct = Some(100);
+    if !summary.is_empty() {
+        entry.detail = summary;
+    }
+    if !matches!(entry.state, ToolState::RiskFlagged(_)) {
+        entry.state = ToolState::Finished;
+    }
+}
+
+fn ensure_tool_entry<'a>(
+    tools: &'a mut Vec<ToolTrace>,
+    tool_id: &str,
+    name: &str,
+) -> &'a mut ToolTrace {
+    let pos = if !tool_id.is_empty() {
+        tools.iter().rposition(|t| t.tool_id == tool_id)
+    } else {
+        tools
+            .iter()
+            .rposition(|t| t.state == ToolState::Running && (name.is_empty() || t.name == name))
+    };
+    if let Some(idx) = pos {
+        let entry = &mut tools[idx];
+        if !name.is_empty() && entry.name == "tool" {
+            entry.name = name.to_string();
+        }
+        return entry;
+    }
+    tools.push(ToolTrace {
+        tool_id: tool_id.to_string(),
+        name: if name.is_empty() {
+            "tool".into()
+        } else {
+            name.to_string()
+        },
+        detail: String::new(),
+        progress_pct: None,
+        duration_s: None,
+        state: ToolState::Running,
+    });
+    tools.last_mut().expect("inserted tool trace")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1036,6 +1835,8 @@ pub enum PaletteAction {
     NewChat,
     SwitchModel,
     ToggleSidebar,
+    ToggleInspector,
+    OpenInspector(InspectorTab),
     FocusFilter,
     FilterSessions(SessionFilter),
     ReloadHistory,
@@ -1097,6 +1898,9 @@ pub struct AppState {
     pub session_query: String,
     pub launch_draft: String,
     pub pending_launch: Option<String>,
+    pub inspector_open: bool,
+    pub inspector_tab: InspectorTab,
+    pub next_side_id: u64,
 }
 
 impl AppState {
@@ -1239,6 +2043,11 @@ impl AppState {
         }
     }
 
+    pub fn allocate_side_id(&mut self) -> u64 {
+        self.next_side_id = self.next_side_id.saturating_add(1);
+        self.next_side_id
+    }
+
     pub fn disconnect(&mut self) {
         self.cancel_pending_launch();
         for conversation in self.conversations.values_mut() {
@@ -1248,6 +2057,9 @@ impl AppState {
                 conversation.interaction = None;
                 conversation.revision += 1;
             }
+            conversation.fail_pending_side_questions(
+                "Connection lost before Hermes answered this side question.",
+            );
             conversation.runtime_id = None;
             conversation.history_loading = false;
         }
@@ -1306,8 +2118,51 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
             "Ctrl+M",
         ));
     }
+    out.extend(palette_inspector_commands(state, writable));
     out.extend(palette_filter_commands(state));
     out.extend(palette_utility_commands(state, connected));
+    out
+}
+
+fn palette_inspector_commands(state: &AppState, writable: bool) -> Vec<PaletteEntry> {
+    let mut out = Vec::new();
+    if writable {
+        out.push(PaletteEntry::command(
+            PaletteAction::OpenInspector(InspectorTab::SideAsk),
+            "dialog-question-symbolic",
+            "Ask a side question (/btw)…",
+            "Query a snapshot of this chat without polluting history",
+            "Alt+Enter",
+        ));
+    }
+    let mut toggle = PaletteEntry::command(
+        PaletteAction::ToggleInspector,
+        "utilities-system-monitor-symbolic",
+        "Toggle Flight Deck inspector",
+        "Show or hide side-ask, live trace, and conversation map",
+        "Ctrl+I",
+    );
+    toggle.active = state.inspector_open;
+    if toggle.active {
+        toggle.badge = "OPEN".into();
+    }
+    out.push(toggle);
+    if state.selected.is_some() {
+        out.push(PaletteEntry::command(
+            PaletteAction::OpenInspector(InspectorTab::Trace),
+            "utilities-terminal-symbolic",
+            "Inspect live reasoning & tool trace",
+            "View model chain-of-thought, tool timings, and context gauge",
+            "",
+        ));
+        out.push(PaletteEntry::command(
+            PaletteAction::OpenInspector(InspectorTab::Outline),
+            "view-list-bullet-symbolic",
+            "Jump to turn in conversation outline",
+            "Navigate prompts and code blocks non-linearly",
+            "",
+        ));
+    }
     out
 }
 
@@ -2201,5 +3056,176 @@ mod tests {
 
         let model = build_palette_entries(&state, "switch model", 1_700_000_600);
         assert_eq!(model[0].action, PaletteAction::SwitchModel);
+
+        let btw = build_palette_entries(&state, "btw", 1_700_000_600);
+        assert_eq!(
+            btw[0].action,
+            PaletteAction::OpenInspector(InspectorTab::SideAsk)
+        );
+    }
+
+    #[test]
+    fn composer_input_distinguishes_btw_side_questions_from_normal_prompts() {
+        assert_eq!(parse_composer_input("   \n "), ComposerIntent::Empty);
+        assert_eq!(parse_composer_input("/btw"), ComposerIntent::Empty);
+        assert_eq!(parse_composer_input("/ask   "), ComposerIntent::Empty);
+        assert_eq!(
+            parse_composer_input("/btw what port did we pick?"),
+            ComposerIntent::SideQuestion("what port did we pick?".into())
+        );
+        assert_eq!(
+            parse_composer_input("  /ask\nexplain this stack frame  "),
+            ComposerIntent::SideQuestion("explain this stack frame".into())
+        );
+        assert_eq!(
+            parse_composer_input("/btwitter is not a prefix"),
+            ComposerIntent::Prompt("/btwitter is not a prefix".into())
+        );
+        assert_eq!(
+            parse_composer_input("normal prompt"),
+            ComposerIntent::Prompt("normal prompt".into())
+        );
+    }
+
+    #[test]
+    fn telemetry_parses_v023_usage_and_live_session_info_cleanly() {
+        let usage = serde_json::json!({
+            "usage": {
+                "input": 14_200,
+                "output": 850,
+                "reasoning": 320,
+                "cache_read": 11_000,
+                "total": 15_050,
+                "calls": 3,
+                "compressions": 1,
+                "context_used": 14_500,
+                "context_max": 128_000,
+                "avg_tps": 64.5,
+                "avg_latency_s": 1.25,
+                "cost_usd": 0.042
+            }
+        });
+        let parsed = parse_telemetry_payload(&usage).expect("telemetry");
+        assert_eq!(parsed.input_tokens, 14_200);
+        assert_eq!(parsed.output_tokens, 850);
+        assert_eq!(parsed.reasoning_tokens, 320);
+        assert_eq!(parsed.cache_read_tokens, 11_000);
+        assert_eq!(parsed.context_percent, Some(11));
+        assert_eq!(parsed.header_badge().as_deref(), Some("11% ctx"));
+        assert_eq!(parsed.context_summary(), "14.5k / 128.0k (11%)");
+        assert!(parsed.context_fraction().unwrap() > 0.10);
+
+        let resume = serde_json::json!({
+            "info": {
+                "cwd": "/srv/hermes/workspace",
+                "branch": "feat/flight-deck",
+                "usage": { "input": 500, "output": 100 }
+            }
+        });
+        let mut live = parse_live_info_telemetry(&resume).expect("live info");
+        assert_eq!(live.cwd, "/srv/hermes/workspace");
+        assert_eq!(live.branch, "feat/flight-deck");
+        assert_eq!(live.header_badge().as_deref(), Some("600 tok"));
+        live.merge(parsed);
+        assert_eq!(live.cwd, "/srv/hermes/workspace");
+        assert_eq!(live.context_percent, Some(11));
+        assert_eq!(format_compact_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn side_question_lifecycle_handles_fast_completion_errors_and_disconnect() {
+        let mut state = AppState::default();
+        let id1 = state.allocate_side_id();
+        let id2 = state.allocate_side_id();
+        let id3 = state.allocate_side_id();
+        let mut chat = Conversation {
+            runtime_id: Some("rt-1".into()),
+            status: TurnStatus::Streaming,
+            ..Default::default()
+        };
+        let rev0 = chat.revision;
+        chat.begin_side_question(id1, "What word?".into());
+        assert_eq!(chat.revision, rev0, "side channel never diffs transcript");
+        // Fast completion arriving before SideStarted binds task_id:
+        chat.complete_side_question("btw_fast", "What word?", "The word is **lattice**.".into());
+        assert_eq!(chat.side_questions[0].status, SideQuestionStatus::Answered);
+        assert_eq!(chat.side_questions[0].task_id.as_deref(), Some("btw_fast"));
+
+        // Normal bind + gateway side-agent error prefix:
+        chat.begin_side_question(id2, "Trigger side error".into());
+        chat.bind_side_task(id2, "btw_err".into());
+        chat.complete_side_question("btw_err", "Trigger side error", "error: rate limit".into());
+        assert_eq!(chat.side_questions[1].status, SideQuestionStatus::Failed);
+
+        // Pending question settled cleanly on disconnect while main turn stays independent:
+        chat.begin_side_question(id3, "Still running".into());
+        state.conversations.insert("s1".into(), chat);
+        state.disconnect();
+        let settled = &state.conversations["s1"];
+        assert_eq!(settled.side_questions[2].status, SideQuestionStatus::Failed);
+        assert!(settled.side_questions[2].answer.contains("Connection lost"));
+    }
+
+    #[test]
+    fn reasoning_tool_trace_and_outline_track_conversation_milestones() {
+        let mut chat = Conversation::default();
+        chat.append_reasoning("Step 1. ", false);
+        chat.append_reasoning("Step 2.", false);
+        assert_eq!(chat.reasoning, "Step 1. Step 2.");
+        chat.append_reasoning("Replaced block", true);
+        assert_eq!(chat.reasoning, "Replaced block");
+        chat.clear_turn_reasoning();
+        assert!(chat.reasoning.is_empty());
+
+        chat.apply_tool_event(ToolEventUpdate::Started {
+            tool_id: "call-1".into(),
+            name: "terminal".into(),
+            detail: "cargo test".into(),
+        });
+        chat.apply_tool_event(ToolEventUpdate::Progress {
+            tool_id: "call-1".into(),
+            name: "terminal".into(),
+            percent: Some(50),
+            message: "compiling".into(),
+        });
+        chat.apply_tool_event(ToolEventUpdate::Risk {
+            tool_id: "call-1".into(),
+            name: "terminal".into(),
+            risk: "high entropy output".into(),
+        });
+        chat.apply_tool_event(ToolEventUpdate::Completed {
+            tool_id: "call-1".into(),
+            name: "terminal".into(),
+            duration_s: Some(1.4),
+            summary: "ok (53 passed)".into(),
+        });
+        assert_eq!(chat.tools.len(), 1);
+        assert_eq!(
+            chat.tools[0].state,
+            ToolState::RiskFlagged("high entropy output".into())
+        );
+        assert_eq!(chat.tools[0].duration_s, Some(1.4));
+
+        chat.record_message(ChatMessage {
+            id: "u1".into(),
+            role: Role::User,
+            text: "Write a Rust snippet".into(),
+        });
+        chat.record_message(ChatMessage {
+            id: "t1".into(),
+            role: Role::Tool,
+            text: "Used terminal".into(),
+        });
+        chat.record_message(ChatMessage {
+            id: "a1".into(),
+            role: Role::Assistant,
+            text: "Here:\n```rust\nfn main() {}\n```\nDone.".into(),
+        });
+        let outline = build_outline(&chat.messages);
+        assert_eq!(outline.len(), 1);
+        assert_eq!(outline[0].turn_number, 1);
+        assert_eq!(outline[0].message_index, 0);
+        assert_eq!(outline[0].code_blocks, 1);
+        assert_eq!(outline[0].meta, "1 tool · 1 code block");
     }
 }

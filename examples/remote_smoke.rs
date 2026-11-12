@@ -9,6 +9,7 @@ const WORD: &str = "lattice";
 const OTHER: &str = "marble";
 const TURN_ONE: &str = "Reply with exactly the single word lattice. Do not use tools.";
 const TURN_TWO: &str = "What single word did I just ask you to reply with? Answer with that word only. Do not use tools.";
+const SIDE_PROMPT: &str = "What single word did we repeat in this chat? Reply with that word only.";
 const TURN_OTHER: &str = "Reply with exactly the single word marble. Do not use tools.";
 
 struct Harness {
@@ -77,13 +78,32 @@ fn expect_words(first: &str, second: &str, other: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, String> {
-    if TURN_TWO.to_ascii_lowercase().contains(WORD)
-        || TURN_OTHER.to_ascii_lowercase().contains(WORD)
-        || OTHER.to_ascii_lowercase().contains(WORD)
-    {
+fn check_prompt_isolation() -> Result<(), String> {
+    let leak = [TURN_TWO, SIDE_PROMPT, TURN_OTHER, OTHER]
+        .iter()
+        .any(|s| s.to_ascii_lowercase().contains(WORD));
+    if leak {
         return Err("later prompts must not contain the first chat's word".into());
     }
+    Ok(())
+}
+
+fn verify_reconnect_history(
+    harness: &mut Harness,
+    first_id: &str,
+    second_id: &str,
+) -> Result<(), String> {
+    harness.send(Command::Reconnect)?;
+    wait_connected(harness, Duration::from_secs(40))?;
+    let cold_first = resume(harness, first_id)?;
+    let cold_second = resume(harness, second_id)?;
+    assert_context(&cold_first.1)?;
+    assert_side_unpersisted(&cold_first.1)?;
+    assert_separate(&cold_second.1, "cold resume of the second chat")
+}
+
+fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, String> {
+    check_prompt_isolation()?;
     wait_connected(harness, Duration::from_secs(40))?;
     let first = create(harness, "hn-smoke-a")?;
     created.push(first.0.clone());
@@ -93,21 +113,85 @@ fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, Strin
     let second_reply = submit(harness, &first.1, TURN_TWO)?.0;
     let other_reply = submit(harness, &second.1, TURN_OTHER)?.0;
     expect_words(&first_reply, &second_reply, &other_reply)?;
+    prove_side_question(harness, &first.1)?;
     let saved = resume(harness, &second.0)?;
     assert_separate(&saved.1, "the second chat")?;
     let resumed = resume(harness, &first.0)?;
     assert_context(&resumed.1)?;
-    harness.send(Command::Reconnect)?;
-    wait_connected(harness, Duration::from_secs(40))?;
-    let cold_first = resume(harness, &first.0)?;
-    let cold_second = resume(harness, &second.0)?;
-    assert_context(&cold_first.1)?;
-    assert_separate(&cold_second.1, "cold resume of the second chat")?;
+    assert_side_unpersisted(&resumed.1)?;
+    verify_reconnect_history(harness, &first.0, &second.0)?;
 
     let switched = prove_model_switch(harness, created)?;
     Ok(format!(
-        "connected created=3 turn1={WORD} turn2_context=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
+        "connected created=3 turn1={WORD} turn2_context=true btw_snapshot=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
     ))
+}
+
+fn note_side(
+    event: Event,
+    runtime_id: &str,
+    answer: &mut Option<String>,
+) -> Result<Option<Event>, String> {
+    match event {
+        Event::SideStarted { runtime_id: id, .. } if id == runtime_id => Ok(None),
+        Event::SideComplete {
+            runtime_id: id,
+            text,
+            ..
+        } if id == runtime_id => {
+            *answer = Some(text);
+            Ok(None)
+        }
+        Event::SideFailed {
+            runtime_id: id,
+            message,
+            ..
+        } if id == runtime_id => Err(format!("btw side question failed: {message}")),
+        Event::Connection(ConnectionState::Disconnected(message)) => {
+            Err(format!("disconnected during btw: {message}"))
+        }
+        event => Ok(Some(event)),
+    }
+}
+
+fn prove_side_question(harness: &mut Harness, runtime_id: &str) -> Result<(), String> {
+    harness.send(Command::AskSide {
+        runtime_id: runtime_id.into(),
+        client_id: 1,
+        question: SIDE_PROMPT.into(),
+    })?;
+    let start = Instant::now();
+    let mut answer = None;
+    while start.elapsed() < Duration::from_secs(90) {
+        for event in harness.drain() {
+            if let Some(event) = note_side(event, runtime_id, &mut answer)? {
+                harness.events.push(event);
+            }
+        }
+        if let Some(text) = answer {
+            return verify_side_word(&text);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("btw side question timed out".into())
+}
+
+fn verify_side_word(text: &str) -> Result<(), String> {
+    if text.to_ascii_lowercase().contains(WORD) {
+        Ok(())
+    } else {
+        Err(format!(
+            "btw side answer missed session context (len {})",
+            text.trim().len()
+        ))
+    }
+}
+
+fn assert_side_unpersisted(messages: &[ChatMessage]) -> Result<(), String> {
+    if messages.iter().any(|m| m.text.contains(SIDE_PROMPT)) {
+        return Err("ephemeral btw question leaked into persisted history".into());
+    }
+    Ok(())
 }
 
 fn confirm_switch(
@@ -350,6 +434,9 @@ fn note_submit(
             && matches!(operation.as_str(), "submit" | "gateway") =>
         {
             Err(message)
+        }
+        Event::Connection(ConnectionState::Disconnected(message)) => {
+            Err(format!("disconnected during turn: {message}"))
         }
         event => Ok(Some(event)),
     }

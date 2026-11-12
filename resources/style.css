@@ -87,3 +87,41 @@
 .md-code-copy { font-size: 12px; }
 .md-table { border-spacing: 0; }
 .interaction-scroll { min-height: 0; }
+.inspector-trigger { padding: 4px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.05); }
+.inspector-trigger:hover { background: alpha(@window_fg_color, 0.10); }
+.inspector-trigger.inspector-open { background: alpha(@accent_bg_color, 0.24); color: @accent_color; }
+.inspector-trigger-badge { font-family: monospace; font-size: 11px; font-weight: 700; }
+.flight-deck { background: @sidebar_bg_color; border-left: 1px solid alpha(@window_fg_color, 0.08); }
+.flight-deck-kicker { font-size: 11px; font-weight: 800; letter-spacing: 1.4px; opacity: 0.65; }
+.flight-deck-branch { font-family: monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 6px; background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.flight-tab-btn { font-size: 11px; font-weight: 700; min-height: 26px; }
+.side-ask-explainer { font-size: 11px; opacity: 0.62; line-height: 1.35; }
+.inspector-card { background: alpha(@window_fg_color, 0.045); border: 1px solid alpha(@window_fg_color, 0.08); border-radius: 11px; padding: 11px 12px; }
+.inspector-section-title { font-size: 13px; font-weight: 700; }
+.inspector-kicker { font-size: 10px; font-weight: 800; letter-spacing: 1px; opacity: 0.62; }
+.side-suggestion-chip { font-size: 11px; padding: 4px 9px; border-radius: 7px; background: alpha(@accent_bg_color, 0.12); color: @accent_color; }
+.side-card { background: @view_bg_color; border: 1px solid alpha(@window_fg_color, 0.10); border-radius: 11px; padding: 10px 12px; }
+.side-card.pending { border-color: alpha(@accent_color, 0.40); }
+.side-card.failed { border-color: alpha(@error_color, 0.45); background: alpha(@error_color, 0.05); }
+.side-question-title { font-size: 13px; font-weight: 700; }
+.side-status-badge { font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: 0.6px; padding: 2px 6px; border-radius: 5px; }
+.side-badge-pending { background: alpha(@warning_color, 0.18); color: @warning_color; }
+.side-badge-ok { background: alpha(@success_color, 0.16); color: @success_color; }
+.side-badge-err { background: alpha(@error_color, 0.18); color: @error_color; }
+.side-error-text { font-size: 12px; color: @error_color; }
+.side-action-btn { font-size: 11px; font-weight: 600; padding: 2px 8px; min-height: 24px; border-radius: 6px; background: alpha(@window_fg_color, 0.05); }
+.side-ask-entry { font-size: 13px; min-height: 32px; border-radius: 8px; }
+.context-meter trough { min-height: 6px; border-radius: 4px; }
+.context-meter progress { min-height: 6px; border-radius: 4px; }
+.context-meter.warn progress { background-color: @warning_color; }
+.context-meter.high progress { background-color: @error_color; }
+.workspace-meta-line { font-family: monospace; font-size: 11px; opacity: 0.72; }
+.metric-chip { background: alpha(@window_fg_color, 0.04); border-radius: 8px; padding: 6px 8px; }
+.metric-label { font-size: 10px; opacity: 0.58; }
+.metric-value { font-family: monospace; font-size: 12px; font-weight: 700; }
+.reasoning-body { font-family: monospace; font-size: 12px; line-height: 1.45; }
+.tool-trace-row { background: alpha(@window_fg_color, 0.04); border-radius: 8px; padding: 7px 9px; }
+.tool-trace-name { font-family: monospace; font-size: 12px; font-weight: 700; }
+.outline-row { padding: 8px 10px; border-radius: 9px; }
+.outline-turn-num { font-family: monospace; font-size: 11px; font-weight: 800; color: @accent_color; }
+.outline-turn-title { font-size: 12px; font-weight: 600; }
