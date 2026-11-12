@@ -80,6 +80,7 @@ struct Ui {
     rendered_lineage: RefCell<Option<LineageStamp>>,
     rendered_interaction: RefCell<Option<(String, String)>>,
     changing_draft: Cell<bool>,
+    recall: RefCell<PromptRecall>,
     follow_bottom: Cell<bool>,
     select_created: Cell<bool>,
     suppress_selection: Cell<bool>,
@@ -1045,6 +1046,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         rendered_lineage: RefCell::new(None),
         rendered_interaction: RefCell::new(None),
         changing_draft: Cell::new(false),
+        recall: RefCell::new(PromptRecall::default()),
         follow_bottom: Cell::new(true),
         select_created: Cell::new(false),
         suppress_selection: Cell::new(false),
@@ -1641,12 +1643,48 @@ fn handle_studio_editor_key(
         ui.paste_clipboard_image();
         return glib::Propagation::Stop;
     }
+    if let Some(propagation) = handle_prompt_recall_key(ui, key, modifiers) {
+        return propagation;
+    }
     if !ui.slash_deck.is_open()
         || modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK)
     {
         return glib::Propagation::Proceed;
     }
     handle_slash_deck_key(ui, key, modifiers)
+}
+
+fn handle_prompt_recall_key(
+    ui: &Rc<Ui>,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> Option<glib::Propagation> {
+    let back = match key {
+        gdk::Key::Up | gdk::Key::KP_Up => true,
+        gdk::Key::Down | gdk::Key::KP_Down => false,
+        _ => return None,
+    };
+    if modifiers.intersects(
+        gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::SHIFT_MASK,
+    ) {
+        return None;
+    }
+    let prompts = {
+        let state = ui.state.borrow();
+        let id = state.selected.as_ref()?;
+        PromptRecall::prompts(&state.conversations.get(id)?.messages)
+    };
+    let buffer = ui.editor.buffer();
+    let current = buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+        .to_string();
+    let text = ui.recall.borrow_mut().step(&prompts, &current, back)?;
+    ui.set_editor_text_at_end(&text);
+    ui.state.borrow_mut().set_active_draft(text);
+    ui.refresh_controls();
+    Some(glib::Propagation::Stop)
 }
 
 fn is_image_clipboard_paste_shortcut(ui: &Ui, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {

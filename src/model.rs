@@ -1701,6 +1701,57 @@ const MAX_REASONING_CHARS: usize = 24_000;
 const MAX_TOOL_TRACES: usize = 80;
 const MAX_SIDE_QUESTIONS: usize = 40;
 
+/// Shell-style recall of earlier prompts in the composer (Up/Down).
+#[derive(Default)]
+pub struct PromptRecall {
+    index: Option<usize>,
+    stash: String,
+    shown: String,
+}
+
+impl PromptRecall {
+    /// User prompts oldest-first, skipping blanks and consecutive repeats.
+    pub fn prompts(messages: &[ChatMessage]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for m in messages.iter().filter(|m| m.role == Role::User) {
+            let text = m.text.trim();
+            if !text.is_empty() && out.last().map(String::as_str) != Some(text) {
+                out.push(text.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn active(&self) -> bool {
+        self.index.is_some()
+    }
+
+    /// `back` walks to older prompts; otherwise newer, ending at the stashed draft.
+    /// Returns the text to show, or `None` when the key should behave normally.
+    pub fn step(&mut self, prompts: &[String], current: &str, back: bool) -> Option<String> {
+        if self.index.is_some() && current != self.shown {
+            self.index = None; // user edited the recalled text; start over
+        }
+        let next = match (self.index, back) {
+            (None, true) if current.is_empty() && !prompts.is_empty() => {
+                self.stash = current.to_string();
+                prompts.len() - 1
+            }
+            (Some(i), true) => i.saturating_sub(1),
+            (Some(i), false) if i + 1 < prompts.len() => i + 1,
+            (Some(_), false) => {
+                self.index = None;
+                self.shown = self.stash.clone();
+                return Some(self.stash.clone());
+            }
+            _ => return None,
+        };
+        self.index = Some(next);
+        self.shown = prompts[next].clone();
+        Some(self.shown.clone())
+    }
+}
+
 #[derive(Default)]
 pub struct Conversation {
     pub runtime_id: Option<String>,
@@ -3380,6 +3431,34 @@ fn session_palette_icon(source: &str, pinned: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_recall_walks_history_and_restores_draft() {
+        let prompts = vec!["one".to_string(), "two".to_string()];
+        let mut r = PromptRecall::default();
+        assert_eq!(r.step(&prompts, "typed", true), None);
+        assert_eq!(r.step(&prompts, "", false), None);
+        assert_eq!(r.step(&prompts, "", true).as_deref(), Some("two"));
+        assert_eq!(r.step(&prompts, "two", true).as_deref(), Some("one"));
+        assert_eq!(r.step(&prompts, "one", true).as_deref(), Some("one"));
+        assert_eq!(r.step(&prompts, "one", false).as_deref(), Some("two"));
+        assert_eq!(r.step(&prompts, "two", false).as_deref(), Some(""));
+        assert!(!r.active());
+        // Editing a recalled prompt abandons recall.
+        r.step(&prompts, "", true);
+        assert_eq!(r.step(&prompts, "two!", false), None);
+    }
+
+    #[test]
+    fn prompt_recall_prompts_skip_blank_and_repeats() {
+        let m = |role, t: &str| ChatMessage {
+            id: String::new(),
+            role,
+            text: t.into(),
+        };
+        let msgs = [m(Role::User, "a"), m(Role::Assistant, "x"), m(Role::User, " a "), m(Role::User, " ")];
+        assert_eq!(PromptRecall::prompts(&msgs), vec!["a".to_string()]);
+    }
+
     #[test]
     fn transcript_export_renders_roles_and_safe_names() {
         let msgs = vec![
