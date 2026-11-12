@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use hermes_native::backend::{self, Backend};
 use hermes_native::model::{
     Catalog, ChatMessage, Command, Config, ConnectionState, Event, ModelIdentity, RewindMode, Role,
-    SeedMessage, TurnStatus,
+    SearchHit, SeedMessage, SessionMutation, SessionSummary, TurnStatus,
 };
 
 const WORD: &str = "lattice";
@@ -109,7 +109,7 @@ fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, Strin
     prove_conversations_and_timeline(harness, created)?;
     let switched = prove_model_switch(harness, created)?;
     Ok(format!(
-        "connected created=4 turn1={WORD} turn2_context=true btw_snapshot=true branched_undo=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
+        "connected created=4 turn1={WORD} turn2_context=true btw_snapshot=true branched_undo=true fts_search=true curation_pin_rename_archive=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
     ))
 }
 
@@ -124,7 +124,8 @@ fn prove_conversations_and_timeline(
     prove_initial_turns(harness, &first.1, &second.1)?;
     prove_side_question(harness, &first.1)?;
     prove_branch_and_undo(harness, &first.0, &first.1, created)?;
-    prove_saved_and_reconnected(harness, &first.0, &second.0)
+    prove_saved_and_reconnected(harness, &first.0, &second.0)?;
+    prove_recall_and_curation(harness, &first.0, &second.0)
 }
 
 fn prove_initial_turns(
@@ -149,6 +150,178 @@ fn prove_saved_and_reconnected(
     assert_context(&resumed.1)?;
     assert_side_unpersisted(&resumed.1)?;
     verify_reconnect_history(harness, first_id, second_id)
+}
+
+fn prove_recall_and_curation(
+    harness: &mut Harness,
+    first_id: &str,
+    second_id: &str,
+) -> Result<(), String> {
+    curate_session(harness, first_id, SessionMutation::SetPinned(true))?;
+    curate_session(
+        harness,
+        first_id,
+        SessionMutation::Rename("hn-smoke-curated".into()),
+    )?;
+    verify_listed_curation(harness, first_id, "hn-smoke-curated")?;
+    prove_fts_search(harness, first_id, WORD)?;
+    curate_session(harness, second_id, SessionMutation::Archive)?;
+    verify_archived_excluded(harness, second_id)
+}
+
+fn curate_session(
+    harness: &mut Harness,
+    stored_id: &str,
+    mutation: SessionMutation,
+) -> Result<(), String> {
+    harness.send(Command::MutateSession {
+        stored_id: stored_id.into(),
+        mutation: mutation.clone(),
+    })?;
+    let start = Instant::now();
+    let mut done = false;
+    while start.elapsed() < Duration::from_secs(30) {
+        for event in harness.drain() {
+            if let Some(event) = note_mutation(event, stored_id, &mutation, &mut done)? {
+                harness.events.push(event);
+            }
+        }
+        if done {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("session curation timed out".into())
+}
+
+fn note_mutation(
+    event: Event,
+    target_id: &str,
+    expected: &SessionMutation,
+    done: &mut bool,
+) -> Result<Option<Event>, String> {
+    match event {
+        Event::SessionMutated {
+            stored_id,
+            mutation,
+        } if stored_id == target_id && &mutation == expected => {
+            *done = true;
+            Ok(None)
+        }
+        Event::Error {
+            operation,
+            session_id,
+            message,
+        } if operation == "curation" && session_id.as_deref() == Some(target_id) => {
+            Err(format!("curation failed: {message}"))
+        }
+        other => Ok(Some(other)),
+    }
+}
+
+fn verify_listed_curation(
+    harness: &mut Harness,
+    target_id: &str,
+    expected_title: &str,
+) -> Result<(), String> {
+    let sessions = fetch_first_page(harness)?;
+    let row = sessions
+        .iter()
+        .find(|s| s.stored_id == target_id)
+        .ok_or_else(|| "curated session missing from recent list".to_string())?;
+    if !row.pinned || row.title != expected_title {
+        return Err(format!(
+            "curated session mismatch: pinned={} title={}",
+            row.pinned, row.title
+        ));
+    }
+    Ok(())
+}
+
+fn verify_archived_excluded(harness: &mut Harness, archived_id: &str) -> Result<(), String> {
+    let sessions = fetch_first_page(harness)?;
+    if sessions.iter().any(|s| s.stored_id == archived_id) {
+        return Err("archived session still appeared in active session list".into());
+    }
+    Ok(())
+}
+
+fn fetch_first_page(harness: &mut Harness) -> Result<Vec<SessionSummary>, String> {
+    harness.send(Command::List { offset: 0 })?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        for event in harness.drain() {
+            match event {
+                Event::Sessions {
+                    sessions,
+                    offset: 0,
+                    ..
+                } => return Ok(sessions),
+                Event::Error {
+                    operation, message, ..
+                } if operation == "list" => return Err(format!("list failed: {message}")),
+                other => harness.events.push(other),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("list timed out".into())
+}
+
+fn prove_fts_search(harness: &mut Harness, target_id: &str, query: &str) -> Result<(), String> {
+    harness.send(Command::SearchSessions {
+        query: query.into(),
+        request_seq: 42,
+    })?;
+    let start = Instant::now();
+    let mut hits = None;
+    while start.elapsed() < Duration::from_secs(30) {
+        for event in harness.drain() {
+            if let Some(event) = note_search(event, 42, &mut hits)? {
+                harness.events.push(event);
+            }
+        }
+        if let Some(found) = hits {
+            return verify_fts_hit(&found, target_id);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("FTS5 search timed out".into())
+}
+
+fn note_search(
+    event: Event,
+    expected_seq: u64,
+    hits: &mut Option<Vec<SearchHit>>,
+) -> Result<Option<Event>, String> {
+    match event {
+        Event::SearchResults {
+            request_seq,
+            hits: rows,
+            ..
+        } if request_seq == expected_seq => {
+            *hits = Some(rows);
+            Ok(None)
+        }
+        Event::Error {
+            operation, message, ..
+        } if operation == "search" => Err(format!("search failed: {message}")),
+        other => Ok(Some(other)),
+    }
+}
+
+fn verify_fts_hit(hits: &[SearchHit], target_id: &str) -> Result<(), String> {
+    let hit = hits
+        .iter()
+        .find(|h| h.stored_id == target_id)
+        .ok_or_else(|| "FTS5 search did not find target session".to_string())?;
+    if !hit.pinned || hit.title != "hn-smoke-curated" {
+        return Err("FTS5 hit did not reflect curated pin/title metadata".into());
+    }
+    if !hit.snippet_markup.contains("<b>") {
+        return Err("FTS5 hit snippet did not include Pango bold highlight markup".into());
+    }
+    Ok(())
 }
 
 fn prove_branch_and_undo(

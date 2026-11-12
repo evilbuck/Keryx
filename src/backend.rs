@@ -9,11 +9,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use crate::model::{
     Catalog, ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event,
     InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, RewindMode, Role,
-    SeedMessage, SessionSummary, SteerOutcome, ToolEventUpdate, TurnStatus,
+    SeedMessage, SessionMutation, SessionSummary, SteerOutcome, ToolEventUpdate, TurnStatus,
     parse_live_info_telemetry, parse_telemetry_payload, seed_messages_through,
 };
+use crate::recall;
 
 const PAGE: usize = 50;
+const SEARCH_LIMIT: usize = 25;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -330,6 +332,13 @@ enum JobKind {
     DeleteResume {
         stored_id: String,
     },
+    ArchiveClose {
+        stored_id: String,
+        retried: bool,
+    },
+    ArchiveResume {
+        stored_id: String,
+    },
     Catalog,
     /// Provider-less prime on a chat whose agent is not built yet.
     Prime {
@@ -393,6 +402,7 @@ struct Link {
     next_id: u64,
     next_turn_generation: u64,
     message_counts: HashMap<String, usize>,
+    deferred_mutations: HashMap<String, (Option<String>, Option<bool>)>,
     jobs: HashMap<u64, Job>,
     runtime_of: HashMap<String, String>,
     refused: HashSet<String>,
@@ -523,6 +533,7 @@ impl Link {
             next_id: 1,
             next_turn_generation: 0,
             message_counts: HashMap::new(),
+            deferred_mutations: HashMap::new(),
             jobs: HashMap::new(),
             runtime_of: HashMap::new(),
             refused: HashSet::new(),
@@ -737,18 +748,14 @@ impl Link {
         }
         match command {
             Command::Reconnect | Command::Shutdown => {}
-            Command::List { offset } => self.list(offset).await,
+            Command::List { .. }
+            | Command::History { .. }
+            | Command::SearchSessions { .. }
+            | Command::MutateSession { .. } => self.http_command(command).await,
             Command::Create { title } => self.begin_create(title).await,
             Command::Resume { stored_id } => self.begin_resume(stored_id).await,
-            Command::History { stored_id, before } => self.history(stored_id, before).await,
             Command::Submit { runtime_id, text } => {
-                if !self
-                    .turns
-                    .get(&runtime_id)
-                    .is_some_and(|turn| turn.phase == TurnPhase::Stopping)
-                {
-                    self.begin_submit(runtime_id, text).await;
-                }
+                self.submit_unless_stopping(runtime_id, text).await;
             }
             Command::Steer { runtime_id, text } => self.begin_steer(runtime_id, text).await,
             Command::Interrupt { runtime_id } => self.begin_interrupt(runtime_id).await,
@@ -765,13 +772,33 @@ impl Link {
         }
     }
 
-    async fn handle_unready_command(&mut self, command: Command) {
-        if self.write.is_some()
-            || matches!(
-                command,
-                Command::List { .. } | Command::Create { .. } | Command::Resume { .. }
-            )
+    async fn submit_unless_stopping(&mut self, runtime_id: String, text: String) {
+        if !self
+            .turns
+            .get(&runtime_id)
+            .is_some_and(|turn| turn.phase == TurnPhase::Stopping)
         {
+            self.begin_submit(runtime_id, text).await;
+        }
+    }
+
+    async fn http_command(&mut self, command: Command) {
+        match command {
+            Command::List { offset } => self.list(offset).await,
+            Command::History { stored_id, before } => self.history(stored_id, before).await,
+            Command::SearchSessions { query, request_seq } => {
+                self.search_sessions(query, request_seq).await;
+            }
+            Command::MutateSession {
+                stored_id,
+                mutation,
+            } => self.mutate_session(stored_id, mutation).await,
+            _ => {}
+        }
+    }
+
+    async fn handle_unready_command(&mut self, command: Command) {
+        if self.write.is_some() || is_queueable_while_connecting(&command) {
             self.queued.push_back(command);
             return;
         }
@@ -789,9 +816,9 @@ impl Link {
             .await;
             return;
         }
-        if let Command::Undo { stored_id, .. } | Command::Branch { stored_id, .. } = command {
+        if let Some((op, stored_id)) = unready_session_failure(&command) {
             self.fail(
-                "timeline",
+                op,
                 Some(stored_id),
                 "Not connected. Reconnect to try again.",
             )
@@ -1320,16 +1347,271 @@ impl Link {
 
     async fn list(&mut self, offset: usize) {
         match fetch_sessions(&self.http, &self.origin, offset).await {
-            Ok(event) => {
-                if let Event::Sessions { sessions, .. } = &event {
-                    for session in sessions {
-                        self.note_listed(session);
-                    }
+            Ok(mut event) => {
+                if let Event::Sessions { sessions, .. } = &mut event {
+                    self.note_and_clean_listed(sessions);
                 }
                 self.emit(event).await;
             }
             Err(message) => self.fail("list", None, message).await,
         }
+    }
+
+    fn note_and_clean_listed(&mut self, sessions: &mut [SessionSummary]) {
+        for session in sessions {
+            session.title = self.clean(std::mem::take(&mut session.title));
+            session.preview = self.clean(std::mem::take(&mut session.preview));
+            self.note_listed(session);
+        }
+    }
+
+    async fn search_sessions(&self, query: String, request_seq: u64) {
+        let trimmed = query.trim().to_string();
+        if trimmed.is_empty() {
+            self.emit(Event::SearchResults {
+                query,
+                request_seq,
+                hits: Vec::new(),
+            })
+            .await;
+            return;
+        }
+        match fetch_search_hits(&self.http, &self.origin, &trimmed, &self.secrets).await {
+            Ok(hits) => {
+                self.emit(Event::SearchResults {
+                    query,
+                    request_seq,
+                    hits,
+                })
+                .await;
+            }
+            Err(message) => {
+                self.emit(Event::SearchResults {
+                    query,
+                    request_seq,
+                    hits: Vec::new(),
+                })
+                .await;
+                self.fail("search", None, message).await;
+            }
+        }
+    }
+
+    async fn mutate_session(&mut self, stored_id: String, mutation: SessionMutation) {
+        if matches!(mutation, SessionMutation::Archive) {
+            self.begin_archive(stored_id).await;
+            return;
+        }
+        let body = recall::mutation_patch_body(&mutation);
+        match patch_session_http(&self.http, &self.origin, &stored_id, &body).await {
+            Ok(PatchOutcome::Applied) => self.finish_applied_mutation(stored_id, mutation).await,
+            Ok(PatchOutcome::NotFound) if self.is_unpersisted_live(&stored_id) => {
+                self.apply_unpersisted_mutation(stored_id, mutation).await;
+            }
+            Ok(PatchOutcome::NotFound) => {
+                self.fail("curation", Some(stored_id), "Session not found.")
+                    .await;
+            }
+            Ok(PatchOutcome::Conflict) => {
+                self.fail(
+                    "curation",
+                    Some(stored_id),
+                    "Could not update active conversation (HTTP 409).",
+                )
+                .await;
+            }
+            Err(message) => self.fail("curation", Some(stored_id), message).await,
+        }
+    }
+
+    async fn begin_archive(&mut self, stored_id: String) {
+        if self.is_unpersisted_live(&stored_id) {
+            self.apply_unpersisted_mutation(stored_id, SessionMutation::Archive)
+                .await;
+            return;
+        }
+        if let Some(runtime_id) = self.runtime_of.remove(&stored_id)
+            && self
+                .close_runtime_for_archive(&stored_id, &runtime_id, false)
+                .await
+        {
+            return;
+        }
+        self.request_archive_patch(stored_id, false).await;
+    }
+
+    async fn close_runtime_for_archive(
+        &mut self,
+        stored_id: &str,
+        runtime_id: &str,
+        retried: bool,
+    ) -> bool {
+        let _ = self
+            .send_rpc(
+                "session.interrupt",
+                json!({"session_id": runtime_id}),
+                JobKind::Ping,
+                RPC_TIMEOUT,
+            )
+            .await;
+        self.send_rpc(
+            "session.close",
+            json!({"session_id": runtime_id}),
+            JobKind::ArchiveClose {
+                stored_id: stored_id.to_string(),
+                retried,
+            },
+            RPC_TIMEOUT,
+        )
+        .await
+        .is_ok()
+    }
+
+    async fn request_archive_patch(&mut self, stored_id: String, retried: bool) {
+        let body = recall::mutation_patch_body(&SessionMutation::Archive);
+        match patch_session_http(&self.http, &self.origin, &stored_id, &body).await {
+            Ok(PatchOutcome::Applied) => self.finish_archive(stored_id).await,
+            Ok(PatchOutcome::NotFound)
+                if self.message_counts.get(&stored_id).copied() == Some(0) =>
+            {
+                self.finish_archive(stored_id).await;
+            }
+            Ok(PatchOutcome::NotFound) => {
+                self.fail("curation", Some(stored_id), "Session not found.")
+                    .await;
+            }
+            Ok(PatchOutcome::Conflict) => {
+                self.retry_archive_after_conflict(stored_id, retried).await;
+            }
+            Err(message) => self.fail("curation", Some(stored_id), message).await,
+        }
+    }
+
+    async fn finish_archive(&mut self, stored_id: String) {
+        self.runtime_of.remove(&stored_id);
+        self.deferred_mutations.remove(&stored_id);
+        self.emit(Event::SessionMutated {
+            stored_id,
+            mutation: SessionMutation::Archive,
+        })
+        .await;
+    }
+
+    async fn retry_archive_after_conflict(&mut self, stored_id: String, retried: bool) {
+        if !retried
+            && !self.refused.contains(&stored_id)
+            && self
+                .send_rpc(
+                    "session.resume",
+                    json!({
+                        "session_id": stored_id,
+                        "inline_images": false,
+                        "omit_messages": true
+                    }),
+                    JobKind::ArchiveResume {
+                        stored_id: stored_id.clone(),
+                    },
+                    RPC_TIMEOUT,
+                )
+                .await
+                .is_ok()
+        {
+            return;
+        }
+        self.fail(
+            "curation",
+            Some(stored_id),
+            "Could not archive active conversation (HTTP 409).",
+        )
+        .await;
+    }
+
+    async fn finish_applied_mutation(&mut self, stored_id: String, mutation: SessionMutation) {
+        self.clear_deferred_field(&stored_id, &mutation);
+        self.emit(Event::SessionMutated {
+            stored_id,
+            mutation,
+        })
+        .await;
+    }
+
+    fn is_unpersisted_live(&self, stored_id: &str) -> bool {
+        self.runtime_of.contains_key(stored_id)
+            && self.message_counts.get(stored_id).copied().unwrap_or(0) == 0
+    }
+
+    async fn apply_unpersisted_mutation(&mut self, stored_id: String, mutation: SessionMutation) {
+        if matches!(mutation, SessionMutation::Archive) {
+            self.deferred_mutations.remove(&stored_id);
+            self.close_live_runtime_quietly(&stored_id).await;
+        } else {
+            self.record_deferred_mutation(&stored_id, &mutation);
+        }
+        self.emit(Event::SessionMutated {
+            stored_id,
+            mutation,
+        })
+        .await;
+    }
+
+    fn record_deferred_mutation(&mut self, stored_id: &str, mutation: &SessionMutation) {
+        let entry = self
+            .deferred_mutations
+            .entry(stored_id.to_string())
+            .or_insert((None, None));
+        match mutation {
+            SessionMutation::Rename(title) => entry.0 = Some(title.trim().to_string()),
+            SessionMutation::SetPinned(pinned) => entry.1 = Some(*pinned),
+            SessionMutation::Archive => {}
+        }
+    }
+
+    fn clear_deferred_field(&mut self, stored_id: &str, mutation: &SessionMutation) {
+        let Some(entry) = self.deferred_mutations.get_mut(stored_id) else {
+            return;
+        };
+        match mutation {
+            SessionMutation::Rename(_) => entry.0 = None,
+            SessionMutation::SetPinned(_) => entry.1 = None,
+            SessionMutation::Archive => {}
+        }
+        if entry.0.is_none() && entry.1.is_none() {
+            self.deferred_mutations.remove(stored_id);
+        }
+    }
+
+    async fn close_live_runtime_quietly(&mut self, stored_id: &str) {
+        if let Some(runtime_id) = self.runtime_of.remove(stored_id) {
+            let _ = self
+                .send_rpc(
+                    "session.close",
+                    json!({"session_id": runtime_id}),
+                    JobKind::Ping,
+                    RPC_TIMEOUT,
+                )
+                .await;
+        }
+    }
+
+    async fn flush_deferred_for_runtime(&mut self, runtime_id: &str) {
+        let Some(stored_id) = self.stored_id_for_runtime(runtime_id) else {
+            return;
+        };
+        let count = self.message_counts.entry(stored_id.clone()).or_insert(0);
+        *count = (*count).max(2);
+        let Some((title, pinned)) = self.deferred_mutations.remove(&stored_id) else {
+            return;
+        };
+        let Some(body) = deferred_patch_body(title, pinned) else {
+            return;
+        };
+        let _ = patch_session_http(&self.http, &self.origin, &stored_id, &body).await;
+    }
+
+    fn stored_id_for_runtime(&self, runtime_id: &str) -> Option<String> {
+        self.runtime_of
+            .iter()
+            .find_map(|(stored, rt)| (rt == runtime_id).then(|| stored.clone()))
     }
 
     async fn history(&self, stored_id: String, before: usize) {
@@ -1923,6 +2205,7 @@ impl Link {
             status,
         })
         .await;
+        self.flush_deferred_for_runtime(runtime_id).await;
         self.emit_complete_metadata(runtime_id, payload).await;
     }
 
@@ -2206,6 +2489,7 @@ impl Link {
             } => self.on_side_reply(runtime_id, client_id, result).await,
             JobKind::Delete { stored_id, .. } => {
                 self.runtime_of.remove(&stored_id);
+                self.deferred_mutations.remove(&stored_id);
                 self.emit(Event::Deleted { stored_id }).await;
             }
             JobKind::DeleteResume { stored_id } => {
@@ -2279,6 +2563,28 @@ impl Link {
             } => {
                 self.on_undo_sync_reply(stored_id, runtime_id, removed, mode, prompt_text, result)
                     .await;
+            }
+            other => self.on_curation_job(other, result).await,
+        }
+    }
+
+    async fn on_curation_job(&mut self, kind: JobKind, result: &Value) {
+        match kind {
+            JobKind::ArchiveClose { stored_id, retried } => {
+                self.request_archive_patch(stored_id, retried).await;
+            }
+            JobKind::ArchiveResume { stored_id } => {
+                if let Some(runtime_id) = result
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    && self
+                        .close_runtime_for_archive(&stored_id, runtime_id, true)
+                        .await
+                {
+                    return;
+                }
+                self.request_archive_patch(stored_id, true).await;
             }
             _ => {}
         }
@@ -2476,6 +2782,9 @@ impl Link {
         let messages = self
             .load_branch_messages(&stored_id, before, count - before, fallback_messages)
             .await;
+        let model_name = model
+            .as_ref()
+            .map_or_else(String::new, |entry| entry.model.clone());
         self.emit(Event::Branched {
             session: SessionSummary {
                 stored_id,
@@ -2486,6 +2795,9 @@ impl Link {
                 message_count: before + messages.len(),
                 parent_session_id: Some(parent_stored_id),
                 is_branch: true,
+                pinned: false,
+                preview: String::new(),
+                model: model_name,
             },
             parent_title,
             runtime_id,
@@ -2927,6 +3239,21 @@ impl Link {
             JobKind::BranchSeeded {
                 parent_stored_id, ..
             } => self.fail("branch", Some(parent_stored_id), message).await,
+            other => self.fail_curation_job(other, code, message).await,
+        }
+    }
+
+    async fn fail_curation_job(&mut self, kind: JobKind, code: i64, message: &str) {
+        match kind {
+            JobKind::ArchiveClose { stored_id, retried } => {
+                self.request_archive_patch(stored_id, retried).await;
+            }
+            JobKind::ArchiveResume { stored_id } => {
+                if matches!(resume_disposition(code), ResumeDisposition::ReadOnly) {
+                    self.refused.insert(stored_id.clone());
+                }
+                self.fail("curation", Some(stored_id), message).await;
+            }
             _ => {}
         }
     }
@@ -3041,6 +3368,9 @@ impl Link {
             title
         };
         let model = model_identity(result);
+        let model_name = model
+            .as_ref()
+            .map_or_else(String::new, |entry| entry.model.clone());
         self.emit(Event::Created {
             session: SessionSummary {
                 stored_id,
@@ -3051,6 +3381,9 @@ impl Link {
                 message_count: 0,
                 parent_session_id: None,
                 is_branch: false,
+                pinned: false,
+                preview: String::new(),
+                model: model_name,
             },
             runtime_id: runtime_id.clone(),
             model,
@@ -3386,49 +3719,137 @@ fn parse_sessions(body: &Value, offset: usize) -> Result<Event, String> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchOutcome {
+    Applied,
+    NotFound,
+    Conflict,
+}
+
+fn is_queueable_while_connecting(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::List { .. }
+            | Command::Create { .. }
+            | Command::Resume { .. }
+            | Command::SearchSessions { .. }
+    )
+}
+
+fn unready_session_failure(command: &Command) -> Option<(&'static str, String)> {
+    match command {
+        Command::Undo { stored_id, .. } | Command::Branch { stored_id, .. } => {
+            Some(("timeline", stored_id.clone()))
+        }
+        Command::MutateSession { stored_id, .. } => Some(("curation", stored_id.clone())),
+        _ => None,
+    }
+}
+
+fn deferred_patch_body(title: Option<String>, pinned: Option<bool>) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    if let Some(title) = title {
+        map.insert("title".into(), Value::String(title));
+    }
+    if let Some(pinned) = pinned {
+        map.insert("pinned".into(), Value::Bool(pinned));
+    }
+    (!map.is_empty()).then_some(Value::Object(map))
+}
+
+async fn fetch_search_hits(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    query: &str,
+    secrets: &[String],
+) -> Result<Vec<crate::model::SearchHit>, String> {
+    let mut url = endpoint(origin, "/api/sessions/search");
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("limit", &SEARCH_LIMIT.to_string());
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| "Could not search conversations.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not search conversations (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Search results were not usable.".to_string())?;
+    recall::parse_search_results(&body, secrets)
+}
+
+async fn patch_session_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    body: &Value,
+) -> Result<PatchOutcome, String> {
+    let path = format!("/api/sessions/{stored_id}");
+    let response = http
+        .patch(endpoint(origin, &path))
+        .json(body)
+        .send()
+        .await
+        .map_err(|_| "Could not update conversation.".to_string())?;
+    let code = response.status().as_u16();
+    if response.status().is_success() {
+        return Ok(PatchOutcome::Applied);
+    }
+    if code == 404 {
+        return Ok(PatchOutcome::NotFound);
+    }
+    if code == 409 {
+        return Ok(PatchOutcome::Conflict);
+    }
+    Err(format!("Could not update conversation (HTTP {code})."))
+}
+
 fn session_summary(row: &Value) -> Result<SessionSummary, String> {
-    let stored_id = row
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "The conversation list was not usable.".to_string())?
-        .to_string();
+    let stored_id = optional_trimmed_str(row, "id")
+        .ok_or_else(|| "The conversation list was not usable.".to_string())?;
     let count = row
         .get("message_count")
         .and_then(Value::as_u64)
         .ok_or_else(|| "The conversation list was not usable.".to_string())?;
     let message_count =
         usize::try_from(count).map_err(|_| "The conversation list was not usable.".to_string())?;
-    let title = row
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let updated = extract_epoch_string(row);
-    let parent_session_id = row
-        .get("parent_session_id")
+    let title = session_summary_title(row);
+    let raw_preview = row.get("preview").and_then(Value::as_str).unwrap_or("");
+    Ok(SessionSummary {
+        stored_id,
+        preview: recall::clean_session_preview(raw_preview, &title),
+        title,
+        source: optional_trimmed_str(row, "source").unwrap_or_default(),
+        updated_at: extract_epoch_string(row),
+        read_only_reason: None,
+        message_count,
+        parent_session_id: optional_trimmed_str(row, "parent_session_id"),
+        is_branch: false,
+        pinned: row.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+        model: optional_trimmed_str(row, "model").unwrap_or_default(),
+    })
+}
+
+fn session_summary_title(row: &Value) -> String {
+    match optional_trimmed_str(row, "title") {
+        Some(title) => title,
+        None => "Untitled".into(),
+    }
+}
+
+fn optional_trimmed_str(row: &Value, key: &str) -> Option<String> {
+    row.get(key)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    Ok(SessionSummary {
-        stored_id,
-        title: if title.is_empty() {
-            "Untitled".into()
-        } else {
-            title.to_string()
-        },
-        source: row
-            .get("source")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        updated_at: updated,
-        read_only_reason: None,
-        message_count,
-        parent_session_id,
-        is_branch: false,
-    })
+        .map(str::to_string)
 }
 
 fn value_as_epoch(value: &Value) -> Option<i64> {
@@ -5388,6 +5809,182 @@ mod tests {
                 }
                 other => panic!("unexpected: {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn session_summary_extracts_pinned_preview_and_model_fields() {
+        let summary = session_summary(&json!({
+            "id": "s-curated",
+            "title": "Wayland compositor research",
+            "source": "tui",
+            "model": "claude-opus-4-6",
+            "pinned": true,
+            "preview": "  Investigated   layer-shell   anchoring  ",
+            "message_count": 14,
+            "last_active": 1794452594.0
+        }))
+        .expect("summary");
+        assert!(summary.pinned);
+        assert_eq!(summary.model, "claude-opus-4-6");
+        assert_eq!(summary.preview, "Investigated layer-shell anchoring");
+        assert_eq!(summary.message_count, 14);
+    }
+
+    #[test]
+    fn unready_and_deferred_mutation_helpers_cover_curation_and_search() {
+        assert!(is_queueable_while_connecting(&Command::SearchSessions {
+            query: "hyprland".into(),
+            request_seq: 1,
+        }));
+        assert!(!is_queueable_while_connecting(&Command::MutateSession {
+            stored_id: "s1".into(),
+            mutation: SessionMutation::Archive,
+        }));
+        assert_eq!(
+            unready_session_failure(&Command::MutateSession {
+                stored_id: "s1".into(),
+                mutation: SessionMutation::SetPinned(true),
+            }),
+            Some(("curation", "s1".to_string()))
+        );
+        assert_eq!(
+            deferred_patch_body(Some("Curated".into()), Some(true)),
+            Some(json!({"title": "Curated", "pinned": true}))
+        );
+        assert_eq!(deferred_patch_body(None, None), None);
+    }
+
+    #[test]
+    fn unpersisted_zero_turn_sessions_defer_curation_until_turn_or_archive() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "alice".into(),
+                    password: "top-secret-value".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.runtime_of.insert("st-new".into(), "rt-new".into());
+            link.message_counts.insert("st-new".into(), 0);
+            assert!(link.is_unpersisted_live("st-new"));
+
+            link.apply_unpersisted_mutation("st-new".into(), SessionMutation::SetPinned(true))
+                .await;
+            link.apply_unpersisted_mutation(
+                "st-new".into(),
+                SessionMutation::Rename("Fresh".into()),
+            )
+            .await;
+            assert_eq!(
+                link.deferred_mutations.get("st-new"),
+                Some(&(Some("Fresh".into()), Some(true)))
+            );
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated { .. })
+            ));
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated { .. })
+            ));
+
+            link.apply_unpersisted_mutation("st-new".into(), SessionMutation::Archive)
+                .await;
+            assert!(!link.deferred_mutations.contains_key("st-new"));
+            assert!(!link.runtime_of.contains_key("st-new"));
+        });
+    }
+
+    async fn spawn_one_http_status(status_line: &'static str, body: &'static str) -> url::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+        });
+        url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    #[test]
+    fn archive_close_and_http_patch_outcomes_cover_conflict_and_completion() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let http = reqwest::Client::new();
+            let ok_url = spawn_one_http_status("200 OK", "{}").await;
+            assert_eq!(
+                patch_session_http(&http, &ok_url, "s1", &json!({"pinned": true})).await,
+                Ok(PatchOutcome::Applied)
+            );
+            let missing_url = spawn_one_http_status("404 Not Found", "{}").await;
+            assert_eq!(
+                patch_session_http(&http, &missing_url, "s1", &json!({"pinned": true})).await,
+                Ok(PatchOutcome::NotFound)
+            );
+            let conflict_url = spawn_one_http_status("409 Conflict", "{}").await;
+            assert_eq!(
+                patch_session_http(&http, &conflict_url, "s1", &json!({"archived": true})).await,
+                Ok(PatchOutcome::Conflict)
+            );
+
+            let archive_url = spawn_one_http_status("200 OK", "{}").await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: archive_url,
+                    username: "alice".into(),
+                    password: "top-secret-value".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.on_curation_job(
+                JobKind::ArchiveClose {
+                    stored_id: "st-arc".into(),
+                    retried: false,
+                },
+                &json!({"closed": true}),
+            )
+            .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated {
+                    stored_id,
+                    mutation: SessionMutation::Archive
+                }) if stored_id == "st-arc"
+            ));
+
+            link.fail_curation_job(
+                JobKind::ArchiveResume {
+                    stored_id: "st-ro".into(),
+                },
+                4132,
+                "active elsewhere",
+            )
+            .await;
+            assert!(link.refused.contains("st-ro"));
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Error { operation, .. }) if operation == "curation"
+            ));
         });
     }
 }

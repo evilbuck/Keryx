@@ -5,16 +5,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::model::{
-    AppState, PaletteAction, PaletteEntry, SessionFilter, SessionSummary, SourceKind,
-    build_palette_entries, classify_source, session_meta_line, source_badge,
-};
+use crate::model::{AppState, PaletteAction, PaletteEntry, SessionFilter, build_palette_entries};
 
 pub struct TriageBar {
     pub container: gtk::Box,
     pub all_btn: gtk::ToggleButton,
     pub chats_btn: gtk::ToggleButton,
     pub auto_btn: gtk::ToggleButton,
+    pub pinned_btn: gtk::ToggleButton,
     pub search: gtk::SearchEntry,
     pub empty_label: gtk::Label,
     updating: Cell<bool>,
@@ -28,14 +26,16 @@ impl TriageBar {
         let all_btn = triage_button("All", "Show all conversations");
         let chats_btn = triage_button("Chats", "Interactive human chats only (hide cron)");
         let auto_btn = triage_button("Auto", "Scheduled cron and background sessions");
+        let pinned_btn = triage_button("★", "Pinned conversations");
         all_btn.set_active(true);
         pills.append(&all_btn);
         pills.append(&chats_btn);
         pills.append(&auto_btn);
+        pills.append(&pinned_btn);
         container.append(&pills);
 
         let search = gtk::SearchEntry::new();
-        search.set_placeholder_text(Some("Filter conversations…"));
+        search.set_placeholder_text(Some("Search server history or filter chats…"));
         search.add_css_class("sidebar-search");
         search.update_property(&[gtk::accessible::Property::Label("Filter conversations")]);
         container.append(&search);
@@ -50,6 +50,7 @@ impl TriageBar {
             all_btn,
             chats_btn,
             auto_btn,
+            pinned_btn,
             search,
             empty_label,
             updating: Cell::new(false),
@@ -59,20 +60,23 @@ impl TriageBar {
     pub fn sync(&self, state: &AppState, visible_count: usize) {
         self.updating.set(true);
         let (all, chats, auto) = state.filter_counts();
+        let pinned = state.pinned_count();
         self.all_btn.set_label(&format!("All {all}"));
         self.chats_btn.set_label(&format!("Chats {chats}"));
         self.auto_btn.set_label(&format!("Auto {auto}"));
+        self.pinned_btn.set_label(&format!("★ {pinned}"));
         self.all_btn
             .set_active(state.session_filter == SessionFilter::All);
         self.chats_btn
             .set_active(state.session_filter == SessionFilter::Chats);
         self.auto_btn
             .set_active(state.session_filter == SessionFilter::Auto);
+        self.pinned_btn
+            .set_active(state.session_filter == SessionFilter::Pinned);
         if self.search.text().as_str() != state.session_query {
             self.search.set_text(&state.session_query);
         }
-        self.empty_label
-            .set_visible(!state.sessions.is_empty() && visible_count == 0);
+        sync_triage_empty(&self.empty_label, state, visible_count);
         self.updating.set(false);
     }
 
@@ -86,6 +90,7 @@ impl TriageBar {
         wire_triage_pill(self, &self.all_btn, SessionFilter::All, &filter_cb);
         wire_triage_pill(self, &self.chats_btn, SessionFilter::Chats, &filter_cb);
         wire_triage_pill(self, &self.auto_btn, SessionFilter::Auto, &filter_cb);
+        wire_triage_pill(self, &self.pinned_btn, SessionFilter::Pinned, &filter_cb);
         let bar = Rc::downgrade(self);
         self.search.connect_search_changed(move |entry| {
             if let Some(bar) = bar.upgrade()
@@ -103,6 +108,17 @@ impl TriageBar {
             }
         });
     }
+}
+
+fn sync_triage_empty(label: &gtk::Label, state: &AppState, visible_count: usize) {
+    let text = if state.remote_search_loading {
+        "Searching full server history…"
+    } else {
+        "No matching conversations"
+    };
+    label.set_label(text);
+    let show = (!state.sessions.is_empty() || state.remote_search_loading) && visible_count == 0;
+    label.set_visible(show);
 }
 
 fn triage_button(label: &str, tooltip: &str) -> gtk::ToggleButton {
@@ -157,7 +173,7 @@ impl CommandPalette {
         set_box_margins(&root, 14);
 
         let search = gtk::SearchEntry::new();
-        search.set_placeholder_text(Some("Jump to a conversation or run a command…"));
+        search.set_placeholder_text(Some("Omnisearch server history or run a command…"));
         search.add_css_class("palette-search");
         search.update_property(&[gtk::accessible::Property::Label("Command palette search")]);
         root.append(&search);
@@ -191,9 +207,9 @@ impl CommandPalette {
         root.append(&palette_footer());
 
         let dialog = adw::Dialog::builder()
-            .title("Command Palette")
-            .content_width(560)
-            .content_height(430)
+            .title("Omnisearch & Command Palette")
+            .content_width(600)
+            .content_height(460)
             .follows_content_size(false)
             .child(&root)
             .build();
@@ -229,6 +245,14 @@ impl CommandPalette {
         }
     }
 
+    pub fn query_text(&self) -> String {
+        self.search.text().to_string()
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.get()
+    }
+
     pub fn refresh_if_open(&self, state: &AppState) {
         if self.open.get() {
             self.populate(state);
@@ -240,6 +264,12 @@ impl CommandPalette {
         let entries = build_palette_entries(state, &query, now_epoch_secs());
         let boxed: Vec<glib::BoxedAnyObject> =
             entries.into_iter().map(glib::BoxedAnyObject::new).collect();
+        let empty_text = if state.remote_search_loading {
+            "Searching full server history…"
+        } else {
+            "No matching command or conversation."
+        };
+        self.empty.set_label(empty_text);
         self.empty.set_visible(boxed.is_empty());
         self.results.splice(0, self.results.n_items(), &boxed);
         if self.selection.n_items() > 0 {
@@ -394,14 +424,27 @@ fn palette_row_labels(entry: &PaletteEntry) -> gtk::Box {
         title.add_css_class("palette-destructive");
     }
     labels.append(&title);
-    if !entry.subtitle.is_empty() {
-        let subtitle = gtk::Label::new(Some(&entry.subtitle));
-        subtitle.set_xalign(0.0);
-        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        subtitle.add_css_class("palette-subtitle");
+    if let Some(subtitle) = palette_subtitle_label(entry) {
         labels.append(&subtitle);
     }
     labels
+}
+
+fn palette_subtitle_label(entry: &PaletteEntry) -> Option<gtk::Label> {
+    if entry.subtitle.is_empty() && entry.subtitle_markup.is_none() {
+        return None;
+    }
+    let subtitle = gtk::Label::new(None);
+    subtitle.set_xalign(0.0);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    subtitle.add_css_class("palette-subtitle");
+    if let Some(markup) = &entry.subtitle_markup {
+        subtitle.set_use_markup(true);
+        subtitle.set_markup(markup);
+    } else {
+        subtitle.set_text(&entry.subtitle);
+    }
+    Some(subtitle)
 }
 
 fn append_palette_badges(row: &gtk::Box, entry: &PaletteEntry) {
@@ -409,10 +452,8 @@ fn append_palette_badges(row: &gtk::Box, entry: &PaletteEntry) {
         let badge = gtk::Label::new(Some(&entry.badge));
         badge.add_css_class("source-badge");
         badge.set_valign(gtk::Align::Center);
-        if matches!(entry.action, PaletteAction::OpenSession(_)) && entry.badge == "CRON" {
-            badge.add_css_class("source-auto");
-        } else if entry.badge == "PARENT" {
-            badge.add_css_class("fork-badge");
+        if let Some(extra) = palette_badge_extra_class(entry) {
+            badge.add_css_class(extra);
         }
         row.append(&badge);
     }
@@ -424,10 +465,22 @@ fn append_palette_badges(row: &gtk::Box, entry: &PaletteEntry) {
     }
 }
 
+fn palette_badge_extra_class(entry: &PaletteEntry) -> Option<&'static str> {
+    match entry.badge.as_str() {
+        "★ PIN" | "PINNED" => Some("pin-badge"),
+        "FTS5" => Some("fts-badge"),
+        "PARENT" => Some("fork-badge"),
+        "CRON" if matches!(entry.action, PaletteAction::OpenSession(_)) => Some("source-auto"),
+        _ => None,
+    }
+}
+
 fn palette_footer() -> gtk::Box {
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     footer.add_css_class("palette-footer");
-    let hint = gtk::Label::new(Some("↑↓ navigate · Enter run · Esc close"));
+    let hint = gtk::Label::new(Some(
+        "↑↓ navigate · Enter open or run · FTS5 searches full server history",
+    ));
     hint.set_xalign(0.0);
     hint.set_hexpand(true);
     hint.add_css_class("composer-hint");
@@ -438,7 +491,7 @@ fn palette_footer() -> gtk::Box {
 pub fn build_palette_trigger() -> gtk::Button {
     let inner = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     inner.append(&gtk::Image::from_icon_name("system-search-symbolic"));
-    let label = gtk::Label::new(Some("Commands"));
+    let label = gtk::Label::new(Some("Omnisearch"));
     label.add_css_class("palette-trigger-label");
     inner.append(&label);
     let kbd = gtk::Label::new(Some("Ctrl+K"));
@@ -448,7 +501,7 @@ pub fn build_palette_trigger() -> gtk::Button {
     button.set_child(Some(&inner));
     button.add_css_class("flat");
     button.add_css_class("palette-trigger");
-    button.set_tooltip_text(Some("Open command palette and session jumper · Ctrl+K"));
+    button.set_tooltip_text(Some("Open omnisearch and command palette · Ctrl+K"));
     button.update_property(&[gtk::accessible::Property::Label("Command palette")]);
     button
 }
@@ -459,9 +512,11 @@ pub fn build_shortcut_hints() -> gtk::Box {
     stack.add_css_class("shortcut-strip");
     stack.append(&shortcut_hint_row(&[
         ("Enter", "Start chat"),
-        ("Ctrl+K", "Palette"),
+        ("Ctrl+K", "Omnisearch"),
+        ("Ctrl+Shift+F", "Find"),
     ]));
     stack.append(&shortcut_hint_row(&[
+        ("Ctrl+P", "Pin"),
         ("Ctrl+I", "Flight Deck"),
         ("Ctrl+D", "Branch"),
         ("Alt+Enter", "Side-Ask"),
@@ -484,57 +539,6 @@ fn shortcut_hint_row(items: &[(&str, &str)]) -> gtk::Box {
         row.append(&item);
     }
     row
-}
-
-pub fn bind_session_row(object: &glib::Object) {
-    let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
-    let value = item
-        .item()
-        .and_downcast::<glib::BoxedAnyObject>()
-        .expect("session item");
-    let session = value.borrow::<SessionSummary>();
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    row.add_css_class("session-row");
-
-    let title = gtk::Label::new(Some(if session.title.is_empty() {
-        "Untitled conversation"
-    } else {
-        &session.title
-    }));
-    title.set_xalign(0.0);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.add_css_class("session-title");
-    row.append(&title);
-
-    let meta_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let badge = gtk::Label::new(Some(&source_badge(&session.source)));
-    badge.add_css_class("source-badge");
-    badge.add_css_class(match classify_source(&session.source) {
-        SourceKind::Automated => "source-auto",
-        SourceKind::Interactive => "source-chat",
-    });
-    meta_row.append(&badge);
-    if session.is_branch {
-        let fork = gtk::Label::new(Some("⑂ FORK"));
-        fork.add_css_class("source-badge");
-        fork.add_css_class("fork-badge");
-        meta_row.append(&fork);
-    }
-
-    let meta = gtk::Label::new(Some(&session_meta_line(&session, now_epoch_secs())));
-    meta.set_xalign(0.0);
-    meta.set_hexpand(true);
-    meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    meta.add_css_class("session-meta");
-    meta_row.append(&meta);
-    row.append(&meta_row);
-
-    let identity = match &session.read_only_reason {
-        Some(reason) => format!("Conversation ID: {}\n{}", session.stored_id, reason),
-        None => format!("Conversation ID: {}", session.stored_id),
-    };
-    row.set_tooltip_text(Some(&identity));
-    item.set_child(Some(&row));
 }
 
 pub fn now_epoch_secs() -> i64 {

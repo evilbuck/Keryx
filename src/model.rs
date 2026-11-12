@@ -94,6 +94,9 @@ pub struct SessionSummary {
     pub message_count: usize,
     pub parent_session_id: Option<String>,
     pub is_branch: bool,
+    pub pinned: bool,
+    pub preview: String,
+    pub model: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -102,6 +105,7 @@ pub enum SessionFilter {
     All,
     Chats,
     Auto,
+    Pinned,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +141,7 @@ impl SessionFilter {
             Self::All => true,
             Self::Chats => classify_source(&session.source) == SourceKind::Interactive,
             Self::Auto => classify_source(&session.source) == SourceKind::Automated,
+            Self::Pinned => session.pinned,
         }
     }
 }
@@ -184,6 +189,10 @@ fn relative_bucket(delta: i64) -> String {
 
 pub fn session_meta_line(session: &SessionSummary, now_epoch_secs: i64) -> String {
     let mut parts = vec![message_count_label(session.message_count)];
+    let model = short_model_badge(&session.model);
+    if !model.is_empty() {
+        parts.push(model);
+    }
     if let Some(age) = format_relative_age(&session.updated_at, now_epoch_secs) {
         parts.push(age);
     }
@@ -191,6 +200,20 @@ pub fn session_meta_line(session: &SessionSummary, now_epoch_secs: i64) -> Strin
         parts.push("read-only".into());
     }
     parts.join(" · ")
+}
+
+pub fn short_model_badge(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let tail = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if tail.chars().count() <= 22 {
+        tail.to_string()
+    } else {
+        let prefix: String = tail.chars().take(21).collect();
+        format!("{prefix}…")
+    }
 }
 
 fn message_count_label(count: usize) -> String {
@@ -634,6 +657,116 @@ pub struct SeedMessage {
     pub content: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchHit {
+    pub stored_id: String,
+    pub title: String,
+    pub source: String,
+    pub model: String,
+    pub role: String,
+    pub snippet_plain: String,
+    pub snippet_markup: String,
+    pub updated_at: String,
+    pub message_count: usize,
+    pub pinned: bool,
+    pub parent_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionMutation {
+    Rename(String),
+    SetPinned(bool),
+    Archive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationOutcome {
+    Updated,
+    ArchivedSelected,
+    ArchivedOther,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptFind {
+    pub open: bool,
+    pub query: String,
+    pub matches: Vec<usize>,
+    pub active_pos: usize,
+}
+
+impl TranscriptFind {
+    pub fn open_with(&mut self, query: &str, messages: &[ChatMessage]) {
+        self.open = true;
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            self.query = trimmed.to_string();
+        }
+        self.matches = crate::recall::find_transcript_matches(messages, &self.query);
+        self.active_pos = 0;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.query.clear();
+        self.matches.clear();
+        self.active_pos = 0;
+    }
+
+    pub fn set_query(&mut self, query: String, messages: &[ChatMessage]) {
+        self.query = query;
+        self.recompute(messages);
+    }
+
+    pub fn recompute(&mut self, messages: &[ChatMessage]) {
+        if !self.open || self.query.trim().is_empty() {
+            self.matches.clear();
+            self.active_pos = 0;
+            return;
+        }
+        let prev = self.active_message_index();
+        self.matches = crate::recall::find_transcript_matches(messages, &self.query);
+        self.active_pos = prev
+            .and_then(|idx| self.matches.iter().position(|&m| m == idx))
+            .unwrap_or(0);
+    }
+
+    pub fn step(&mut self, delta: isize) -> Option<usize> {
+        if self.matches.is_empty() {
+            return None;
+        }
+        let len = self.matches.len() as isize;
+        self.active_pos = (self.active_pos as isize + delta).rem_euclid(len) as usize;
+        self.active_message_index()
+    }
+
+    pub fn active_message_index(&self) -> Option<usize> {
+        if self.open {
+            self.matches.get(self.active_pos).copied()
+        } else {
+            None
+        }
+    }
+
+    pub fn match_state(&self, message_index: usize) -> (bool, bool) {
+        if !self.open || self.matches.is_empty() {
+            return (false, false);
+        }
+        let is_match = self.matches.binary_search(&message_index).is_ok();
+        let is_active = self.active_message_index() == Some(message_index);
+        (is_match, is_active)
+    }
+
+    pub fn status_label(&self) -> String {
+        if self.query.trim().is_empty() {
+            "Type to find".into()
+        } else if self.matches.is_empty() {
+            "0 matches".into()
+        } else {
+            format!("{} / {}", self.active_pos + 1, self.matches.len())
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Command {
     List {
@@ -668,6 +801,16 @@ pub enum Command {
     },
     Delete {
         stored_id: String,
+    },
+    /// Server-wide FTS5 search across all persisted conversations (`GET /api/sessions/search`).
+    SearchSessions {
+        query: String,
+        request_seq: u64,
+    },
+    /// Server-persisted session curation (`PATCH /api/sessions/{id}`).
+    MutateSession {
+        stored_id: String,
+        mutation: SessionMutation,
     },
     /// Fork a live or read-only conversation (`session.branch`, `session.branch_stored`, or seeded `session.create`).
     Branch {
@@ -723,6 +866,10 @@ pub enum ComposerIntent {
     SideQuestion(String),
     Branch(Option<String>),
     Rewind(RewindMode),
+    FindInTranscript(Option<String>),
+    TogglePin,
+    Rename(String),
+    Archive,
 }
 
 pub fn parse_composer_input(raw: &str) -> ComposerIntent {
@@ -736,7 +883,35 @@ pub fn parse_composer_input(raw: &str) -> ComposerIntent {
     if let Some(timeline) = parse_timeline_command(trimmed) {
         return timeline;
     }
+    if let Some(curation) = parse_curation_command(trimmed) {
+        return curation;
+    }
     ComposerIntent::Prompt(trimmed.to_string())
+}
+
+fn parse_curation_command(trimmed: &str) -> Option<ComposerIntent> {
+    for prefix in ["/find", "/search"] {
+        if let Some(rest) = strip_command_prefix(trimmed, prefix) {
+            let query = (!rest.is_empty()).then(|| rest.to_string());
+            return Some(ComposerIntent::FindInTranscript(query));
+        }
+    }
+    for prefix in ["/rename", "/title"] {
+        if let Some(rest) = strip_command_prefix(trimmed, prefix) {
+            return Some(if rest.is_empty() {
+                ComposerIntent::Empty
+            } else {
+                ComposerIntent::Rename(rest.to_string())
+            });
+        }
+    }
+    if strip_command_prefix(trimmed, "/pin") == Some("") {
+        return Some(ComposerIntent::TogglePin);
+    }
+    if strip_command_prefix(trimmed, "/archive") == Some("") {
+        return Some(ComposerIntent::Archive);
+    }
+    None
 }
 
 fn parse_side_command(trimmed: &str) -> Option<ComposerIntent> {
@@ -1442,6 +1617,17 @@ pub enum Event {
         runtime_id: String,
         telemetry: SessionTelemetry,
     },
+    /// Server-wide FTS5 search hits (`GET /api/sessions/search`).
+    SearchResults {
+        query: String,
+        request_seq: u64,
+        hits: Vec<SearchHit>,
+    },
+    /// Confirmed session curation (`PATCH /api/sessions/{id}`).
+    SessionMutated {
+        stored_id: String,
+        mutation: SessionMutation,
+    },
     Error {
         operation: String,
         session_id: Option<String>,
@@ -2011,12 +2197,17 @@ pub enum PaletteAction {
     ToggleInspector,
     OpenInspector(InspectorTab),
     FocusFilter,
+    FindInTranscript,
+    TogglePinCurrent,
+    RenameCurrent,
+    ArchiveCurrent,
     FilterSessions(SessionFilter),
     ReloadHistory,
     LoadMoreSessions,
     Reconnect,
     DeleteCurrent,
     OpenSession(String),
+    OpenSearchHit { stored_id: String, query: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2025,6 +2216,7 @@ pub struct PaletteEntry {
     pub icon: &'static str,
     pub title: String,
     pub subtitle: String,
+    pub subtitle_markup: Option<String>,
     pub shortcut: &'static str,
     pub badge: String,
     pub active: bool,
@@ -2044,6 +2236,7 @@ impl PaletteEntry {
             icon,
             title: title.into(),
             subtitle: subtitle.into(),
+            subtitle_markup: None,
             shortcut,
             badge: String::new(),
             active: false,
@@ -2075,6 +2268,12 @@ pub struct AppState {
     pub inspector_open: bool,
     pub inspector_tab: InspectorTab,
     pub next_side_id: u64,
+    pub remote_search_seq: u64,
+    pub remote_search_loading: bool,
+    pub remote_search_query: String,
+    pub remote_search_hits: Vec<SearchHit>,
+    pub transcript_find: TranscriptFind,
+    pub pending_find_query: Option<String>,
 }
 
 impl AppState {
@@ -2176,7 +2375,19 @@ impl AppState {
         (all, chats, all.saturating_sub(chats))
     }
 
+    pub fn pinned_count(&self) -> usize {
+        self.sessions.iter().filter(|s| s.pinned).count()
+    }
+
+    pub fn is_selected_pinned(&self) -> bool {
+        self.selected
+            .as_deref()
+            .and_then(|id| self.sessions.iter().find(|s| s.stored_id == id))
+            .is_some_and(|s| s.pinned)
+    }
+
     /// Indices into `self.sessions` matching the active filter and sidebar search query.
+    /// Pinned conversations float to the top while preserving server recency within each group.
     pub fn visible_sessions(&self) -> Vec<usize> {
         let tokens = query_tokens(&self.session_query);
         let filtered = self
@@ -2185,20 +2396,119 @@ impl AppState {
             .enumerate()
             .filter(|(_, s)| self.session_filter.matches(s));
         if tokens.is_empty() {
-            return filtered.map(|(index, _)| index).collect();
+            let mut indices: Vec<(bool, usize)> =
+                filtered.map(|(index, s)| (!s.pinned, index)).collect();
+            indices.sort_by_key(|&(unpinned, index)| (unpinned, index));
+            return indices.into_iter().map(|(_, index)| index).collect();
         }
-        let mut ranked: Vec<(usize, usize)> = filtered
+        let mut ranked: Vec<(usize, bool, usize)> = filtered
             .filter_map(|(index, s)| {
-                let fork_tag = if s.is_branch { "branch fork" } else { "" };
-                let key = normalize(&format!(
-                    "{} {} {} {fork_tag}",
-                    s.title, s.source, s.stored_id
-                ));
-                match_tokens(&key, &tokens).map(|score| (score, index))
+                session_search_score(s, &tokens).map(|score| (score, !s.pinned, index))
             })
             .collect();
-        ranked.sort_by_key(|&(score, index)| (score, index));
-        ranked.into_iter().map(|(_, index)| index).collect()
+        ranked.sort_by_key(|&(score, unpinned, index)| (score, unpinned, index));
+        ranked.into_iter().map(|(_, _, index)| index).collect()
+    }
+
+    pub fn begin_remote_search(&mut self, raw_query: &str) -> Option<(u64, String)> {
+        let trimmed = raw_query.trim();
+        self.remote_search_seq = self.remote_search_seq.saturating_add(1);
+        if trimmed.chars().count() < 2 {
+            self.remote_search_loading = false;
+            self.remote_search_query.clear();
+            self.remote_search_hits.clear();
+            return None;
+        }
+        self.remote_search_loading = true;
+        Some((self.remote_search_seq, trimmed.to_string()))
+    }
+
+    pub fn apply_search_results(
+        &mut self,
+        query: String,
+        request_seq: u64,
+        hits: Vec<SearchHit>,
+    ) -> bool {
+        if request_seq != self.remote_search_seq {
+            return false;
+        }
+        self.remote_search_loading = false;
+        self.remote_search_query = query;
+        self.remote_search_hits = hits;
+        true
+    }
+
+    pub fn has_active_remote_search(&self, query: &str) -> bool {
+        let trimmed = query.trim();
+        trimmed.chars().count() >= 2 && self.remote_search_query.eq_ignore_ascii_case(trimmed)
+    }
+
+    /// Server FTS5 hits not already present in the locally-loaded `self.sessions` slice.
+    pub fn remote_only_sidebar_hits(&self) -> Vec<&SearchHit> {
+        if !self.has_active_remote_search(&self.session_query) {
+            return Vec::new();
+        }
+        let known: std::collections::HashSet<&str> =
+            self.sessions.iter().map(|s| s.stored_id.as_str()).collect();
+        self.remote_search_hits
+            .iter()
+            .filter(|hit| !known.contains(hit.stored_id.as_str()))
+            .filter(|hit| sidebar_filter_matches_hit(self.session_filter, hit))
+            .collect()
+    }
+
+    pub fn apply_mutation(
+        &mut self,
+        stored_id: &str,
+        mutation: &SessionMutation,
+    ) -> MutationOutcome {
+        match mutation {
+            SessionMutation::Rename(title) => {
+                self.apply_rename(stored_id, title);
+                MutationOutcome::Updated
+            }
+            SessionMutation::SetPinned(pinned) => {
+                self.apply_pinned(stored_id, *pinned);
+                MutationOutcome::Updated
+            }
+            SessionMutation::Archive => {
+                self.remote_search_hits.retain(|h| h.stored_id != stored_id);
+                if self.remove_session(stored_id) {
+                    self.transcript_find.close();
+                    self.pending_find_query = None;
+                    MutationOutcome::ArchivedSelected
+                } else {
+                    MutationOutcome::ArchivedOther
+                }
+            }
+        }
+    }
+
+    fn apply_rename(&mut self, stored_id: &str, title: &str) {
+        let clean = title.trim();
+        if clean.is_empty() {
+            return;
+        }
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.stored_id == stored_id) {
+            session.title = clean.to_string();
+        }
+        for hit in &mut self.remote_search_hits {
+            if hit.stored_id == stored_id {
+                hit.title = clean.to_string();
+            }
+        }
+        self.sync_branch_flags();
+    }
+
+    fn apply_pinned(&mut self, stored_id: &str, pinned: bool) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.stored_id == stored_id) {
+            session.pinned = pinned;
+        }
+        for hit in &mut self.remote_search_hits {
+            if hit.stored_id == stored_id {
+                hit.pinned = pinned;
+            }
+        }
     }
 
     pub fn active_draft(&self) -> &str {
@@ -2295,6 +2605,7 @@ impl AppState {
 
     pub fn disconnect(&mut self) {
         self.cancel_pending_launch();
+        self.remote_search_loading = false;
         for conversation in self.conversations.values_mut() {
             if conversation.status.busy() {
                 conversation.status = TurnStatus::Unknown;
@@ -2312,6 +2623,25 @@ impl AppState {
     }
 }
 
+fn session_search_score(session: &SessionSummary, tokens: &[String]) -> Option<usize> {
+    let fork_tag = if session.is_branch { "branch fork" } else { "" };
+    let pin_tag = if session.pinned { "pinned star" } else { "" };
+    let key = normalize(&format!(
+        "{} {} {} {} {} {fork_tag} {pin_tag}",
+        session.title, session.preview, session.model, session.source, session.stored_id
+    ));
+    match_tokens(&key, tokens)
+}
+
+fn sidebar_filter_matches_hit(filter: SessionFilter, hit: &SearchHit) -> bool {
+    match filter {
+        SessionFilter::All => true,
+        SessionFilter::Chats => classify_source(&hit.source) == SourceKind::Interactive,
+        SessionFilter::Auto => classify_source(&hit.source) == SourceKind::Automated,
+        SessionFilter::Pinned => hit.pinned,
+    }
+}
+
 fn fallback_session_title(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2326,24 +2656,41 @@ pub fn build_palette_entries(
     query: &str,
     now_epoch_secs: i64,
 ) -> Vec<PaletteEntry> {
-    let mut all = palette_commands(state);
-    let cmd_count = all.len();
-    all.extend(palette_sessions(state, now_epoch_secs));
+    let commands = palette_commands(state);
+    let sessions = palette_sessions(state, query, now_epoch_secs);
     let tokens = query_tokens(query);
     if tokens.is_empty() {
+        let mut all = commands;
+        all.extend(sessions);
         return all;
     }
-    let mut ranked: Vec<(usize, u8, usize, PaletteEntry)> = all
+    let mut ranked = rank_palette_slice(commands, &tokens, 0, false);
+    ranked.extend(rank_palette_slice(sessions, &tokens, 1, true));
+    ranked.sort_by_key(|&(score, kind_rank, index, _)| (score, kind_rank, index));
+    let mut out: Vec<PaletteEntry> = ranked.into_iter().map(|(_, _, _, entry)| entry).collect();
+    out.extend(palette_remote_hits(state, query, now_epoch_secs));
+    out
+}
+
+fn rank_palette_slice(
+    entries: Vec<PaletteEntry>,
+    tokens: &[String],
+    kind_rank: u8,
+    include_fts_enriched: bool,
+) -> Vec<(usize, u8, usize, PaletteEntry)> {
+    entries
         .into_iter()
         .enumerate()
         .filter_map(|(index, entry)| {
-            let score = match_tokens(&entry.search_key(), &tokens)?;
-            let kind_rank = u8::from(index >= cmd_count);
-            Some((score, kind_rank, index, entry))
+            if let Some(score) = match_tokens(&entry.search_key(), tokens) {
+                Some((score, kind_rank, index, entry))
+            } else if include_fts_enriched && entry.subtitle_markup.is_some() {
+                Some((50 + index, kind_rank, index, entry))
+            } else {
+                None
+            }
         })
-        .collect();
-    ranked.sort_by_key(|&(score, kind_rank, index, _)| (score, kind_rank, index));
-    ranked.into_iter().map(|(_, _, _, entry)| entry).collect()
+        .collect()
 }
 
 fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
@@ -2364,6 +2711,7 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
             "Ctrl+N",
         ));
     }
+    out.extend(palette_curation_commands(state, conversation, connected));
     out.extend(palette_timeline_commands(
         state,
         conversation,
@@ -2382,6 +2730,60 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
     out.extend(palette_inspector_commands(state, writable));
     out.extend(palette_filter_commands(state));
     out.extend(palette_utility_commands(state, connected));
+    out
+}
+
+fn palette_curation_commands(
+    state: &AppState,
+    conversation: Option<&Conversation>,
+    connected: bool,
+) -> Vec<PaletteEntry> {
+    let mut out = Vec::new();
+    if conversation.is_some_and(|c| !c.messages.is_empty()) {
+        out.push(PaletteEntry::command(
+            PaletteAction::FindInTranscript,
+            "edit-find-symbolic",
+            "Find in current transcript…",
+            "Jump through messages in the open conversation (/find)",
+            "Ctrl+Shift+F",
+        ));
+    }
+    if connected && state.selected.is_some() {
+        let pinned = state.is_selected_pinned();
+        let mut pin = PaletteEntry::command(
+            PaletteAction::TogglePinCurrent,
+            if pinned {
+                "non-starred-symbolic"
+            } else {
+                "starred-symbolic"
+            },
+            if pinned {
+                "Unpin current conversation"
+            } else {
+                "Pin current conversation"
+            },
+            "Keep important threads anchored at the top of the sidebar (/pin)",
+            "Ctrl+P",
+        );
+        if pinned {
+            pin.badge = "PINNED".into();
+        }
+        out.push(pin);
+        out.push(PaletteEntry::command(
+            PaletteAction::RenameCurrent,
+            "document-edit-symbolic",
+            "Rename current conversation…",
+            "Set a custom title persisted on the Hermes server (/rename)",
+            "F2",
+        ));
+        out.push(PaletteEntry::command(
+            PaletteAction::ArchiveCurrent,
+            "folder-download-symbolic",
+            "Archive current conversation",
+            "Hide from active lists while keeping server history searchable (/archive)",
+            "Ctrl+Shift+E",
+        ));
+    }
     out
 }
 
@@ -2487,7 +2889,14 @@ fn palette_inspector_commands(state: &AppState, writable: bool) -> Vec<PaletteEn
 
 fn palette_filter_commands(state: &AppState) -> Vec<PaletteEntry> {
     let (all, chats, auto) = state.filter_counts();
+    let pinned = state.pinned_count();
     let specs = [
+        (
+            SessionFilter::Pinned,
+            "starred-symbolic",
+            "Show pinned conversations",
+            format!("{pinned} starred threads"),
+        ),
         (
             SessionFilter::Chats,
             "user-available-symbolic",
@@ -2538,8 +2947,8 @@ fn palette_utility_commands(state: &AppState, connected: bool) -> Vec<PaletteEnt
         PaletteEntry::command(
             PaletteAction::FocusFilter,
             "system-search-symbolic",
-            "Filter sidebar conversations",
-            "Focus the sidebar search input",
+            "Filter & search all conversations",
+            "Focus sidebar search (queries local + full server FTS5)",
             "Ctrl+F",
         ),
     ];
@@ -2584,37 +2993,127 @@ fn palette_utility_commands(state: &AppState, connected: bool) -> Vec<PaletteEnt
     out
 }
 
-fn palette_sessions(state: &AppState, now_epoch_secs: i64) -> Vec<PaletteEntry> {
-    state
-        .sessions
-        .iter()
+fn palette_sessions(state: &AppState, query: &str, now_epoch_secs: i64) -> Vec<PaletteEntry> {
+    let fts_active = state.has_active_remote_search(query);
+    let mut ordered: Vec<&SessionSummary> = state.sessions.iter().collect();
+    ordered.sort_by_key(|s| !s.pinned);
+    ordered
+        .into_iter()
         .map(|session| {
-            let icon = if classify_source(&session.source) == SourceKind::Automated {
-                "alarm-symbolic"
-            } else {
-                "mail-send-symbolic"
-            };
-            let title = if session.title.is_empty() {
-                "Untitled conversation".into()
-            } else {
-                session.title.clone()
-            };
-            let mut subtitle = session_meta_line(session, now_epoch_secs);
-            if session.is_branch {
-                subtitle.push_str(" · fork");
-            }
-            PaletteEntry {
-                action: PaletteAction::OpenSession(session.stored_id.clone()),
-                icon,
-                title,
-                subtitle,
-                shortcut: "",
-                badge: source_badge(&session.source),
-                active: state.selected.as_deref() == Some(session.stored_id.as_str()),
-                destructive: false,
-            }
+            build_local_palette_session(state, session, query, fts_active, now_epoch_secs)
         })
         .collect()
+}
+
+fn build_local_palette_session(
+    state: &AppState,
+    session: &SessionSummary,
+    query: &str,
+    fts_active: bool,
+    now_epoch_secs: i64,
+) -> PaletteEntry {
+    let icon = session_palette_icon(&session.source, session.pinned);
+    let title = fallback_session_title(&session.title);
+    let fts_hit = fts_active
+        .then(|| {
+            state
+                .remote_search_hits
+                .iter()
+                .find(|h| h.stored_id == session.stored_id)
+        })
+        .flatten();
+    let (action, subtitle, subtitle_markup) = if let Some(hit) = fts_hit {
+        (
+            PaletteAction::OpenSearchHit {
+                stored_id: session.stored_id.clone(),
+                query: query.trim().to_string(),
+            },
+            hit.snippet_plain.clone(),
+            Some(hit.snippet_markup.clone()),
+        )
+    } else {
+        let mut sub = session_meta_line(session, now_epoch_secs);
+        if session.is_branch {
+            sub.push_str(" · fork");
+        }
+        (
+            PaletteAction::OpenSession(session.stored_id.clone()),
+            sub,
+            None,
+        )
+    };
+    PaletteEntry {
+        action,
+        icon,
+        title,
+        subtitle,
+        subtitle_markup,
+        shortcut: "",
+        badge: if session.pinned {
+            "★ PIN".into()
+        } else {
+            source_badge(&session.source)
+        },
+        active: state.selected.as_deref() == Some(session.stored_id.as_str()),
+        destructive: false,
+    }
+}
+
+fn palette_remote_hits(state: &AppState, query: &str, now_epoch_secs: i64) -> Vec<PaletteEntry> {
+    if !state.has_active_remote_search(query) {
+        return Vec::new();
+    }
+    let known: std::collections::HashSet<&str> = state
+        .sessions
+        .iter()
+        .map(|s| s.stored_id.as_str())
+        .collect();
+    let trimmed = query.trim().to_string();
+    state
+        .remote_search_hits
+        .iter()
+        .filter(|hit| !known.contains(hit.stored_id.as_str()))
+        .map(|hit| build_remote_palette_entry(state, hit, &trimmed, now_epoch_secs))
+        .collect()
+}
+
+fn build_remote_palette_entry(
+    state: &AppState,
+    hit: &SearchHit,
+    query: &str,
+    now_epoch_secs: i64,
+) -> PaletteEntry {
+    let age = format_relative_age(&hit.updated_at, now_epoch_secs).unwrap_or_default();
+    let subtitle = if hit.snippet_plain.is_empty() {
+        format!("{} msgs · {age}", hit.message_count)
+    } else {
+        hit.snippet_plain.clone()
+    };
+    let subtitle_markup = (!hit.snippet_markup.is_empty()).then(|| hit.snippet_markup.clone());
+    PaletteEntry {
+        action: PaletteAction::OpenSearchHit {
+            stored_id: hit.stored_id.clone(),
+            query: query.to_string(),
+        },
+        icon: session_palette_icon(&hit.source, hit.pinned),
+        title: fallback_session_title(&hit.title),
+        subtitle,
+        subtitle_markup,
+        shortcut: "",
+        badge: "FTS5".into(),
+        active: state.selected.as_deref() == Some(hit.stored_id.as_str()),
+        destructive: false,
+    }
+}
+
+fn session_palette_icon(source: &str, pinned: bool) -> &'static str {
+    if pinned {
+        "starred-symbolic"
+    } else if classify_source(source) == SourceKind::Automated {
+        "alarm-symbolic"
+    } else {
+        "mail-send-symbolic"
+    }
 }
 
 #[cfg(test)]
@@ -3753,5 +4252,148 @@ mod tests {
                 .any(|e| e.badge == "PARENT"
                     && e.action == PaletteAction::OpenSession("root".into()))
         );
+    }
+
+    #[test]
+    fn curation_slash_commands_parse_cleanly() {
+        assert_eq!(
+            parse_composer_input("/find"),
+            ComposerIntent::FindInTranscript(None)
+        );
+        assert_eq!(
+            parse_composer_input("/search tokio channel"),
+            ComposerIntent::FindInTranscript(Some("tokio channel".into()))
+        );
+        assert_eq!(parse_composer_input("/pin"), ComposerIntent::TogglePin);
+        assert_eq!(parse_composer_input("/archive"), ComposerIntent::Archive);
+        assert_eq!(parse_composer_input("/rename"), ComposerIntent::Empty);
+        assert_eq!(
+            parse_composer_input("/rename Hyprland monitor layout"),
+            ComposerIntent::Rename("Hyprland monitor layout".into())
+        );
+    }
+
+    #[test]
+    fn pinned_sessions_float_first_and_mutations_sync_state() {
+        let mut state = AppState {
+            selected: Some("s2".into()),
+            sessions: vec![
+                sample_session("s1", "First unpinned", "tui", 4),
+                SessionSummary {
+                    pinned: true,
+                    model: "anthropic/claude-sonnet-4-5".into(),
+                    ..sample_session("s2", "Starred thread", "tui", 9)
+                },
+                sample_session("s3", "Third unpinned", "cron", 2),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.pinned_count(), 1);
+        assert!(state.is_selected_pinned());
+        assert_eq!(state.visible_sessions(), vec![1, 0, 2]);
+        state.session_filter = SessionFilter::Pinned;
+        assert_eq!(state.visible_sessions(), vec![1]);
+        assert!(session_meta_line(&state.sessions[1], 1_700_000_120).contains("claude-sonnet-4-5"));
+
+        assert_eq!(
+            state.apply_mutation("s2", &SessionMutation::Rename("Renamed star".into())),
+            MutationOutcome::Updated
+        );
+        assert_eq!(state.sessions[1].title, "Renamed star");
+        assert_eq!(
+            state.apply_mutation("s2", &SessionMutation::SetPinned(false)),
+            MutationOutcome::Updated
+        );
+        assert!(!state.is_selected_pinned());
+        assert_eq!(
+            state.apply_mutation("s2", &SessionMutation::Archive),
+            MutationOutcome::ArchivedSelected
+        );
+        assert!(state.selected.is_none());
+        assert_eq!(state.sessions.len(), 2);
+    }
+
+    #[test]
+    fn transcript_find_steps_and_tracks_active_match() {
+        let msgs = vec![
+            ChatMessage {
+                id: "1".into(),
+                role: Role::User,
+                text: "Check tailscale funnel".into(),
+            },
+            ChatMessage {
+                id: "2".into(),
+                role: Role::Assistant,
+                text: "Done configuring".into(),
+            },
+            ChatMessage {
+                id: "3".into(),
+                role: Role::User,
+                text: "Verify tailscale status".into(),
+            },
+        ];
+        let mut find = TranscriptFind::default();
+        find.open_with("tailscale", &msgs);
+        assert_eq!(find.matches, vec![0, 2]);
+        assert_eq!(find.status_label(), "1 / 2");
+        assert_eq!(find.match_state(0), (true, true));
+        assert_eq!(find.match_state(2), (true, false));
+        assert_eq!(find.step(1), Some(2));
+        assert_eq!(find.status_label(), "2 / 2");
+        assert_eq!(find.step(1), Some(0));
+        assert_eq!(find.step(-1), Some(2));
+        find.close();
+        assert_eq!(find.match_state(0), (false, false));
+    }
+
+    #[test]
+    fn palette_and_sidebar_merge_remote_fts5_hits_without_duplicates() {
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            sessions: vec![sample_session("local-1", "Daily notes", "tui", 6)],
+            session_query: "lattice".into(),
+            ..Default::default()
+        };
+        let (seq, q) = state.begin_remote_search("lattice").expect("search seq");
+        assert_eq!(q, "lattice");
+        assert!(!state.apply_search_results("lattice".into(), seq + 9, Vec::new()));
+        let hits = vec![
+            SearchHit {
+                stored_id: "local-1".into(),
+                title: "Daily notes".into(),
+                source: "tui".into(),
+                snippet_plain: "Reply with lattice".into(),
+                snippet_markup: "Reply with <b>lattice</b>".into(),
+                ..Default::default()
+            },
+            SearchHit {
+                stored_id: "deep-999".into(),
+                title: "Archived months ago".into(),
+                source: "local".into(),
+                snippet_plain: "Found lattice crystal".into(),
+                snippet_markup: "Found <b>lattice</b> crystal".into(),
+                message_count: 18,
+                updated_at: "1700000000".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(state.apply_search_results("lattice".into(), seq, hits));
+        assert_eq!(state.remote_only_sidebar_hits().len(), 1);
+        let entries = build_palette_entries(&state, "lattice", 1_700_000_300);
+        assert!(entries.iter().any(|e| {
+            e.action
+                == PaletteAction::OpenSearchHit {
+                    stored_id: "local-1".into(),
+                    query: "lattice".into(),
+                }
+        }));
+        assert!(entries.iter().any(|e| {
+            e.badge == "FTS5"
+                && e.action
+                    == PaletteAction::OpenSearchHit {
+                        stored_id: "deep-999".into(),
+                        query: "lattice".into(),
+                    }
+        }));
     }
 }

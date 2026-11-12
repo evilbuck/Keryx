@@ -11,6 +11,7 @@ use crate::inspector::{InspectorAction, InspectorPanel};
 use crate::markdown;
 use crate::model::*;
 use crate::palette::{self, CommandPalette, TriageBar};
+use crate::recall::{self, SidebarRowItem, TranscriptFindBar};
 
 struct Ui {
     backend: Option<Backend>,
@@ -22,6 +23,10 @@ struct Ui {
     palette: RefCell<Option<Rc<CommandPalette>>>,
     palette_trigger: gtk::Button,
     branch_chat: gtk::Button,
+    find_chat: gtk::Button,
+    pin_chat: gtk::Button,
+    rename_chat: gtk::Button,
+    find_bar: Rc<TranscriptFindBar>,
     inspector: InspectorPanel,
     inspector_toggle: gtk::Button,
     inspector_badge: gtk::Label,
@@ -66,6 +71,7 @@ struct Ui {
     rendered_session: RefCell<Option<String>>,
     rendered_revision: Cell<u64>,
     rendered_row_gate: Cell<(bool, bool)>,
+    rendered_find_stamp: RefCell<(bool, String, usize, usize)>,
     rendered_lineage: RefCell<Option<LineageStamp>>,
     rendered_interaction: RefCell<Option<(String, String)>>,
     changing_draft: Cell<bool>,
@@ -73,6 +79,7 @@ struct Ui {
     select_created: Cell<bool>,
     suppress_selection: Cell<bool>,
     sequence: Cell<u64>,
+    search_debounce_seq: Cell<u64>,
 }
 
 type LineageStamp = (
@@ -81,6 +88,8 @@ type LineageStamp = (
     Vec<(String, String)>,
 );
 
+type FindRenderStamp = (bool, String, usize, usize);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MessageRowData {
     index: usize,
@@ -88,6 +97,8 @@ struct MessageRowData {
     can_branch: bool,
     can_edit_retry: bool,
     can_regenerate: bool,
+    is_match: bool,
+    is_active_match: bool,
 }
 
 fn row_action_gates(
@@ -104,8 +115,18 @@ fn row_action_gates(
     (can_branch, writable_idle)
 }
 
+fn find_render_stamp(find: &TranscriptFind) -> FindRenderStamp {
+    (
+        find.open,
+        find.query.clone(),
+        find.active_pos,
+        find.matches.len(),
+    )
+}
+
 fn build_message_rows(
     conversation: Option<&Conversation>,
+    find: &TranscriptFind,
     connected: bool,
     creating: bool,
 ) -> Vec<MessageRowData> {
@@ -117,12 +138,18 @@ fn build_message_rows(
     c.messages
         .iter()
         .enumerate()
-        .map(|(index, message)| MessageRowData {
-            index,
-            message: message.clone(),
-            can_branch: can_branch_gate && is_branchable_message(message),
-            can_edit_retry: writable_idle && last_user.as_deref() == Some(message.id.as_str()),
-            can_regenerate: writable_idle && last_assistant.as_deref() == Some(message.id.as_str()),
+        .map(|(index, message)| {
+            let (is_match, is_active_match) = find.match_state(index);
+            MessageRowData {
+                index,
+                message: message.clone(),
+                can_branch: can_branch_gate && is_branchable_message(message),
+                can_edit_retry: writable_idle && last_user.as_deref() == Some(message.id.as_str()),
+                can_regenerate: writable_idle
+                    && last_assistant.as_deref() == Some(message.id.as_str()),
+                is_match,
+                is_active_match,
+            }
         })
         .collect()
 }
@@ -300,10 +327,28 @@ fn editor_editable(state: &AppState) -> bool {
 }
 
 fn can_send_in_conversation(c: &Conversation) -> bool {
+    let intent = parse_composer_input(&c.draft);
+    if is_curation_or_find_intent(&intent) {
+        return true;
+    }
     if c.runtime_id.is_none() || c.read_only_reason.is_some() || c.rewinding {
         return false;
     }
-    match parse_composer_input(&c.draft) {
+    can_send_live_intent(c, &intent)
+}
+
+fn is_curation_or_find_intent(intent: &ComposerIntent) -> bool {
+    matches!(
+        intent,
+        ComposerIntent::FindInTranscript(_)
+            | ComposerIntent::TogglePin
+            | ComposerIntent::Rename(_)
+            | ComposerIntent::Archive
+    )
+}
+
+fn can_send_live_intent(c: &Conversation, intent: &ComposerIntent) -> bool {
+    match intent {
         ComposerIntent::Empty => false,
         ComposerIntent::SideQuestion(_) => true,
         ComposerIntent::Branch(_) => {
@@ -311,6 +356,7 @@ fn can_send_in_conversation(c: &Conversation) -> bool {
         }
         ComposerIntent::Rewind(_) => !c.status.busy() && last_turn_targets(&c.messages).0.is_some(),
         ComposerIntent::Prompt(_) => c.status != TurnStatus::Stopping,
+        _ => false,
     }
 }
 
@@ -333,17 +379,17 @@ fn composer_send_sensitive(state: &AppState, reload_pending: bool) -> bool {
 
 fn composer_hint_text(state: &AppState) -> &'static str {
     let Some(id) = &state.selected else {
-        return "Enter to start a new chat · Shift+Enter new line · Ctrl+K commands";
+        return "Enter to start a new chat · Shift+Enter new line · Ctrl+K omnisearch";
     };
     let Some(c) = state.conversations.get(id) else {
-        return "Enter to send · Alt+Enter side-ask (/btw) · Ctrl+I Flight Deck";
+        return "Enter to send · Alt+Enter side-ask (/btw) · Ctrl+Shift+F find";
     };
     composer_conversation_hint(c)
 }
 
 fn composer_conversation_hint(c: &Conversation) -> &'static str {
     if c.read_only_reason.is_some() {
-        return "Read-only transcript · Ctrl+D to fork into a live chat · Ctrl+I Flight Deck";
+        return "Read-only transcript · Ctrl+Shift+F find · Ctrl+D fork · Ctrl+P pin";
     }
     if let Some(slash_hint) = composer_slash_hint(c.draft.trim_start()) {
         return slash_hint;
@@ -351,11 +397,14 @@ fn composer_conversation_hint(c: &Conversation) -> &'static str {
     if c.status.steerable() {
         "Enter to steer active turn · Alt+Enter or /btw side-ask · Ctrl+I Flight Deck"
     } else {
-        "Enter to send · /branch or Ctrl+D to fork · /retry to edit last · Ctrl+I Deck"
+        "Enter to send · /find · /pin · /rename · /branch · /retry · Ctrl+K omnisearch"
     }
 }
 
 fn composer_slash_hint(trimmed: &str) -> Option<&'static str> {
+    if let Some(hint) = composer_curation_slash_hint(trimmed) {
+        return Some(hint);
+    }
     if trimmed.starts_with("/btw") || trimmed.starts_with("/ask") {
         return Some("Enter to ask snapshot side question (/btw) · never saved to history");
     }
@@ -369,6 +418,16 @@ fn composer_slash_hint(trimmed: &str) -> Option<&'static str> {
         return Some("Enter to rewind last turn (/undo drop · /retry edit · /regen re-run)");
     }
     None
+}
+
+fn composer_curation_slash_hint(trimmed: &str) -> Option<&'static str> {
+    match trimmed.split_whitespace().next().unwrap_or("") {
+        "/find" | "/search" => Some("Enter to search within this transcript (/find [query])"),
+        "/pin" => Some("Enter to pin or unpin this conversation on the server (/pin)"),
+        "/rename" | "/title" => Some("Enter to rename this conversation (/rename <new title>)"),
+        "/archive" => Some("Enter to archive this conversation on the server (/archive)"),
+        _ => None,
+    }
 }
 
 fn build_branch_trigger() -> gtk::Button {
@@ -429,6 +488,7 @@ fn bind_message_row(object: &glib::Object) {
     speaker.set_hexpand(true);
     speaker.set_xalign(0.0);
     heading.append(&speaker);
+    apply_message_match_chrome(&row, &heading, &data);
     append_message_actions(&heading, &data);
     let copy = icon_button("edit-copy-symbolic", "Copy original message");
     copy.add_css_class("flat");
@@ -448,6 +508,24 @@ fn bind_message_row(object: &glib::Object) {
         .child(&row)
         .build();
     item.set_child(Some(&column));
+}
+
+fn apply_message_match_chrome(row: &gtk::Box, heading: &gtk::Box, data: &MessageRowData) {
+    if !data.is_match {
+        return;
+    }
+    row.add_css_class("message-match");
+    let text = if data.is_active_match {
+        row.add_css_class("message-match-active");
+        "ACTIVE MATCH"
+    } else {
+        "MATCH"
+    };
+    let badge = gtk::Label::new(Some(text));
+    badge.add_css_class("source-badge");
+    badge.add_css_class("match-badge");
+    badge.set_valign(gtk::Align::Center);
+    heading.append(&badge);
 }
 
 fn append_message_actions(heading: &gtk::Box, data: &MessageRowData) {
@@ -562,9 +640,21 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     let delete_chat = icon_button("user-trash-symbolic", "Delete conversation");
     delete_chat.add_css_class("flat");
     delete_chat.set_visible(false);
+    let rename_chat = icon_button("document-edit-symbolic", "Rename conversation · F2");
+    rename_chat.add_css_class("flat");
+    rename_chat.set_visible(false);
+    let pin_chat = icon_button("non-starred-symbolic", "Pin conversation · Ctrl+P");
+    pin_chat.add_css_class("flat");
+    pin_chat.set_visible(false);
+    let find_chat = icon_button("edit-find-symbolic", "Find in transcript · Ctrl+Shift+F");
+    find_chat.add_css_class("flat");
+    find_chat.set_visible(false);
     header.pack_end(&inspector_toggle);
     header.pack_end(&reconnect);
     header.pack_end(&delete_chat);
+    header.pack_end(&rename_chat);
+    header.pack_end(&pin_chat);
+    header.pack_end(&find_chat);
     header.pack_end(&connection);
 
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -591,7 +681,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     selection.set_autoselect(false);
     selection.set_can_unselect(true);
     let session_factory = gtk::SignalListItemFactory::new();
-    session_factory.connect_bind(|_, object| palette::bind_session_row(object));
+    session_factory.connect_bind(|_, object| recall::bind_sidebar_row(object));
     let session_list = gtk::ListView::new(Some(selection.clone()), Some(session_factory));
     // This property selects the row under the pointer. Leave it off so hover
     // cannot resume a conversation; clicks and arrow keys still select.
@@ -633,6 +723,8 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     history_bar.append(&older);
     history_bar.append(&latest);
     main.append(&history_bar);
+    let find_bar = TranscriptFindBar::new();
+    main.append(&find_bar.root);
 
     let messages = gio::ListStore::new::<glib::BoxedAnyObject>();
     let message_factory = gtk::SignalListItemFactory::new();
@@ -837,6 +929,10 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         palette: RefCell::new(None),
         palette_trigger,
         branch_chat,
+        find_chat,
+        pin_chat,
+        rename_chat,
+        find_bar,
         inspector,
         inspector_toggle,
         inspector_badge,
@@ -881,6 +977,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         rendered_session: RefCell::new(None),
         rendered_revision: Cell::new(u64::MAX),
         rendered_row_gate: Cell::new((false, false)),
+        rendered_find_stamp: RefCell::new((false, String::new(), 0, 0)),
         rendered_lineage: RefCell::new(None),
         rendered_interaction: RefCell::new(None),
         changing_draft: Cell::new(false),
@@ -888,6 +985,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         select_created: Cell::new(false),
         suppress_selection: Cell::new(false),
         sequence: Cell::new(0),
+        search_debounce_seq: Cell::new(0),
     });
     let pointer_row_click = Rc::new(Cell::new(false));
     connect_actions(&ui, &session_list, &pointer_row_click);
@@ -1114,11 +1212,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
             return;
         }
         // Enter and double-click. A single click selects without activating.
-        let Some(id) = ui.session_id_at(position) else {
-            return;
-        };
-        ui.select_created.set(false);
-        ui.select(&id, true);
+        ui.activate_sidebar_position(position, true);
     });
     watch_sidebar_clicks(session_list, pointer_row_click, ui);
     let weak = Rc::downgrade(ui);
@@ -1260,9 +1354,11 @@ fn connect_workspace(ui: &Rc<Ui>) {
     }));
     let weak = Rc::downgrade(ui);
     palette.connect_query(move |palette| {
-        let _ = weak
-            .upgrade()
-            .map(|ui| palette.populate(&ui.state.borrow()));
+        if let Some(ui) = weak.upgrade() {
+            let query = palette.query_text();
+            ui.queue_remote_search(&query);
+            palette.populate(&ui.state.borrow());
+        }
     });
     *ui.palette.borrow_mut() = Some(palette);
 
@@ -1276,6 +1372,7 @@ fn connect_workspace(ui: &Rc<Ui>) {
     });
     connect_inspector(ui);
     connect_timeline(ui);
+    connect_recall_and_curation(ui);
 
     let weak_filter = Rc::downgrade(ui);
     let weak_query = Rc::downgrade(ui);
@@ -1289,7 +1386,8 @@ fn connect_workspace(ui: &Rc<Ui>) {
         },
         move |query| {
             let _ = weak_query.upgrade().map(|ui| {
-                ui.state.borrow_mut().session_query = query;
+                ui.state.borrow_mut().session_query = query.clone();
+                ui.queue_remote_search(&query);
                 ui.refresh_sessions();
             });
         },
@@ -1396,6 +1494,41 @@ fn parse_rewind_action(kind: &str) -> Option<RewindMode> {
     }
 }
 
+fn connect_recall_and_curation(ui: &Rc<Ui>) {
+    let weak = Rc::downgrade(ui);
+    ui.find_chat.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.open_transcript_find(None));
+    });
+    let weak = Rc::downgrade(ui);
+    ui.pin_chat.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.toggle_pin_current());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.rename_chat.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.prompt_rename_current());
+    });
+    let weak_q = Rc::downgrade(ui);
+    let weak_step = Rc::downgrade(ui);
+    let weak_older = Rc::downgrade(ui);
+    let weak_close = Rc::downgrade(ui);
+    ui.find_bar.connect(
+        move |query| {
+            let _ = weak_q
+                .upgrade()
+                .map(|ui| ui.update_transcript_find_query(query));
+        },
+        move |delta| {
+            let _ = weak_step.upgrade().map(|ui| ui.step_transcript_find(delta));
+        },
+        move || {
+            let _ = weak_older.upgrade().map(|ui| ui.older.emit_clicked());
+        },
+        move || {
+            let _ = weak_close.upgrade().map(|ui| ui.close_transcript_find());
+        },
+    );
+}
+
 fn shortcut_command(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<char> {
     let clean = modifiers
         & (gdk::ModifierType::CONTROL_MASK
@@ -1407,11 +1540,33 @@ fn shortcut_command(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<char>
     key.to_unicode().map(|ch| ch.to_ascii_lowercase())
 }
 
+fn ctrl_shift_command(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<char> {
+    let clean = modifiers
+        & (gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::ALT_MASK);
+    if clean != (gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK) {
+        return None;
+    }
+    key.to_unicode().map(|ch| ch.to_ascii_lowercase())
+}
+
+fn is_plain_f2(key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    let clean = modifiers
+        & (gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::ALT_MASK);
+    clean.is_empty() && key == gdk::Key::F2
+}
+
 fn handle_window_shortcut(
     ui: &Rc<Ui>,
     key: gdk::Key,
     modifiers: gdk::ModifierType,
 ) -> glib::Propagation {
+    if handle_extended_shortcut(ui, key, modifiers) {
+        return glib::Propagation::Stop;
+    }
     let Some(ch) = shortcut_command(key, modifiers) else {
         return glib::Propagation::Proceed;
     };
@@ -1423,6 +1578,27 @@ fn handle_window_shortcut(
         return glib::Propagation::Proceed;
     }
     glib::Propagation::Stop
+}
+
+fn handle_extended_shortcut(ui: &Rc<Ui>, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    if is_plain_f2(key, modifiers) {
+        ui.close_palette();
+        ui.prompt_rename_current();
+        return true;
+    }
+    match ctrl_shift_command(key, modifiers) {
+        Some('f') => {
+            ui.close_palette();
+            ui.open_transcript_find(None);
+            true
+        }
+        Some('e') => {
+            ui.close_palette();
+            ui.archive_current();
+            true
+        }
+        _ => false,
+    }
 }
 
 fn dispatch_workspace_shortcut(ui: &Rc<Ui>, ch: char) -> bool {
@@ -1446,6 +1622,10 @@ fn dispatch_workspace_shortcut(ui: &Rc<Ui>, ch: char) -> bool {
         'f' => {
             ui.close_palette();
             ui.focus_sidebar_filter();
+        }
+        'p' => {
+            ui.close_palette();
+            ui.toggle_pin_current();
         }
         'm' => {
             ui.close_palette();
@@ -1515,11 +1695,18 @@ impl Ui {
     }
 
     fn select(&self, id: &str, focus_editor: bool) {
+        let switched = self.state.borrow().selected.as_deref() != Some(id);
         {
             let mut state = self.state.borrow_mut();
             state.pending_launch = None;
             state.selected = Some(id.to_string());
             state.notice.clear();
+            if switched {
+                state.pending_find_query = None;
+            }
+        }
+        if switched {
+            self.recompute_find_for_selected();
         }
         self.follow_bottom.set(true);
         let draft = self
@@ -1545,6 +1732,20 @@ impl Ui {
         }
     }
 
+    fn recompute_find_for_selected(&self) {
+        let mut state = self.state.borrow_mut();
+        if !state.transcript_find.open {
+            return;
+        }
+        let messages = state
+            .selected
+            .as_ref()
+            .and_then(|id| state.conversations.get(id))
+            .map(|c| c.messages.clone())
+            .unwrap_or_default();
+        state.transcript_find.recompute(&messages);
+    }
+
     fn resume(&self, id: &str) {
         if !self.pending_resumes.borrow_mut().insert(id.to_string()) {
             return;
@@ -1563,11 +1764,13 @@ impl Ui {
             self.submit_from_launch();
             return;
         }
+        if self.try_submit_curation_or_find() {
+            return;
+        }
         let Some((id, runtime_id, draft)) = self.extract_submit_target() else {
             return;
         };
         match parse_composer_input(&draft) {
-            ComposerIntent::Empty => {}
             ComposerIntent::SideQuestion(question) => {
                 self.dispatch_composer_side_question(&id, question);
             }
@@ -1580,7 +1783,36 @@ impl Ui {
                 self.rewind_last(mode);
             }
             ComposerIntent::Prompt(text) => self.dispatch_prompt_or_steer(id, runtime_id, text),
+            _ => {}
         }
+    }
+
+    fn try_submit_curation_or_find(&self) -> bool {
+        let candidate = {
+            let state = self.state.borrow();
+            let Some(id) = state.selected.clone() else {
+                return false;
+            };
+            let Some(c) = state.conversations.get(&id) else {
+                return false;
+            };
+            (id, parse_composer_input(&c.draft))
+        };
+        let (id, intent) = candidate;
+        if !is_curation_or_find_intent(&intent) {
+            return false;
+        }
+        self.clear_composer_draft(&id);
+        match intent {
+            ComposerIntent::FindInTranscript(query) => {
+                self.open_transcript_find(query.as_deref());
+            }
+            ComposerIntent::TogglePin => self.toggle_pin_current(),
+            ComposerIntent::Rename(title) => self.rename_current_to(title),
+            ComposerIntent::Archive => self.archive_current(),
+            _ => {}
+        }
+        true
     }
 
     fn clear_composer_draft(&self, id: &str) {
@@ -1690,10 +1922,8 @@ impl Ui {
                 return;
             };
             let question = match parse_composer_input(&c.draft) {
-                ComposerIntent::Empty | ComposerIntent::Branch(_) | ComposerIntent::Rewind(_) => {
-                    String::new()
-                }
                 ComposerIntent::SideQuestion(q) | ComposerIntent::Prompt(q) => q,
+                _ => String::new(),
             };
             (id, question)
         };
@@ -1965,6 +2195,10 @@ impl Ui {
                 self.select_created.set(false);
                 self.select(&id, true);
             }
+            PaletteAction::OpenSearchHit { stored_id, query } => {
+                self.select_created.set(false);
+                self.open_session_with_find(&stored_id, &query);
+            }
             other => self.run_palette_session_action(other),
         }
     }
@@ -1973,14 +2207,248 @@ impl Ui {
         match action {
             PaletteAction::ToggleInspector => self.toggle_inspector(),
             PaletteAction::OpenInspector(tab) => self.open_inspector(tab),
+            PaletteAction::FindInTranscript => self.open_transcript_find(None),
             PaletteAction::BranchCurrent => self.branch_from(None, None),
             PaletteAction::RewindLast(mode) => self.rewind_last(mode),
             PaletteAction::ReloadHistory => self.reload_current(),
             PaletteAction::LoadMoreSessions => self.load_more_sessions(),
             PaletteAction::Reconnect => self.trigger_reconnect(),
+            other => self.run_palette_curation_action(other),
+        }
+    }
+
+    fn run_palette_curation_action(self: &Rc<Self>, action: PaletteAction) {
+        match action {
+            PaletteAction::TogglePinCurrent => self.toggle_pin_current(),
+            PaletteAction::RenameCurrent => self.prompt_rename_current(),
+            PaletteAction::ArchiveCurrent => self.archive_current(),
             PaletteAction::DeleteCurrent => self.confirm_delete_current(),
             _ => {}
         }
+    }
+
+    fn queue_remote_search(self: &Rc<Self>, raw_query: &str) {
+        let trimmed = raw_query.trim().to_string();
+        let token = self.search_debounce_seq.get().wrapping_add(1);
+        self.search_debounce_seq.set(token);
+        if trimmed.chars().count() < 2 {
+            let _ = self.state.borrow_mut().begin_remote_search("");
+            return;
+        }
+        self.state.borrow_mut().remote_search_loading = true;
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(180), move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.fire_debounced_search(token, trimmed);
+            }
+        });
+    }
+
+    fn fire_debounced_search(&self, token: u64, query: String) {
+        if self.search_debounce_seq.get() != token {
+            return;
+        }
+        let request_seq = {
+            let mut state = self.state.borrow_mut();
+            if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+                state.remote_search_loading = false;
+                None
+            } else {
+                state.begin_remote_search(&query)
+            }
+        };
+        if let Some((request_seq, clean_query)) = request_seq
+            && !self.command(Command::SearchSessions {
+                query: clean_query,
+                request_seq,
+            })
+        {
+            self.state.borrow_mut().remote_search_loading = false;
+        }
+        self.refresh_sessions();
+    }
+
+    fn open_session_with_find(&self, stored_id: &str, query: &str) {
+        ensure_session_from_search_hit(&mut self.state.borrow_mut(), stored_id);
+        let clean_query = query.trim().to_string();
+        self.select(stored_id, false);
+        if clean_query.is_empty() {
+            self.editor.grab_focus();
+            return;
+        }
+        let ready_now = !self.pending_resumes.borrow().contains(stored_id)
+            && self
+                .state
+                .borrow()
+                .conversations
+                .get(stored_id)
+                .is_some_and(|c| c.loaded);
+        if ready_now {
+            self.open_transcript_find(Some(&clean_query));
+        } else {
+            self.state.borrow_mut().pending_find_query = Some(clean_query);
+        }
+    }
+
+    fn open_transcript_find(&self, initial_query: Option<&str>) {
+        let active_idx = {
+            let mut state = self.state.borrow_mut();
+            let Some(id) = state.selected.clone() else {
+                return;
+            };
+            let query =
+                initial_query.map_or_else(|| state.transcript_find.query.clone(), str::to_string);
+            let messages = state
+                .conversations
+                .get(&id)
+                .map(|c| c.messages.clone())
+                .unwrap_or_default();
+            state.transcript_find.open_with(&query, &messages);
+            state.transcript_find.active_message_index()
+        };
+        if active_idx.is_some() {
+            self.follow_bottom.set(false);
+        }
+        self.refresh();
+        self.find_bar.focus_entry();
+        if let Some(index) = active_idx {
+            self.schedule_scroll_to_message(index);
+        }
+    }
+
+    fn update_transcript_find_query(&self, query: String) {
+        let active_idx = {
+            let mut state = self.state.borrow_mut();
+            let messages = state
+                .selected
+                .as_ref()
+                .and_then(|id| state.conversations.get(id))
+                .map(|c| c.messages.clone())
+                .unwrap_or_default();
+            state.transcript_find.set_query(query, &messages);
+            state.transcript_find.active_message_index()
+        };
+        if active_idx.is_some() {
+            self.follow_bottom.set(false);
+        }
+        self.refresh();
+        if let Some(index) = active_idx {
+            self.schedule_scroll_to_message(index);
+        }
+    }
+
+    fn step_transcript_find(&self, delta: isize) {
+        let active_idx = {
+            let mut state = self.state.borrow_mut();
+            state.transcript_find.step(delta);
+            state.transcript_find.active_message_index()
+        };
+        if active_idx.is_some() {
+            self.follow_bottom.set(false);
+        }
+        self.refresh();
+        if let Some(index) = active_idx {
+            self.schedule_scroll_to_message(index);
+        }
+    }
+
+    fn close_transcript_find(&self) {
+        self.state.borrow_mut().transcript_find.close();
+        self.refresh();
+        self.editor.grab_focus();
+    }
+
+    fn schedule_scroll_to_message(&self, index: usize) {
+        self.follow_bottom.set(false);
+        let list = self.message_list.clone();
+        let store = self.messages.clone();
+        glib::idle_add_local_once(move || {
+            if (index as u32) < store.n_items() {
+                list.scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
+            }
+        });
+    }
+
+    fn toggle_pin_current(&self) {
+        let target = {
+            let state = self.state.borrow();
+            if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+                return;
+            }
+            state
+                .selected
+                .clone()
+                .map(|id| (id, !state.is_selected_pinned()))
+        };
+        let Some((stored_id, next_pinned)) = target else {
+            return;
+        };
+        self.command(Command::MutateSession {
+            stored_id,
+            mutation: SessionMutation::SetPinned(next_pinned),
+        });
+        self.refresh();
+    }
+
+    fn rename_current_to(&self, title: String) {
+        let clean = title.trim().to_string();
+        if clean.is_empty() {
+            return;
+        }
+        let stored_id = {
+            let state = self.state.borrow();
+            if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+                return;
+            }
+            state.selected.clone()
+        };
+        let Some(stored_id) = stored_id else {
+            return;
+        };
+        self.command(Command::MutateSession {
+            stored_id,
+            mutation: SessionMutation::Rename(clean),
+        });
+        self.refresh();
+    }
+
+    fn prompt_rename_current(self: &Rc<Self>) {
+        let target = {
+            let state = self.state.borrow();
+            if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+                return;
+            }
+            let Some(id) = state.selected.clone() else {
+                return;
+            };
+            let current = session_display_title(&state, &id);
+            (id, current)
+        };
+        let (_, current_title) = target;
+        let weak = Rc::downgrade(self);
+        recall::present_rename_dialog(&self.window, &current_title, move |new_title| {
+            if let Some(ui) = weak.upgrade() {
+                ui.rename_current_to(new_title);
+            }
+        });
+    }
+
+    fn archive_current(&self) {
+        let stored_id = {
+            let state = self.state.borrow();
+            if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+                return;
+            }
+            state.selected.clone()
+        };
+        let Some(stored_id) = stored_id else {
+            return;
+        };
+        self.command(Command::MutateSession {
+            stored_id,
+            mutation: SessionMutation::Archive,
+        });
+        self.refresh();
     }
 
     fn branch_from(&self, end_inclusive: Option<usize>, custom_title: Option<String>) {
@@ -2533,22 +3001,15 @@ impl Ui {
                 read_only_reason,
                 model,
             } => {
-                self.pending_resumes.borrow_mut().remove(&stored_id);
-                let c = state.conversations.entry(stored_id).or_default();
-                c.runtime_id = runtime_id;
-                c.messages = messages;
-                c.history_before = before;
-                c.history_loading = false;
-                c.loaded = true;
-                c.read_only_reason = read_only_reason;
-                c.status = TurnStatus::Idle;
-                c.activity.clear();
-                c.interaction = None;
-                // Resume metadata is the restored stored pair; it replaces any stale claim.
-                c.model = model.map_or(ModelState::Unknown, ModelState::Confirmed);
-                *self.model_pending.borrow_mut() = None;
-                c.revision += 1;
-                c.inspector_revision += 1;
+                drop(state);
+                self.note_resumed(
+                    stored_id,
+                    runtime_id,
+                    messages,
+                    before,
+                    read_only_reason,
+                    model,
+                );
             }
             Event::History {
                 stored_id,
@@ -2556,9 +3017,8 @@ impl Ui {
                 before,
                 next_before,
             } => {
-                if let Some(c) = state.conversations.get_mut(&stored_id) {
-                    c.receive_history_page(before, next_before, messages);
-                }
+                drop(state);
+                self.note_history_page(stored_id, messages, before, next_before);
             }
             other => {
                 let meta = self.apply_history(&mut state, &other);
@@ -2572,7 +3032,60 @@ impl Ui {
         }
     }
 
-    /// Session-list, title, deletion, and failure events.
+    fn note_resumed(
+        &self,
+        stored_id: String,
+        runtime_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        before: usize,
+        read_only_reason: Option<String>,
+        model: Option<ModelIdentity>,
+    ) {
+        self.pending_resumes.borrow_mut().remove(&stored_id);
+        *self.model_pending.borrow_mut() = None;
+        let jump_idx = {
+            let mut state = self.state.borrow_mut();
+            let c = state.conversations.entry(stored_id.clone()).or_default();
+            c.runtime_id = runtime_id;
+            c.messages = messages;
+            c.history_before = before;
+            c.history_loading = false;
+            c.loaded = true;
+            c.read_only_reason = read_only_reason;
+            c.status = TurnStatus::Idle;
+            c.activity.clear();
+            c.interaction = None;
+            // Resume metadata is the restored stored pair; it replaces any stale claim.
+            c.model = model.map_or(ModelState::Unknown, ModelState::Confirmed);
+            c.revision += 1;
+            c.inspector_revision += 1;
+            sync_find_after_transcript_load(&mut state, &stored_id)
+        };
+        if let Some(index) = jump_idx {
+            self.schedule_scroll_to_message(index);
+        }
+    }
+
+    fn note_history_page(
+        &self,
+        stored_id: String,
+        messages: Vec<ChatMessage>,
+        before: usize,
+        next_before: usize,
+    ) {
+        let jump_idx = {
+            let mut state = self.state.borrow_mut();
+            if let Some(c) = state.conversations.get_mut(&stored_id) {
+                c.receive_history_page(before, next_before, messages);
+            }
+            sync_find_after_history_page(&mut state, &stored_id)
+        };
+        if let Some(index) = jump_idx {
+            self.schedule_scroll_to_message(index);
+        }
+    }
+
+    /// Session-list, title, search, curation, deletion, and failure events.
     fn apply_history(&self, state: &mut AppState, event: &Event) -> MetaOutcome {
         match event {
             Event::SessionTitle { session_id, title } => {
@@ -2582,6 +3095,15 @@ impl Ui {
                     MetaOutcome::Handled
                 }
             }
+            Event::SearchResults {
+                query,
+                request_seq,
+                hits,
+            } => apply_search_event(state, query, *request_seq, hits),
+            Event::SessionMutated {
+                stored_id,
+                mutation,
+            } => apply_mutation_event(state, stored_id, mutation),
             Event::Deleted { stored_id } => {
                 if state.remove_session(stored_id) {
                     MetaOutcome::ResetToLaunch
@@ -2712,15 +3234,7 @@ impl Ui {
     fn refresh_sessions(&self) {
         let (rows, selected) = {
             let state = self.state.borrow();
-            let indices = state.visible_sessions();
-            let rows: Vec<_> = indices
-                .iter()
-                .filter_map(|&index| state.sessions.get(index))
-                .cloned()
-                .map(glib::BoxedAnyObject::new)
-                .collect();
-            let selected = visible_selected_position(&state, &indices);
-            (rows, selected)
+            build_sidebar_rows(&state)
         };
         let visible_count = rows.len();
         // Drop the state borrow before these mutations. Hold the guard across
@@ -2740,38 +3254,65 @@ impl Ui {
     fn sync_sidebar_selection(&self) {
         let selected = {
             let state = self.state.borrow();
-            let indices = state.visible_sessions();
-            visible_selected_position(&state, &indices)
+            sidebar_selected_index(&state)
         };
         self.suppress_selection.set(true);
         self.selection.set_selected(selected);
         self.suppress_selection.set(false);
     }
 
-    fn session_id_at(&self, position: u32) -> Option<String> {
+    fn sidebar_item_at(&self, position: u32) -> Option<SidebarRowItem> {
         self.sessions
             .item(position)
             .and_downcast::<glib::BoxedAnyObject>()
-            .map(|value| value.borrow::<SessionSummary>().stored_id.clone())
+            .map(|value| value.borrow::<SidebarRowItem>().clone())
+    }
+
+    fn activate_sidebar_position(&self, position: u32, focus_editor: bool) {
+        let Some(item) = self.sidebar_item_at(position) else {
+            return;
+        };
+        self.open_sidebar_item(item, focus_editor);
     }
 
     fn adopt_sidebar_selection(&self, focus_editor: bool) {
         if self.suppress_selection.get() {
             return;
         }
-        let Some(id) = self.session_id_at(self.selection.selected()) else {
+        let Some(item) = self.sidebar_item_at(self.selection.selected()) else {
             // A cleared highlight must not leave the open conversation behind.
             self.sync_sidebar_selection();
             return;
         };
+        let id = item.stored_id().to_string();
         if self.state.borrow().selected.as_deref() == Some(id.as_str()) {
-            if focus_editor {
+            if let Some(query) = item.search_query() {
+                self.open_transcript_find(Some(query));
+            } else if focus_editor {
                 self.editor.grab_focus();
             }
             return;
         }
+        self.open_sidebar_item(item, focus_editor);
+    }
+
+    fn open_sidebar_item(&self, item: SidebarRowItem, focus_editor: bool) {
         self.select_created.set(false);
-        self.select(&id, focus_editor);
+        match item {
+            SidebarRowItem::Local(session) => {
+                if let Some(query) = local_fts_handoff(&self.state.borrow(), &session.stored_id) {
+                    self.open_session_with_find(&session.stored_id, &query);
+                } else {
+                    self.select(&session.stored_id, focus_editor);
+                }
+            }
+            SidebarRowItem::RemoteHit { hit, query } => {
+                self.state
+                    .borrow_mut()
+                    .upsert_session(hit_to_session_summary(&hit));
+                self.open_session_with_find(&hit.stored_id, &query);
+            }
+        }
     }
 
     fn refresh(&self) {
@@ -2811,28 +3352,45 @@ impl Ui {
     fn sync_message_list(&self, state: &AppState, conversation: Option<&Conversation>) {
         let connected = state.connection.as_ref() == Some(&ConnectionState::Connected);
         let gates = row_action_gates(conversation, connected, state.creating);
+        let find_stamp = find_render_stamp(&state.transcript_find);
         let identity_changed = *self.rendered_session.borrow() != state.selected;
         let revision = conversation.map_or(0, |c| c.revision);
-        if !identity_changed
-            && self.rendered_revision.get() == revision
-            && self.rendered_row_gate.get() == gates
-        {
+        if self.message_list_up_to_date(identity_changed, revision, gates, &find_stamp) {
             return;
         }
         if identity_changed {
             self.messages.remove_all();
             *self.rendered_session.borrow_mut() = state.selected.clone();
         }
-        let current = build_message_rows(conversation, connected, state.creating);
+        let current = build_message_rows(
+            conversation,
+            &state.transcript_find,
+            connected,
+            state.creating,
+        );
         sync_list_store_rows(&self.messages, &current);
         self.rendered_revision.set(revision);
         self.rendered_row_gate.set(gates);
+        *self.rendered_find_stamp.borrow_mut() = find_stamp;
         if self.follow_bottom.get() {
             let adjustment = self.transcript.vadjustment();
             glib::idle_add_local_once(move || {
                 adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
             });
         }
+    }
+
+    fn message_list_up_to_date(
+        &self,
+        identity_changed: bool,
+        revision: u64,
+        gates: (bool, bool),
+        find_stamp: &FindRenderStamp,
+    ) -> bool {
+        !identity_changed
+            && self.rendered_revision.get() == revision
+            && self.rendered_row_gate.get() == gates
+            && *self.rendered_find_stamp.borrow() == *find_stamp
     }
 
     fn sync_lineage_bar(&self, state: &AppState) {
@@ -2904,9 +3462,32 @@ impl Ui {
                 && !matches!(state.connection, Some(ConnectionState::Connecting)),
         );
         self.sync_branch_controls(&state, conversation, connected);
+        self.sync_curation_controls(&state, conversation, connected);
         self.refresh_model_trigger(conversation, &state.catalog, writable);
         self.refresh_connection_badge(&state);
         self.sync_inspector_chrome(&state, conversation, writable);
+    }
+
+    fn sync_curation_controls(
+        &self,
+        state: &AppState,
+        conversation: Option<&Conversation>,
+        connected: bool,
+    ) {
+        let has_chat = state.selected.is_some();
+        let can_curate = connected && has_chat;
+        self.find_chat.set_visible(has_chat);
+        self.find_chat
+            .set_sensitive(conversation.is_some_and(|c| !c.messages.is_empty()));
+        self.pin_chat.set_visible(can_curate);
+        self.pin_chat.set_sensitive(can_curate);
+        self.rename_chat.set_visible(can_curate);
+        self.rename_chat.set_sensitive(can_curate);
+        sync_pin_button(&self.pin_chat, state.is_selected_pinned());
+        let history_before = conversation.map_or(0, |c| c.history_before);
+        let history_loading = conversation.is_some_and(|c| c.history_loading || c.status.busy());
+        self.find_bar
+            .sync(&state.transcript_find, history_before, history_loading);
     }
 
     fn sync_branch_controls(
@@ -3265,6 +3846,154 @@ fn promote_session_front(state: &mut AppState, id: &str) {
     {
         let item = state.sessions.remove(pos);
         state.sessions.insert(0, item);
+    }
+}
+
+fn sync_pin_button(button: &gtk::Button, pinned: bool) {
+    if pinned {
+        button.set_icon_name("starred-symbolic");
+        button.add_css_class("pin-active");
+        button.set_tooltip_text(Some("Unpin conversation · Ctrl+P"));
+    } else {
+        button.set_icon_name("non-starred-symbolic");
+        button.remove_css_class("pin-active");
+        button.set_tooltip_text(Some("Pin conversation · Ctrl+P"));
+    }
+}
+
+fn apply_search_event(
+    state: &mut AppState,
+    query: &str,
+    request_seq: u64,
+    hits: &[SearchHit],
+) -> MetaOutcome {
+    if state.apply_search_results(query.to_string(), request_seq, hits.to_vec()) {
+        MetaOutcome::RefreshSessions
+    } else {
+        MetaOutcome::Handled
+    }
+}
+
+fn apply_mutation_event(
+    state: &mut AppState,
+    stored_id: &str,
+    mutation: &SessionMutation,
+) -> MetaOutcome {
+    match state.apply_mutation(stored_id, mutation) {
+        MutationOutcome::ArchivedSelected => MetaOutcome::ResetToLaunch,
+        MutationOutcome::Updated | MutationOutcome::ArchivedOther => MetaOutcome::RefreshSessions,
+    }
+}
+
+fn sync_find_after_transcript_load(state: &mut AppState, stored_id: &str) -> Option<usize> {
+    if state.selected.as_deref() != Some(stored_id) {
+        return None;
+    }
+    let messages = state
+        .conversations
+        .get(stored_id)
+        .map(|c| c.messages.clone())
+        .unwrap_or_default();
+    if let Some(query) = state.pending_find_query.take() {
+        state.transcript_find.open_with(&query, &messages);
+        return state.transcript_find.active_message_index();
+    }
+    if state.transcript_find.open {
+        state.transcript_find.recompute(&messages);
+    }
+    None
+}
+
+fn sync_find_after_history_page(state: &mut AppState, stored_id: &str) -> Option<usize> {
+    if state.selected.as_deref() != Some(stored_id) || !state.transcript_find.open {
+        return None;
+    }
+    let messages = state
+        .conversations
+        .get(stored_id)
+        .map(|c| c.messages.clone())
+        .unwrap_or_default();
+    state.transcript_find.recompute(&messages);
+    state.transcript_find.active_message_index()
+}
+
+fn build_sidebar_rows(state: &AppState) -> (Vec<glib::BoxedAnyObject>, u32) {
+    let indices = state.visible_sessions();
+    let mut rows: Vec<glib::BoxedAnyObject> = indices
+        .iter()
+        .filter_map(|&index| state.sessions.get(index))
+        .cloned()
+        .map(SidebarRowItem::Local)
+        .map(glib::BoxedAnyObject::new)
+        .collect();
+    let query = state.session_query.trim().to_string();
+    for hit in state.remote_only_sidebar_hits() {
+        rows.push(glib::BoxedAnyObject::new(SidebarRowItem::RemoteHit {
+            hit: hit.clone(),
+            query: query.clone(),
+        }));
+    }
+    let selected = sidebar_selected_index(state);
+    (rows, selected)
+}
+
+fn sidebar_selected_index(state: &AppState) -> u32 {
+    let indices = state.visible_sessions();
+    let local_pos = visible_selected_position(state, &indices);
+    if local_pos != gtk::INVALID_LIST_POSITION {
+        return local_pos;
+    }
+    let Some(selected_id) = state.selected.as_deref() else {
+        return gtk::INVALID_LIST_POSITION;
+    };
+    state
+        .remote_only_sidebar_hits()
+        .iter()
+        .position(|hit| hit.stored_id == selected_id)
+        .map_or(gtk::INVALID_LIST_POSITION, |pos| {
+            (indices.len() + pos) as u32
+        })
+}
+
+fn local_fts_handoff(state: &AppState, stored_id: &str) -> Option<String> {
+    let q = state.session_query.trim();
+    if q.chars().count() < 2 || !state.has_active_remote_search(q) {
+        return None;
+    }
+    state
+        .remote_search_hits
+        .iter()
+        .any(|hit| hit.stored_id == stored_id)
+        .then(|| q.to_string())
+}
+
+fn ensure_session_from_search_hit(state: &mut AppState, stored_id: &str) {
+    if state.sessions.iter().any(|s| s.stored_id == stored_id) {
+        return;
+    }
+    let summary = state
+        .remote_search_hits
+        .iter()
+        .find(|hit| hit.stored_id == stored_id)
+        .map(hit_to_session_summary);
+    if let Some(summary) = summary {
+        state.upsert_session(summary);
+    }
+}
+
+fn hit_to_session_summary(hit: &SearchHit) -> SessionSummary {
+    SessionSummary {
+        stored_id: hit.stored_id.clone(),
+        title: hit.title.clone(),
+        source: hit.source.clone(),
+        updated_at: hit.updated_at.clone(),
+        read_only_reason: None,
+        message_count: hit.message_count,
+        parent_session_id: hit.parent_session_id.clone(),
+        is_branch: hit.parent_session_id.is_some(),
+        pinned: hit.pinned,
+        preview: hit.snippet_plain.clone(),
+        model: hit.model.clone(),
     }
 }
 
@@ -3875,7 +4604,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let rows = build_message_rows(Some(&chat), true, false);
+        let no_find = TranscriptFind::default();
+        let rows = build_message_rows(Some(&chat), &no_find, true, false);
         assert_eq!(rows.len(), 5);
         assert!(rows[0].can_branch && !rows[0].can_edit_retry);
         assert!(!rows[1].can_branch);
@@ -3885,7 +4615,7 @@ mod tests {
 
         // Busy or read-only gates disable live rewind; read-only still allows branching.
         chat.status = TurnStatus::Streaming;
-        let busy_rows = build_message_rows(Some(&chat), true, false);
+        let busy_rows = build_message_rows(Some(&chat), &no_find, true, false);
         assert!(
             busy_rows
                 .iter()
@@ -3895,10 +4625,51 @@ mod tests {
         chat.status = TurnStatus::Idle;
         chat.runtime_id = None;
         chat.read_only_reason = Some("Read-only cron log".into());
-        let ro_rows = build_message_rows(Some(&chat), true, false);
+        let ro_rows = build_message_rows(Some(&chat), &no_find, true, false);
         assert!(ro_rows[0].can_branch);
         assert!(!ro_rows[3].can_edit_retry);
         assert!(!ro_rows[4].can_regenerate);
+    }
+
+    #[test]
+    fn transcript_find_and_curation_helpers_flag_active_matches_and_slash_hints() {
+        let messages = vec![
+            ChatMessage {
+                id: "u1".into(),
+                role: Role::User,
+                text: "Investigate Hyprland blur".into(),
+            },
+            ChatMessage {
+                id: "a1".into(),
+                role: Role::Assistant,
+                text: "Hyprland decoration blur uses Kawase passes".into(),
+            },
+        ];
+        let mut find = TranscriptFind::default();
+        find.open_with("hyprland", &messages);
+        let chat = Conversation {
+            runtime_id: Some("rt-1".into()),
+            messages,
+            draft: "/find kawase".into(),
+            ..Default::default()
+        };
+        assert!(can_send_in_conversation(&chat));
+        assert!(composer_conversation_hint(&chat).contains("search within this transcript"));
+
+        let rows = build_message_rows(Some(&chat), &find, true, false);
+        assert!(rows[0].is_match && rows[0].is_active_match);
+        assert!(rows[1].is_match && !rows[1].is_active_match);
+        find.step(1);
+        let stepped = build_message_rows(Some(&chat), &find, true, false);
+        assert!(stepped[1].is_match && stepped[1].is_active_match);
+        assert_eq!(
+            ctrl_shift_command(
+                gdk::Key::F,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+            ),
+            Some('f')
+        );
+        assert!(is_plain_f2(gdk::Key::F2, gdk::ModifierType::empty()));
     }
 
     #[test]
