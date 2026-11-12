@@ -551,6 +551,18 @@ fn bind_message_row(object: &glib::Object) {
             .set_text(&source.borrow::<MessageRowData>().message.text);
     });
     heading.append(&copy);
+    let quote = icon_button(
+        "mail-reply-sender-symbolic",
+        "Quote this message into the composer",
+    );
+    quote.add_css_class("flat");
+    quote.add_css_class("message-copy");
+    let source = value.clone();
+    quote.connect_clicked(move |button| {
+        let quoted = quote_markdown(&source.borrow::<MessageRowData>().message.text);
+        let _ = button.activate_action("win.quote", Some(&quoted.to_variant()));
+    });
+    heading.append(&quote);
     row.append(&heading);
     row.append(&message_body(&data.message));
     let column = adw::Clamp::builder()
@@ -1498,6 +1510,7 @@ fn connect_timeline(ui: &Rc<Ui>) {
     });
     register_branch_action(ui);
     register_rewind_action(ui);
+    register_quote_action(ui);
     register_open_session_action(ui);
 }
 
@@ -1533,6 +1546,40 @@ fn register_rewind_action(ui: &Rc<Ui>) {
         }
     });
     ui.window.add_action(&action);
+}
+
+fn register_quote_action(ui: &Rc<Ui>) {
+    let action = gio::SimpleAction::new("quote", Some(glib::VariantTy::STRING));
+    let weak = Rc::downgrade(ui);
+    action.connect_activate(move |_, param| {
+        if let Some(text) = param.and_then(|p| p.get::<String>())
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.insert_into_composer(&format!("{text}\n\n"));
+        }
+    });
+    ui.window.add_action(&action);
+}
+
+/// Markdown block quote of `text`, capped so a huge reply stays editable.
+fn quote_markdown(text: &str) -> String {
+    const MAX_LINES: usize = 12;
+    let lines: Vec<&str> = text.trim().lines().collect();
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(MAX_LINES)
+        .map(|l| {
+            if l.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {l}")
+            }
+        })
+        .collect();
+    if lines.len() > MAX_LINES {
+        out.push("> …".to_string());
+    }
+    out.join("\n")
 }
 
 fn register_open_session_action(ui: &Rc<Ui>) {
@@ -5188,6 +5235,18 @@ mod tests {
         );
         assert!(composer_send_sensitive(&state, false));
         assert!(composer_hint_text(&state).contains("steer"));
+    }
+
+    #[test]
+    fn quote_markdown_prefixes_and_caps_lines() {
+        assert_eq!(quote_markdown("a\n\nb"), "> a\n>\n> b");
+        let long = (0..20)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let q = quote_markdown(&long);
+        assert_eq!(q.lines().count(), 13);
+        assert!(q.ends_with("> …"));
     }
 
     #[test]

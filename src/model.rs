@@ -3455,7 +3455,12 @@ mod tests {
             role,
             text: t.into(),
         };
-        let msgs = [m(Role::User, "a"), m(Role::Assistant, "x"), m(Role::User, " a "), m(Role::User, " ")];
+        let msgs = [
+            m(Role::User, "a"),
+            m(Role::Assistant, "x"),
+            m(Role::User, " a "),
+            m(Role::User, " "),
+        ];
         assert_eq!(PromptRecall::prompts(&msgs), vec!["a".to_string()]);
     }
 
