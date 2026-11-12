@@ -7,16 +7,19 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 use crate::model::{
-    Catalog, ChatMessage, ClarificationQuestion, Command, Config, ConnectionState, Event,
-    InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, RewindMode, Role,
-    SeedMessage, SessionMutation, SessionSummary, SteerOutcome, ToolEventUpdate, TurnStatus,
-    parse_live_info_telemetry, parse_telemetry_payload, seed_messages_through,
+    Catalog, ChatMessage, ClarificationQuestion, Command, CompressSummary, Config, ConnectionState,
+    Event, InteractionAnswer, InteractionKind, InteractionRequest, ModelIdentity, RewindMode, Role,
+    SeedMessage, SessionMutation, SessionSummary, SkillSummary, StagedImage, SteerOutcome,
+    ToolEventUpdate, TurnStatus, WorkspaceCatalog, parse_live_info_telemetry,
+    parse_telemetry_payload, seed_messages_through,
 };
 use crate::recall;
+use crate::studio;
 
 const PAGE: usize = 50;
 const SEARCH_LIMIT: usize = 25;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPRESS_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const EVENT_BOUND: usize = 512;
@@ -263,6 +266,15 @@ fn undo_rpc_params(runtime_id: &str, mode: RewindMode) -> Value {
     })
 }
 
+fn create_rpc_params(title: &str, cwd: Option<&str>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("title".into(), Value::String(title.to_string()));
+    if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+        map.insert("cwd".into(), Value::String(dir.to_string()));
+    }
+    Value::Object(map)
+}
+
 fn extract_session_ids(result: &Value) -> Option<(String, String)> {
     let runtime_id = result
         .get("session_id")
@@ -306,6 +318,12 @@ enum JobKind {
     Submit {
         runtime_id: String,
         generation: u64,
+    },
+    AttachImage {
+        runtime_id: String,
+        generation: u64,
+        remaining_paths: VecDeque<String>,
+        prompt_text: String,
     },
     Interrupt {
         runtime_id: String,
@@ -388,6 +406,18 @@ enum JobKind {
         mode: RewindMode,
         prompt_text: String,
     },
+    Compress {
+        stored_id: String,
+        runtime_id: String,
+    },
+    CompressSync {
+        stored_id: String,
+        runtime_id: String,
+        summary: CompressSummary,
+    },
+    SessionInfo {
+        runtime_id: String,
+    },
 }
 
 struct Link {
@@ -402,6 +432,7 @@ struct Link {
     next_id: u64,
     next_turn_generation: u64,
     message_counts: HashMap<String, usize>,
+    pinned_sessions: HashSet<String>,
     deferred_mutations: HashMap<String, (Option<String>, Option<bool>)>,
     jobs: HashMap<u64, Job>,
     runtime_of: HashMap<String, String>,
@@ -533,6 +564,7 @@ impl Link {
             next_id: 1,
             next_turn_generation: 0,
             message_counts: HashMap::new(),
+            pinned_sessions: HashSet::new(),
             deferred_mutations: HashMap::new(),
             jobs: HashMap::new(),
             runtime_of: HashMap::new(),
@@ -563,6 +595,19 @@ impl Link {
 
     fn clean(&self, text: String) -> String {
         sanitize(&text, &self.secrets)
+    }
+
+    /// Credential tokens (`password` and ephemeral `ws-ticket`) without `username`,
+    /// so short usernames never corrupt skill category slugs or workspace labels.
+    fn credential_secrets(&self) -> Vec<String> {
+        let mut creds = Vec::with_capacity(2);
+        if let Some(pw) = self.secrets.first() {
+            creds.push(pw.clone());
+        }
+        for extra in self.secrets.iter().skip(2) {
+            creds.push(extra.clone());
+        }
+        creds
     }
 
     async fn connect(&mut self) -> Result<(), String> {
@@ -728,6 +773,7 @@ impl Link {
         self.emit(Event::Connection(ConnectionState::Connected))
             .await;
         self.fetch_models().await;
+        self.fetch_studio_catalogs().await;
         while self.ready && self.write.is_some() {
             let Some(command) = self.queued.pop_front() else {
                 break;
@@ -751,11 +797,17 @@ impl Link {
             Command::List { .. }
             | Command::History { .. }
             | Command::SearchSessions { .. }
-            | Command::MutateSession { .. } => self.http_command(command).await,
-            Command::Create { title } => self.begin_create(title).await,
+            | Command::MutateSession { .. }
+            | Command::FetchStudio => self.http_command(command).await,
+            Command::Create { title, cwd } => self.begin_create(title, cwd).await,
             Command::Resume { stored_id } => self.begin_resume(stored_id).await,
-            Command::Submit { runtime_id, text } => {
-                self.submit_unless_stopping(runtime_id, text).await;
+            Command::Submit {
+                runtime_id,
+                text,
+                attachments,
+            } => {
+                self.submit_unless_stopping(runtime_id, text, attachments)
+                    .await;
             }
             Command::Steer { runtime_id, text } => self.begin_steer(runtime_id, text).await,
             Command::Interrupt { runtime_id } => self.begin_interrupt(runtime_id).await,
@@ -765,20 +817,27 @@ impl Link {
                 answer,
             } => self.respond(runtime_id, request_id, answer).await,
             Command::Delete { stored_id } => self.begin_delete(stored_id).await,
-            Command::Branch { .. } | Command::Undo { .. } => self.timeline_command(command).await,
+            Command::Branch { .. } | Command::Undo { .. } | Command::Compress { .. } => {
+                self.timeline_command(command).await;
+            }
             Command::FetchModels | Command::SetModel { .. } | Command::AskSide { .. } => {
                 self.model_command(command).await;
             }
         }
     }
 
-    async fn submit_unless_stopping(&mut self, runtime_id: String, text: String) {
+    async fn submit_unless_stopping(
+        &mut self,
+        runtime_id: String,
+        text: String,
+        attachments: Vec<StagedImage>,
+    ) {
         if !self
             .turns
             .get(&runtime_id)
             .is_some_and(|turn| turn.phase == TurnPhase::Stopping)
         {
-            self.begin_submit(runtime_id, text).await;
+            self.begin_submit(runtime_id, text, attachments).await;
         }
     }
 
@@ -793,6 +852,7 @@ impl Link {
                 stored_id,
                 mutation,
             } => self.mutate_session(stored_id, mutation).await,
+            Command::FetchStudio => self.fetch_studio_catalogs().await,
             _ => {}
         }
     }
@@ -829,11 +889,12 @@ impl Link {
             .await;
     }
 
-    async fn begin_create(&mut self, title: String) {
+    async fn begin_create(&mut self, title: String, cwd: Option<String>) {
+        let params = create_rpc_params(&title, cwd.as_deref());
         if let Err(fault) = self
             .send_rpc(
                 "session.create",
-                json!({"title": title}),
+                params,
                 JobKind::Create { title },
                 RPC_TIMEOUT,
             )
@@ -896,7 +957,7 @@ impl Link {
                 }
             }
             // Idle or already-settled turn: this is a normal next prompt.
-            SteerRoute::Submit => self.begin_submit(runtime_id, text).await,
+            SteerRoute::Submit => self.begin_submit(runtime_id, text, Vec::new()).await,
         }
     }
 
@@ -926,13 +987,95 @@ impl Link {
         }
     }
 
-    async fn begin_submit(&mut self, runtime_id: String, text: String) {
+    async fn begin_submit(
+        &mut self,
+        runtime_id: String,
+        text: String,
+        attachments: Vec<StagedImage>,
+    ) {
         self.next_turn_generation += 1;
         let generation = self.next_turn_generation;
         self.turns.insert(
             runtime_id.clone(),
             Turn::submitting(format!("turn-{runtime_id}-{generation}"), generation),
         );
+        let wire_text = studio::effective_wire_prompt(&text, !attachments.is_empty());
+        if attachments.is_empty() {
+            self.send_submit_rpc(runtime_id, generation, wire_text)
+                .await;
+            return;
+        }
+        match self.upload_staged_images(&attachments).await {
+            Ok(paths) => {
+                self.advance_attach_or_submit(runtime_id, generation, paths, wire_text)
+                    .await;
+            }
+            Err(err) => {
+                if let Some(turn) = self.turns.get_mut(&runtime_id) {
+                    let _ = turn.fail_submit(generation);
+                }
+                self.fail(
+                    "submit",
+                    Some(runtime_id),
+                    format!("{err} The prompt was not sent."),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn upload_staged_images(
+        &self,
+        attachments: &[StagedImage],
+    ) -> Result<VecDeque<String>, String> {
+        let mut paths = VecDeque::with_capacity(attachments.len());
+        for image in attachments {
+            let uploaded = upload_chat_image_http(&self.http, &self.origin, image).await?;
+            paths.push_back(uploaded);
+        }
+        Ok(paths)
+    }
+
+    async fn advance_attach_or_submit(
+        &mut self,
+        runtime_id: String,
+        generation: u64,
+        mut remaining_paths: VecDeque<String>,
+        prompt_text: String,
+    ) {
+        let still_submitting = self.turns.get(&runtime_id).is_some_and(|turn| {
+            turn.generation == generation
+                && turn.phase == TurnPhase::Submitting
+                && !turn.submit_settled
+        });
+        if !still_submitting {
+            return;
+        }
+        let Some(next_path) = remaining_paths.pop_front() else {
+            self.send_submit_rpc(runtime_id, generation, prompt_text)
+                .await;
+            return;
+        };
+        if let Err(fault) = self
+            .send_rpc(
+                "image.attach",
+                json!({"session_id": runtime_id, "path": next_path}),
+                JobKind::AttachImage {
+                    runtime_id: runtime_id.clone(),
+                    generation,
+                    remaining_paths,
+                    prompt_text,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.abort_local_submit(&runtime_id, generation, fault)
+                .await;
+        }
+    }
+
+    async fn send_submit_rpc(&mut self, runtime_id: String, generation: u64, text: String) {
         if let Err(fault) = self
             .send_rpc(
                 "prompt.submit",
@@ -945,16 +1088,21 @@ impl Link {
             )
             .await
         {
-            if let Some(turn) = self.turns.get_mut(&runtime_id) {
-                let _ = turn.fail_submit(generation);
-            }
-            self.fail(
-                "submit",
-                Some(runtime_id),
-                send_fault_message("submit", fault),
-            )
-            .await;
+            self.abort_local_submit(&runtime_id, generation, fault)
+                .await;
         }
+    }
+
+    async fn abort_local_submit(&mut self, runtime_id: &str, generation: u64, fault: SendFault) {
+        if let Some(turn) = self.turns.get_mut(runtime_id) {
+            let _ = turn.fail_submit(generation);
+        }
+        self.fail(
+            "submit",
+            Some(runtime_id.to_string()),
+            send_fault_message("submit", fault),
+        )
+        .await;
     }
 
     async fn model_command(&mut self, command: Command) {
@@ -1039,7 +1187,50 @@ impl Link {
                 self.begin_undo(stored_id, runtime_id, mode, prompt_text)
                     .await;
             }
+            Command::Compress {
+                stored_id,
+                runtime_id,
+            } => {
+                self.begin_compress(stored_id, runtime_id).await;
+            }
             _ => {}
+        }
+    }
+
+    async fn begin_compress(&mut self, stored_id: String, runtime_id: String) {
+        if let Err(fault) = self
+            .send_rpc(
+                "session.compress",
+                json!({"session_id": runtime_id}),
+                JobKind::Compress {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                },
+                COMPRESS_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "compress",
+                Some(stored_id),
+                send_fault_message("compress", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn fetch_studio_catalogs(&self) {
+        let creds = self.credential_secrets();
+        let catalog = match fetch_workspaces_http(&self.http, &self.origin, &creds).await {
+            Ok(catalog) => catalog,
+            Err(err) => WorkspaceCatalog {
+                error: Some(self.clean(err)),
+                ..Default::default()
+            },
+        };
+        self.emit(Event::Workspaces { catalog }).await;
+        if let Ok(skills) = fetch_skills_http(&self.http, &self.origin, &creds).await {
+            self.emit(Event::Skills { skills }).await;
         }
     }
 
@@ -1377,7 +1568,12 @@ impl Link {
             return;
         }
         match fetch_search_hits(&self.http, &self.origin, &trimmed, &self.secrets).await {
-            Ok(hits) => {
+            Ok(mut hits) => {
+                for hit in &mut hits {
+                    if self.pinned_sessions.contains(&hit.stored_id) {
+                        hit.pinned = true;
+                    }
+                }
                 self.emit(Event::SearchResults {
                     query,
                     request_seq,
@@ -1489,6 +1685,7 @@ impl Link {
 
     async fn finish_archive(&mut self, stored_id: String) {
         self.runtime_of.remove(&stored_id);
+        self.pinned_sessions.remove(&stored_id);
         self.deferred_mutations.remove(&stored_id);
         self.emit(Event::SessionMutated {
             stored_id,
@@ -1526,7 +1723,18 @@ impl Link {
         .await;
     }
 
+    fn set_pinned_cache(&mut self, stored_id: &str, pinned: bool) {
+        if pinned {
+            self.pinned_sessions.insert(stored_id.to_string());
+        } else {
+            self.pinned_sessions.remove(stored_id);
+        }
+    }
+
     async fn finish_applied_mutation(&mut self, stored_id: String, mutation: SessionMutation) {
+        if let SessionMutation::SetPinned(pinned) = mutation {
+            self.set_pinned_cache(&stored_id, pinned);
+        }
         self.clear_deferred_field(&stored_id, &mutation);
         self.emit(Event::SessionMutated {
             stored_id,
@@ -1542,9 +1750,13 @@ impl Link {
 
     async fn apply_unpersisted_mutation(&mut self, stored_id: String, mutation: SessionMutation) {
         if matches!(mutation, SessionMutation::Archive) {
+            self.pinned_sessions.remove(&stored_id);
             self.deferred_mutations.remove(&stored_id);
             self.close_live_runtime_quietly(&stored_id).await;
         } else {
+            if let SessionMutation::SetPinned(pinned) = mutation {
+                self.set_pinned_cache(&stored_id, pinned);
+            }
             self.record_deferred_mutation(&stored_id, &mutation);
         }
         self.emit(Event::SessionMutated {
@@ -2296,7 +2508,12 @@ impl Link {
 
     fn retire_submit_jobs(&mut self, runtime_id: &str) {
         self.jobs.retain(|_, job| {
-            !matches!(&job.kind, JobKind::Submit { runtime_id: id, .. } if id == runtime_id)
+            !matches!(
+                &job.kind,
+                JobKind::Submit { runtime_id: id, .. }
+                    | JobKind::AttachImage { runtime_id: id, .. }
+                    if id == runtime_id
+            )
         });
     }
 
@@ -2304,7 +2521,10 @@ impl Link {
         self.jobs.retain(|_, job| {
             !matches!(
                 &job.kind,
-                JobKind::Submit { runtime_id: id, .. } | JobKind::Interrupt { runtime_id: id, .. } if id == runtime_id
+                JobKind::Submit { runtime_id: id, .. }
+                    | JobKind::AttachImage { runtime_id: id, .. }
+                    | JobKind::Interrupt { runtime_id: id, .. }
+                    if id == runtime_id
             )
         });
     }
@@ -2455,6 +2675,15 @@ impl Link {
                 runtime_id,
                 generation,
             } => self.on_submit_reply(runtime_id, generation).await,
+            JobKind::AttachImage {
+                runtime_id,
+                generation,
+                remaining_paths,
+                prompt_text,
+            } => {
+                self.advance_attach_or_submit(runtime_id, generation, remaining_paths, prompt_text)
+                    .await;
+            }
             JobKind::Interrupt {
                 runtime_id,
                 generation,
@@ -2489,6 +2718,7 @@ impl Link {
             } => self.on_side_reply(runtime_id, client_id, result).await,
             JobKind::Delete { stored_id, .. } => {
                 self.runtime_of.remove(&stored_id);
+                self.pinned_sessions.remove(&stored_id);
                 self.deferred_mutations.remove(&stored_id);
                 self.emit(Event::Deleted { stored_id }).await;
             }
@@ -2586,8 +2816,113 @@ impl Link {
                 }
                 self.request_archive_patch(stored_id, true).await;
             }
+            JobKind::Compress {
+                stored_id,
+                runtime_id,
+            } => {
+                self.on_compress_reply(stored_id, runtime_id, result).await;
+            }
+            JobKind::CompressSync {
+                stored_id,
+                runtime_id,
+                summary,
+            } => {
+                self.on_compress_sync_reply(stored_id, runtime_id, summary, result)
+                    .await;
+            }
+            JobKind::SessionInfo { runtime_id } => {
+                self.emit_live_info(&runtime_id, result).await;
+            }
             _ => {}
         }
+    }
+
+    async fn on_compress_reply(&mut self, stored_id: String, runtime_id: String, result: &Value) {
+        self.emit_live_info(&runtime_id, result).await;
+        if let Some(telemetry) = parse_telemetry_payload(result) {
+            self.emit(Event::Telemetry {
+                runtime_id: runtime_id.clone(),
+                telemetry,
+            })
+            .await;
+        }
+        let creds = self.credential_secrets();
+        let summary = studio::parse_compress_summary(result, &creds);
+        if summary.noop {
+            self.emit(Event::Compressed {
+                stored_id,
+                runtime_id,
+                messages: None,
+                before: 0,
+                summary,
+            })
+            .await;
+            return;
+        }
+        if let Err(fault) = self
+            .send_rpc(
+                "session.resume",
+                json!({
+                    "session_id": stored_id,
+                    "inline_images": false,
+                    "omit_messages": true
+                }),
+                JobKind::CompressSync {
+                    stored_id: stored_id.clone(),
+                    runtime_id,
+                    summary,
+                },
+                RPC_TIMEOUT,
+            )
+            .await
+        {
+            self.fail(
+                "compress",
+                Some(stored_id),
+                send_fault_message("compress", fault),
+            )
+            .await;
+        }
+    }
+
+    async fn on_compress_sync_reply(
+        &mut self,
+        stored_id: String,
+        runtime_id: String,
+        summary: CompressSummary,
+        result: &Value,
+    ) {
+        let effective_runtime = result
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(runtime_id);
+        self.runtime_of
+            .insert(stored_id.clone(), effective_runtime.clone());
+        let count = result
+            .get("message_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        self.message_counts.insert(stored_id.clone(), count);
+        let before = count.saturating_sub(PAGE);
+        let messages =
+            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    self.fail("compress", Some(stored_id), err).await;
+                    return;
+                }
+            };
+        self.emit(Event::Compressed {
+            stored_id,
+            runtime_id: effective_runtime,
+            messages: Some(messages),
+            before,
+            summary,
+        })
+        .await;
     }
 
     fn build_pending_branch(
@@ -2723,6 +3058,8 @@ impl Link {
         )
         .await;
         self.emit_live_info(&runtime_id, result).await;
+        self.request_session_info_if_needed(&runtime_id, result)
+            .await;
     }
 
     async fn on_branched(
@@ -2761,6 +3098,8 @@ impl Link {
         )
         .await;
         self.emit_live_info(&runtime_id, result).await;
+        self.request_session_info_if_needed(&runtime_id, result)
+            .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3087,6 +3426,11 @@ impl Link {
             JobKind::Submit {
                 runtime_id,
                 generation,
+            }
+            | JobKind::AttachImage {
+                runtime_id,
+                generation,
+                ..
             } => self.fail_submit_job(runtime_id, generation, message).await,
             JobKind::Interrupt {
                 runtime_id,
@@ -3254,6 +3598,9 @@ impl Link {
                 }
                 self.fail("curation", Some(stored_id), message).await;
             }
+            JobKind::Compress { stored_id, .. } | JobKind::CompressSync { stored_id, .. } => {
+                self.fail("compress", Some(stored_id), message).await;
+            }
             _ => {}
         }
     }
@@ -3390,6 +3737,26 @@ impl Link {
         })
         .await;
         self.emit_live_info(&runtime_id, result).await;
+        self.request_session_info_if_needed(&runtime_id, result)
+            .await;
+    }
+
+    async fn request_session_info_if_needed(&mut self, runtime_id: &str, result: &Value) {
+        if runtime_id.is_empty()
+            || parse_live_info_telemetry(result).is_some_and(|t| !t.cwd.is_empty())
+        {
+            return;
+        }
+        let _ = self
+            .send_rpc(
+                "session.info",
+                json!({"session_id": runtime_id}),
+                JobKind::SessionInfo {
+                    runtime_id: runtime_id.to_string(),
+                },
+                RPC_TIMEOUT,
+            )
+            .await;
     }
 
     async fn on_resumed(&mut self, stored_id: String, result: &Value) {
@@ -3438,6 +3805,7 @@ impl Link {
         .await;
         if let Some(rt) = &runtime_id {
             self.emit_live_info(rt, result).await;
+            self.request_session_info_if_needed(rt, result).await;
         }
         if running && let Some(runtime_id) = runtime_id.clone() {
             self.next_turn_generation += 1;
@@ -3479,6 +3847,7 @@ impl Link {
     fn note_listed(&mut self, session: &SessionSummary) {
         self.message_counts
             .insert(session.stored_id.clone(), session.message_count);
+        self.set_pinned_cache(&session.stored_id, session.pinned);
         if session.source == "kanban" {
             self.refused.insert(session.stored_id.clone());
         }
@@ -3733,6 +4102,7 @@ fn is_queueable_while_connecting(command: &Command) -> bool {
             | Command::Create { .. }
             | Command::Resume { .. }
             | Command::SearchSessions { .. }
+            | Command::FetchStudio
     )
 }
 
@@ -3741,6 +4111,7 @@ fn unready_session_failure(command: &Command) -> Option<(&'static str, String)> 
         Command::Undo { stored_id, .. } | Command::Branch { stored_id, .. } => {
             Some(("timeline", stored_id.clone()))
         }
+        Command::Compress { stored_id, .. } => Some(("compress", stored_id.clone())),
         Command::MutateSession { stored_id, .. } => Some(("curation", stored_id.clone())),
         _ => None,
     }
@@ -3785,16 +4156,65 @@ async fn fetch_search_hits(
     recall::parse_search_results(&body, secrets)
 }
 
-async fn patch_session_http(
+fn next_mutation_request_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("hn-mut-{nanos}-{seq}")
+}
+
+fn apply_mutation_snapshot(body: &Value, snapshot: &Value) -> Value {
+    let Some(mut map) = body.as_object().cloned() else {
+        return body.clone();
+    };
+    let Some(revision) = snapshot.get("runtime_revision").cloned() else {
+        return body.clone();
+    };
+    let generation = snapshot
+        .get("runtime_generation")
+        .cloned()
+        .unwrap_or(Value::Null);
+    map.insert(
+        "request_id".into(),
+        Value::String(next_mutation_request_id()),
+    );
+    map.insert("expected_revision".into(), revision);
+    map.insert("expected_generation".into(), generation);
+    Value::Object(map)
+}
+
+async fn build_fenced_patch_body(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    body: &Value,
+) -> Value {
+    let snap_path = format!("/api/sessions/{stored_id}/mutation-snapshot");
+    let Ok(resp) = http.get(endpoint(origin, &snap_path)).send().await else {
+        return body.clone();
+    };
+    if !resp.status().is_success() {
+        return body.clone();
+    };
+    let Ok(snapshot) = resp.json::<Value>().await else {
+        return body.clone();
+    };
+    apply_mutation_snapshot(body, &snapshot)
+}
+
+async fn send_fenced_patch(
     http: &reqwest::Client,
     origin: &url::Url,
     stored_id: &str,
     body: &Value,
 ) -> Result<PatchOutcome, String> {
+    let payload = build_fenced_patch_body(http, origin, stored_id, body).await;
     let path = format!("/api/sessions/{stored_id}");
     let response = http
         .patch(endpoint(origin, &path))
-        .json(body)
+        .json(&payload)
         .send()
         .await
         .map_err(|_| "Could not update conversation.".to_string())?;
@@ -3809,6 +4229,98 @@ async fn patch_session_http(
         return Ok(PatchOutcome::Conflict);
     }
     Err(format!("Could not update conversation (HTTP {code})."))
+}
+
+async fn patch_session_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    body: &Value,
+) -> Result<PatchOutcome, String> {
+    let first = send_fenced_patch(http, origin, stored_id, body).await?;
+    if first != PatchOutcome::Conflict {
+        return Ok(first);
+    }
+    send_fenced_patch(http, origin, stored_id, body).await
+}
+
+async fn fetch_workspaces_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    secrets: &[String],
+) -> Result<WorkspaceCatalog, String> {
+    let response = http
+        .get(endpoint(origin, "/api/chat/workspaces"))
+        .send()
+        .await
+        .map_err(|_| "Could not load remote workspaces.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not load remote workspaces (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Workspace catalog was not usable.".to_string())?;
+    studio::parse_workspaces(&body, secrets)
+}
+
+async fn fetch_skills_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    secrets: &[String],
+) -> Result<Vec<SkillSummary>, String> {
+    let response = http
+        .get(endpoint(origin, "/api/skills"))
+        .send()
+        .await
+        .map_err(|_| "Could not load remote skills.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not load remote skills (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Skills catalog was not usable.".to_string())?;
+    studio::parse_skills(&body, secrets)
+}
+
+async fn upload_chat_image_http(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    image: &StagedImage,
+) -> Result<String, String> {
+    let response = http
+        .post(endpoint(origin, "/api/chat/image-upload"))
+        .json(&json!({
+            "data_url": image.data_url(),
+            "filename": image.filename,
+        }))
+        .send()
+        .await
+        .map_err(|_| format!("Could not upload {}.", image.filename))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Image upload failed for {} (HTTP {}).",
+            image.filename,
+            response.status().as_u16()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| "Image upload reply was not usable.".to_string())?;
+    body.get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Gateway did not return an uploaded image path.".into())
 }
 
 fn session_summary(row: &Value) -> Result<SessionSummary, String> {
@@ -5909,20 +6421,40 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf).await;
-            let reply = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(reply.as_bytes()).await;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (st, bd) = if req.contains("/mutation-snapshot") {
+                    ("404 Not Found", "{}")
+                } else {
+                    (status_line, body)
+                };
+                let reply = format!(
+                    "HTTP/1.1 {st}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bd}",
+                    bd.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
         });
         url::Url::parse(&format!("http://{addr}")).expect("origin")
     }
 
     #[test]
     fn archive_close_and_http_patch_outcomes_cover_conflict_and_completion() {
+        let fenced = apply_mutation_snapshot(
+            &json!({"pinned": true}),
+            &json!({"exists": true, "runtime_revision": 7, "runtime_generation": "gen-2"}),
+        );
+        assert_eq!(fenced.get("expected_revision"), Some(&json!(7)));
+        assert_eq!(fenced.get("expected_generation"), Some(&json!("gen-2")));
+        assert!(
+            fenced
+                .get("request_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with("hn-mut-"))
+        );
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5984,6 +6516,115 @@ mod tests {
             assert!(matches!(
                 incoming.try_recv(),
                 Ok(Event::Error { operation, .. }) if operation == "curation"
+            ));
+        });
+    }
+
+    #[test]
+    fn studio_http_helpers_create_params_and_compress_noop_roundtrip() {
+        assert_eq!(
+            create_rpc_params("Work", Some(" /home/alice/repo ")),
+            json!({"title": "Work", "cwd": "/home/alice/repo"})
+        );
+        assert_eq!(
+            create_rpc_params("Work", Some("  ")),
+            json!({"title": "Work"})
+        );
+        assert!(is_queueable_while_connecting(&Command::FetchStudio));
+        assert_eq!(
+            unready_session_failure(&Command::Compress {
+                stored_id: "s-comp".into(),
+                runtime_id: "rt-1".into()
+            }),
+            Some(("compress", "s-comp".into()))
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let http = reqwest::Client::new();
+            let ws_url = spawn_one_http_status(
+                "200 OK",
+                r#"{"default_cwd":"/home/alice/.hermes","home":"/home/alice","repos":[{"root":"/home/alice/app","label":"app","sessions":2}]}"#,
+            )
+            .await;
+            let cat = fetch_workspaces_http(&http, &ws_url, &[]).await.unwrap();
+            assert_eq!(cat.options.len(), 2);
+
+            let sk_url = spawn_one_http_status(
+                "200 OK",
+                r#"[{"name":"b-plan","description":"Plan","category":"buck-workflow","enabled":true,"usage":3}]"#,
+            )
+            .await;
+            let skills = fetch_skills_http(&http, &sk_url, &[]).await.unwrap();
+            assert_eq!(skills.len(), 1);
+
+            let up_url = spawn_one_http_status(
+                "200 OK",
+                r#"{"ok":true,"path":"/home/alice/.hermes/cache/images/p.png"}"#,
+            )
+            .await;
+            let png = vec![
+                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+            ];
+            let img = StagedImage::from_bytes(1, "p.png", png).unwrap();
+            let uploaded = upload_chat_image_http(&http, &up_url, &img).await.unwrap();
+            assert_eq!(uploaded, "/home/alice/.hermes/cache/images/p.png");
+
+            let base_url = spawn_one_http_status("200 OK", "{}").await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: base_url,
+                    username: "alice".into(),
+                    password: "secret".into(),
+                },
+                events.clone(),
+            )
+            .expect("link");
+            link.on_compress_reply(
+                "st-1".into(),
+                "rt-1".into(),
+                &json!({"status": "compressed", "removed": 0, "summary": {"noop": true, "headline": "Already compact"}}),
+            )
+            .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Compressed { stored_id, messages: None, .. }) if stored_id == "st-1"
+            ));
+
+            let hist_url = spawn_one_http_status(
+                "200 OK",
+                r#"{"messages":[{"role":"system","content":"Compacted summary"},{"role":"assistant","content":"Ready"}]}"#,
+            )
+            .await;
+            let mut sync_link = Link::new(
+                Config {
+                    url: hist_url,
+                    username: "alice".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("sync link");
+            let summary = studio::parse_compress_summary(
+                &json!({"status": "compressed", "removed": 4, "summary": {"noop": false, "headline": "Compacted 4 rows"}}),
+                &[],
+            );
+            sync_link
+                .on_compress_sync_reply(
+                    "st-2".into(),
+                    "rt-2".into(),
+                    summary,
+                    &json!({"session_id": "rt-2b", "message_count": 2}),
+                )
+                .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Compressed { stored_id, runtime_id, messages: Some(rows), .. })
+                    if stored_id == "st-2" && runtime_id == "rt-2b" && rows.len() == 2
             ));
         });
     }

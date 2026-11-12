@@ -2,6 +2,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 
+pub use crate::studio::{
+    CompressSummary, MAX_IMAGE_BYTES, MAX_STAGED_IMAGES, SkillSummary, SlashCandidate, StagedImage,
+    WorkspaceCatalog, WorkspaceOption,
+};
+
 #[derive(Clone)]
 pub struct Config {
     pub url: url::Url,
@@ -774,6 +779,7 @@ pub enum Command {
     },
     Create {
         title: String,
+        cwd: Option<String>,
     },
     Resume {
         stored_id: String,
@@ -785,6 +791,7 @@ pub enum Command {
     Submit {
         runtime_id: String,
         text: String,
+        attachments: Vec<StagedImage>,
     },
     Interrupt {
         runtime_id: String,
@@ -829,6 +836,13 @@ pub enum Command {
         mode: RewindMode,
         prompt_text: String,
     },
+    /// Compact older turns on the server to free context (`session.compress`).
+    Compress {
+        stored_id: String,
+        runtime_id: String,
+    },
+    /// Fetch remote workspace directories and enabled skills (`GET /api/chat/workspaces`, `GET /api/skills`).
+    FetchStudio,
     /// Fetch the configured catalog for this connection.
     FetchModels,
     /// Switch this conversation's model. `prime` is the conversation's own identity,
@@ -870,6 +884,9 @@ pub enum ComposerIntent {
     TogglePin,
     Rename(String),
     Archive,
+    Compress,
+    AttachImage,
+    PickWorkspace(Option<String>),
 }
 
 pub fn parse_composer_input(raw: &str) -> ComposerIntent {
@@ -886,7 +903,30 @@ pub fn parse_composer_input(raw: &str) -> ComposerIntent {
     if let Some(curation) = parse_curation_command(trimmed) {
         return curation;
     }
+    if let Some(studio) = parse_studio_command(trimmed) {
+        return studio;
+    }
     ComposerIntent::Prompt(trimmed.to_string())
+}
+
+fn parse_studio_command(trimmed: &str) -> Option<ComposerIntent> {
+    for cmd in ["/compress", "/compact"] {
+        if strip_command_prefix(trimmed, cmd) == Some("") {
+            return Some(ComposerIntent::Compress);
+        }
+    }
+    for cmd in ["/attach", "/image"] {
+        if strip_command_prefix(trimmed, cmd) == Some("") {
+            return Some(ComposerIntent::AttachImage);
+        }
+    }
+    for prefix in ["/workspace", "/cwd"] {
+        if let Some(rest) = strip_command_prefix(trimmed, prefix) {
+            let query = (!rest.is_empty()).then(|| rest.to_string());
+            return Some(ComposerIntent::PickWorkspace(query));
+        }
+    }
+    None
 }
 
 fn parse_curation_command(trimmed: &str) -> Option<ComposerIntent> {
@@ -1187,7 +1227,13 @@ pub fn parse_telemetry_payload(value: &serde_json::Value) -> Option<SessionTelem
 }
 
 pub fn parse_live_info_telemetry(result: &serde_json::Value) -> Option<SessionTelemetry> {
-    let info = result.get("info").filter(|v| v.is_object())?;
+    let info = result
+        .get("info")
+        .filter(|v| v.is_object())
+        .unwrap_or(result);
+    if !info.is_object() {
+        return None;
+    }
     let mut out = info
         .get("usage")
         .and_then(parse_telemetry_payload)
@@ -1628,6 +1674,22 @@ pub enum Event {
         stored_id: String,
         mutation: SessionMutation,
     },
+    /// Remote workspace catalog (`GET /api/chat/workspaces`).
+    Workspaces {
+        catalog: WorkspaceCatalog,
+    },
+    /// Enabled remote skills catalog (`GET /api/skills`).
+    Skills {
+        skills: Vec<SkillSummary>,
+    },
+    /// Context compaction result (`session.compress`).
+    Compressed {
+        stored_id: String,
+        runtime_id: String,
+        messages: Option<Vec<ChatMessage>>,
+        before: usize,
+        summary: CompressSummary,
+    },
     Error {
         operation: String,
         session_id: Option<String>,
@@ -1644,6 +1706,7 @@ pub struct Conversation {
     pub runtime_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub draft: String,
+    pub attachments: Vec<StagedImage>,
     pub status: TurnStatus,
     pub activity: String,
     pub read_only_reason: Option<String>,
@@ -1809,7 +1872,7 @@ impl Conversation {
     }
 
     pub fn operation_failed(&mut self, operation: &str, message: String) {
-        if matches!(operation, "branch" | "undo") {
+        if matches!(operation, "branch" | "undo" | "compress") {
             self.rewinding = false;
             self.activity.clear();
         }
@@ -2190,6 +2253,9 @@ fn ensure_tool_entry<'a>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     NewChat,
+    SwitchWorkspace,
+    AttachImage,
+    CompressCurrent,
     BranchCurrent,
     RewindLast(RewindMode),
     SwitchModel,
@@ -2261,6 +2327,10 @@ pub struct AppState {
     pub creating: bool,
     pub notice: String,
     pub catalog: Catalog,
+    pub workspaces: WorkspaceCatalog,
+    pub skills: Vec<SkillSummary>,
+    pub launch_cwd: Option<String>,
+    pub launch_attachments: Vec<StagedImage>,
     pub session_filter: SessionFilter,
     pub session_query: String,
     pub launch_draft: String,
@@ -2268,6 +2338,7 @@ pub struct AppState {
     pub inspector_open: bool,
     pub inspector_tab: InspectorTab,
     pub next_side_id: u64,
+    pub next_attachment_id: u64,
     pub remote_search_seq: u64,
     pub remote_search_loading: bool,
     pub remote_search_query: String,
@@ -2427,10 +2498,19 @@ impl AppState {
         &mut self,
         query: String,
         request_seq: u64,
-        hits: Vec<SearchHit>,
+        mut hits: Vec<SearchHit>,
     ) -> bool {
         if request_seq != self.remote_search_seq {
             return false;
+        }
+        for hit in &mut hits {
+            if self
+                .sessions
+                .iter()
+                .any(|s| s.stored_id == hit.stored_id && s.pinned)
+            {
+                hit.pinned = true;
+            }
         }
         self.remote_search_loading = false;
         self.remote_search_query = query;
@@ -2527,16 +2607,17 @@ impl AppState {
     }
 
     /// Begin creating a conversation from the launch composer (`selected == None`).
-    /// Keeps `launch_draft` intact until `Created` succeeds so a failure never loses text.
+    /// Keeps `launch_draft` and `launch_attachments` intact until `Created` succeeds so a failure never loses input.
     pub fn begin_launch_submit(&mut self) -> Option<(String, String)> {
         if self.selected.is_some() || self.creating || self.pending_launch.is_some() {
             return None;
         }
         let trimmed = self.launch_draft.trim().to_string();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && self.launch_attachments.is_empty() {
             return None;
         }
-        let title = derive_launch_title(&trimmed);
+        let title =
+            crate::studio::derive_multimodal_launch_title(&trimmed, &self.launch_attachments);
         self.creating = true;
         self.pending_launch = Some(trimmed.clone());
         Some((title, trimmed))
@@ -2553,11 +2634,90 @@ impl AppState {
         Some(prompt)
     }
 
+    pub fn take_pending_launch_bundle(&mut self) -> Option<(String, Vec<StagedImage>)> {
+        let prompt = self.take_pending_launch()?;
+        let attachments = std::mem::take(&mut self.launch_attachments);
+        Some((prompt, attachments))
+    }
+
     pub fn take_launch_draft_for_blank_chat(&mut self) -> String {
         if self.pending_launch.is_some() {
             return String::new();
         }
         std::mem::take(&mut self.launch_draft)
+    }
+
+    pub fn take_launch_attachments_for_blank_chat(&mut self) -> Vec<StagedImage> {
+        if self.pending_launch.is_some() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.launch_attachments)
+    }
+
+    pub fn allocate_attachment_id(&mut self) -> u64 {
+        self.next_attachment_id = self.next_attachment_id.saturating_add(1);
+        self.next_attachment_id
+    }
+
+    pub fn active_attachments(&self) -> &[StagedImage] {
+        match &self.selected {
+            Some(id) => self
+                .conversations
+                .get(id)
+                .map_or(&[], |c| c.attachments.as_slice()),
+            None => self.launch_attachments.as_slice(),
+        }
+    }
+
+    pub fn stage_active_images(&mut self, incoming: Vec<StagedImage>) -> Result<usize, String> {
+        if incoming.is_empty() {
+            return Ok(0);
+        }
+        let target = match self.selected.clone() {
+            Some(id) => &mut self.conversations.entry(id).or_default().attachments,
+            None => &mut self.launch_attachments,
+        };
+        let available = MAX_STAGED_IMAGES.saturating_sub(target.len());
+        if available == 0 {
+            return Err(format!(
+                "Up to {MAX_STAGED_IMAGES} images can be attached to one message."
+            ));
+        }
+        let added = incoming.len().min(available);
+        target.extend(incoming.into_iter().take(added));
+        Ok(added)
+    }
+
+    pub fn remove_active_attachment(&mut self, id: u64) -> bool {
+        let target = match self.selected.clone() {
+            Some(sel) => {
+                let Some(c) = self.conversations.get_mut(&sel) else {
+                    return false;
+                };
+                &mut c.attachments
+            }
+            None => &mut self.launch_attachments,
+        };
+        let before = target.len();
+        target.retain(|item| item.id != id);
+        target.len() != before
+    }
+
+    pub fn take_conversation_attachments(&mut self, stored_id: &str) -> Vec<StagedImage> {
+        self.conversations
+            .get_mut(stored_id)
+            .map(|c| std::mem::take(&mut c.attachments))
+            .unwrap_or_default()
+    }
+
+    pub fn effective_active_cwd(&self) -> Option<&str> {
+        if let Some(id) = &self.selected
+            && let Some(c) = self.conversations.get(id)
+            && !c.telemetry.cwd.trim().is_empty()
+        {
+            return Some(c.telemetry.cwd.as_str());
+        }
+        self.launch_cwd.as_deref()
     }
 
     pub fn apply_session_title(&mut self, id: &str, title: &str) -> bool {
@@ -2711,6 +2871,12 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
             "Ctrl+N",
         ));
     }
+    out.extend(palette_studio_commands(
+        state,
+        conversation,
+        connected,
+        writable,
+    ));
     out.extend(palette_curation_commands(state, conversation, connected));
     out.extend(palette_timeline_commands(
         state,
@@ -2730,6 +2896,45 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
     out.extend(palette_inspector_commands(state, writable));
     out.extend(palette_filter_commands(state));
     out.extend(palette_utility_commands(state, connected));
+    out
+}
+
+fn palette_studio_commands(
+    state: &AppState,
+    conversation: Option<&Conversation>,
+    connected: bool,
+    writable: bool,
+) -> Vec<PaletteEntry> {
+    let mut out = Vec::new();
+    if connected && !state.creating {
+        out.push(PaletteEntry::command(
+            PaletteAction::SwitchWorkspace,
+            "folder-symbolic",
+            "Switch / launch in workspace…",
+            "Choose a remote git repo or project directory (/workspace)",
+            "Ctrl+Shift+W",
+        ));
+    }
+    if connected && (state.selected.is_none() || writable) {
+        out.push(PaletteEntry::command(
+            PaletteAction::AttachImage,
+            "insert-image-symbolic",
+            "Attach image to prompt…",
+            "Stage PNG, JPEG, WebP, or GIF for multimodal vision (/attach)",
+            "Ctrl+U",
+        ));
+    }
+    if writable
+        && conversation.is_some_and(|c| !c.status.busy() && !c.rewinding && c.messages.len() >= 2)
+    {
+        out.push(PaletteEntry::command(
+            PaletteAction::CompressCurrent,
+            "view-restore-symbolic",
+            "Compress conversation context",
+            "Compact older turns on the server to free context window (/compress)",
+            "",
+        ));
+    }
     out
 }
 
@@ -4395,5 +4600,43 @@ mod tests {
                         query: "lattice".into(),
                     }
         }));
+    }
+
+    #[test]
+    fn studio_commands_attachments_and_compaction_parse_and_stage() {
+        assert_eq!(parse_composer_input("/compress"), ComposerIntent::Compress);
+        assert_eq!(parse_composer_input("/compact"), ComposerIntent::Compress);
+        assert_eq!(parse_composer_input("/attach"), ComposerIntent::AttachImage);
+        assert_eq!(
+            parse_composer_input("/workspace hermes-native"),
+            ComposerIntent::PickWorkspace(Some("hermes-native".into()))
+        );
+        assert_eq!(
+            parse_composer_input("/workspace"),
+            ComposerIntent::PickWorkspace(None)
+        );
+
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            launch_cwd: Some("/home/alice/repo".into()),
+            ..Default::default()
+        };
+        assert_eq!(state.effective_active_cwd(), Some("/home/alice/repo"));
+        let png = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        ];
+        let id1 = state.allocate_attachment_id();
+        let img = StagedImage::from_bytes(id1, "screen.png", png).unwrap();
+        assert_eq!(state.stage_active_images(vec![img]).unwrap(), 1);
+        assert_eq!(state.active_attachments().len(), 1);
+        let (title, prompt) = state.begin_launch_submit().expect("image-only launch");
+        assert_eq!(title, "Image: screen.png");
+        assert_eq!(prompt, "");
+        state.cancel_pending_launch();
+        assert_eq!(state.active_attachments().len(), 1);
+        let _ = state.begin_launch_submit().unwrap();
+        let (_, bundled) = state.take_pending_launch_bundle().unwrap();
+        assert_eq!(bundled.len(), 1);
+        assert!(state.active_attachments().is_empty());
     }
 }

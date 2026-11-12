@@ -147,3 +147,23 @@
 .message-match-active { border: 2px solid @accent_color; background: alpha(@accent_bg_color, 0.18); }
 .match-badge { background: alpha(@warning_color, 0.22); color: @warning_color; }
 .message-match-active .match-badge { background: alpha(@accent_bg_color, 0.28); color: @accent_color; }
+.hermes-composer.composer-drop-active { border: 2px solid @accent_color; background: alpha(@accent_bg_color, 0.10); }
+.workspace-trigger { background: alpha(@window_fg_color, 0.04); }
+.workspace-trigger:hover { background: alpha(@window_fg_color, 0.09); }
+.workspace-icon { opacity: 0.76; }
+.slash-deck { background: @view_bg_color; border: 1px solid alpha(@accent_color, 0.30); border-radius: 12px; padding: 8px 10px; }
+.slash-row { padding: 6px 8px; border-radius: 8px; }
+.slash-row-active { background: alpha(@accent_bg_color, 0.18); }
+.slash-token { font-family: monospace; font-size: 12.5px; font-weight: 800; color: @accent_color; min-width: 110px; }
+.slash-skill-badge { background: alpha(@purple_3, 0.20); color: @purple_3; }
+.slash-desc { font-size: 12px; opacity: 0.78; }
+.attach-trigger { padding: 4px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.045); }
+.attach-trigger:hover { background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
+.attachment-strip { padding-bottom: 4px; border-bottom: 1px solid alpha(@window_fg_color, 0.08); }
+.attachment-pill { background: alpha(@window_fg_color, 0.055); border: 1px solid alpha(@window_fg_color, 0.12); border-radius: 9px; padding: 4px 6px 4px 6px; }
+.attachment-thumb { border-radius: 5px; }
+.attachment-name { font-size: 11.5px; font-weight: 700; }
+.attachment-remove { min-width: 22px; min-height: 22px; padding: 0; opacity: 0.68; }
+.attachment-remove:hover { opacity: 1; color: @error_color; }
+.compress-btn { font-size: 11px; font-weight: 700; padding: 2px 8px; min-height: 24px; border-radius: 6px; background: alpha(@accent_bg_color, 0.14); color: @accent_color; }
+.compress-btn:hover { background: alpha(@accent_bg_color, 0.24); }

@@ -512,11 +512,12 @@ pub fn build_shortcut_hints() -> gtk::Box {
     stack.add_css_class("shortcut-strip");
     stack.append(&shortcut_hint_row(&[
         ("Enter", "Start chat"),
-        ("Ctrl+K", "Omnisearch"),
-        ("Ctrl+Shift+F", "Find"),
+        ("/", "Skills & commands"),
+        ("Ctrl+U", "Attach image"),
+        ("Ctrl+Shift+W", "Workspace"),
     ]));
     stack.append(&shortcut_hint_row(&[
-        ("Ctrl+P", "Pin"),
+        ("Ctrl+K", "Omnisearch"),
         ("Ctrl+I", "Flight Deck"),
         ("Ctrl+D", "Branch"),
         ("Alt+Enter", "Side-Ask"),

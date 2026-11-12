@@ -12,6 +12,7 @@ use crate::markdown;
 use crate::model::*;
 use crate::palette::{self, CommandPalette, TriageBar};
 use crate::recall::{self, SidebarRowItem, TranscriptFindBar};
+use crate::studio::{self, AttachmentStrip, SlashDeck, WorkspacePicker};
 
 struct Ui {
     backend: Option<Backend>,
@@ -31,6 +32,10 @@ struct Ui {
     inspector_toggle: gtk::Button,
     inspector_badge: gtk::Label,
     delete_chat: gtk::Button,
+    composer_box: gtk::Box,
+    workspace_picker: Rc<WorkspacePicker>,
+    slash_deck: Rc<SlashDeck>,
+    attachments: Rc<AttachmentStrip>,
     composer_hint: gtk::Label,
     sessions: gio::ListStore,
     selection: gtk::SingleSelection,
@@ -328,7 +333,7 @@ fn editor_editable(state: &AppState) -> bool {
 
 fn can_send_in_conversation(c: &Conversation) -> bool {
     let intent = parse_composer_input(&c.draft);
-    if is_curation_or_find_intent(&intent) {
+    if is_curation_or_find_intent(&intent) || is_local_studio_intent(&intent) {
         return true;
     }
     if c.runtime_id.is_none() || c.read_only_reason.is_some() || c.rewinding {
@@ -347,17 +352,50 @@ fn is_curation_or_find_intent(intent: &ComposerIntent) -> bool {
     )
 }
 
+fn is_local_studio_intent(intent: &ComposerIntent) -> bool {
+    matches!(
+        intent,
+        ComposerIntent::AttachImage | ComposerIntent::PickWorkspace(_)
+    )
+}
+
 fn can_send_live_intent(c: &Conversation, intent: &ComposerIntent) -> bool {
     match intent {
-        ComposerIntent::Empty => false,
+        ComposerIntent::Empty => !c.attachments.is_empty() && !c.status.busy(),
         ComposerIntent::SideQuestion(_) => true,
-        ComposerIntent::Branch(_) => {
-            !c.status.busy() && count_visible_branch_messages(&c.messages) > 0
-        }
-        ComposerIntent::Rewind(_) => !c.status.busy() && last_turn_targets(&c.messages).0.is_some(),
-        ComposerIntent::Prompt(_) => c.status != TurnStatus::Stopping,
+        ComposerIntent::Compress => !c.status.busy() && c.messages.len() >= 2,
+        ComposerIntent::Prompt(_) => can_send_prompt_intent(c),
+        other => can_send_timeline_intent(c, other),
+    }
+}
+
+fn can_send_prompt_intent(c: &Conversation) -> bool {
+    if c.attachments.is_empty() {
+        c.status != TurnStatus::Stopping
+    } else {
+        !c.status.busy()
+    }
+}
+
+fn can_send_timeline_intent(c: &Conversation, intent: &ComposerIntent) -> bool {
+    if c.status.busy() {
+        return false;
+    }
+    match intent {
+        ComposerIntent::Branch(_) => count_visible_branch_messages(&c.messages) > 0,
+        ComposerIntent::Rewind(_) => last_turn_targets(&c.messages).0.is_some(),
         _ => false,
     }
+}
+
+fn can_send_on_launch(state: &AppState) -> bool {
+    if state.creating || state.pending_launch.is_some() {
+        return false;
+    }
+    let intent = parse_composer_input(&state.launch_draft);
+    is_local_studio_intent(&intent)
+        || !state.launch_draft.trim().is_empty()
+        || !state.launch_attachments.is_empty()
 }
 
 fn composer_send_sensitive(state: &AppState, reload_pending: bool) -> bool {
@@ -365,11 +403,7 @@ fn composer_send_sensitive(state: &AppState, reload_pending: bool) -> bool {
         return false;
     }
     match &state.selected {
-        None => {
-            !state.creating
-                && state.pending_launch.is_none()
-                && !state.launch_draft.trim().is_empty()
-        }
+        None => can_send_on_launch(state),
         Some(id) => state
             .conversations
             .get(id)
@@ -379,7 +413,10 @@ fn composer_send_sensitive(state: &AppState, reload_pending: bool) -> bool {
 
 fn composer_hint_text(state: &AppState) -> &'static str {
     let Some(id) = &state.selected else {
-        return "Enter to start a new chat · Shift+Enter new line · Ctrl+K omnisearch";
+        let cmd = state.launch_draft.split_whitespace().next().unwrap_or("");
+        return composer_studio_slash_hint(cmd).unwrap_or(
+            "Enter to start a new chat · / skills · Ctrl+U image · Ctrl+Shift+W workspace",
+        );
     };
     let Some(c) = state.conversations.get(id) else {
         return "Enter to send · Alt+Enter side-ask (/btw) · Ctrl+Shift+F find";
@@ -397,7 +434,7 @@ fn composer_conversation_hint(c: &Conversation) -> &'static str {
     if c.status.steerable() {
         "Enter to steer active turn · Alt+Enter or /btw side-ask · Ctrl+I Flight Deck"
     } else {
-        "Enter to send · /find · /pin · /rename · /branch · /retry · Ctrl+K omnisearch"
+        "Enter to send · / skills & commands · Ctrl+U image · Ctrl+K omnisearch"
     }
 }
 
@@ -426,6 +463,19 @@ fn composer_curation_slash_hint(trimmed: &str) -> Option<&'static str> {
         "/pin" => Some("Enter to pin or unpin this conversation on the server (/pin)"),
         "/rename" | "/title" => Some("Enter to rename this conversation (/rename <new title>)"),
         "/archive" => Some("Enter to archive this conversation on the server (/archive)"),
+        other => composer_studio_slash_hint(other),
+    }
+}
+
+fn composer_studio_slash_hint(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "/compress" | "/compact" => Some("Enter to compact older turns on the server (/compress)"),
+        "/attach" | "/image" => {
+            Some("Enter to attach an image for multimodal vision (/attach · Ctrl+U)")
+        }
+        "/workspace" | "/cwd" => {
+            Some("Enter to choose or switch remote project directory (/workspace [query])")
+        }
         _ => None,
     }
 }
@@ -793,8 +843,12 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     activity.add_css_class("activity-label");
     activity_row.append(&activity);
     footer.append(&activity_row);
+    let slash_deck = SlashDeck::new();
+    footer.append(&slash_deck.revealer);
     let composer = gtk::Box::new(gtk::Orientation::Vertical, 8);
     composer.add_css_class("hermes-composer");
+    let attachments = AttachmentStrip::new();
+    composer.append(&attachments.root);
     let editor = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .accepts_tab(false)
@@ -869,8 +923,14 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
     panel.append(&model_scroll);
     model_popover.set_child(Some(&panel));
     model_menu.set_popover(Some(&model_popover));
+    let workspace_picker = WorkspacePicker::new();
     let model_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     model_row.append(&model_menu);
+    model_row.append(&workspace_picker.button);
+    let model_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    model_spacer.set_hexpand(true);
+    model_row.append(&model_spacer);
+    model_row.append(&attachments.attach_btn);
     composer.append(&model_row);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let composer_hint = gtk::Label::new(Some("Enter to send · Shift+Enter for a new line"));
@@ -937,6 +997,10 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         inspector_toggle,
         inspector_badge,
         delete_chat,
+        composer_box: composer,
+        workspace_picker,
+        slash_deck,
+        attachments,
         composer_hint,
         sessions,
         selection,
@@ -1313,7 +1377,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
     let key = gtk::EventControllerKey::new();
     let weak = Rc::downgrade(ui);
     key.connect_key_pressed(move |_, key, _, modifiers| {
-        handle_composer_key(weak.upgrade().as_deref(), key, modifiers)
+        handle_composer_key(weak.upgrade().as_ref(), key, modifiers)
     });
     ui.editor.add_controller(key);
     connect_model_picker(ui);
@@ -1328,7 +1392,7 @@ fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click:
 }
 
 fn handle_composer_key(
-    ui: Option<&Ui>,
+    ui: Option<&Rc<Ui>>,
     key: gdk::Key,
     modifiers: gdk::ModifierType,
 ) -> glib::Propagation {
@@ -1373,6 +1437,7 @@ fn connect_workspace(ui: &Rc<Ui>) {
     connect_inspector(ui);
     connect_timeline(ui);
     connect_recall_and_curation(ui);
+    connect_studio(ui);
 
     let weak_filter = Rc::downgrade(ui);
     let weak_query = Rc::downgrade(ui);
@@ -1529,6 +1594,100 @@ fn connect_recall_and_curation(ui: &Rc<Ui>) {
     );
 }
 
+fn connect_studio(ui: &Rc<Ui>) {
+    let weak = Rc::downgrade(ui);
+    ui.workspace_picker.connect_selected(move |cwd| {
+        let _ = weak.upgrade().map(|ui| ui.choose_workspace(cwd));
+    });
+    let weak = Rc::downgrade(ui);
+    ui.workspace_picker.connect_closed(move || {
+        let _ = weak.upgrade().map(|ui| ui.editor.grab_focus());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.slash_deck.connect_activated(move |cand| {
+        let _ = weak
+            .upgrade()
+            .map(|ui| ui.accept_slash_candidate(cand, false));
+    });
+    let weak = Rc::downgrade(ui);
+    ui.attachments.attach_btn.connect_clicked(move |_| {
+        let _ = weak.upgrade().map(|ui| ui.open_attach_image_dialog());
+    });
+    let weak = Rc::downgrade(ui);
+    ui.attachments.connect_remove(move |id| {
+        let _ = weak.upgrade().map(|ui| ui.remove_staged_attachment(id));
+    });
+    let weak = Rc::downgrade(ui);
+    studio::install_image_drop_target(&ui.composer_box, move |files| {
+        let _ = weak.upgrade().map(|ui| ui.stage_local_files(&files));
+    });
+    let studio_keys = gtk::EventControllerKey::new();
+    studio_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = Rc::downgrade(ui);
+    studio_keys.connect_key_pressed(move |_, key, _, modifiers| {
+        weak.upgrade().map_or(glib::Propagation::Proceed, |ui| {
+            handle_studio_editor_key(&ui, key, modifiers)
+        })
+    });
+    ui.editor.add_controller(studio_keys);
+}
+
+fn handle_studio_editor_key(
+    ui: &Rc<Ui>,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> glib::Propagation {
+    if is_image_clipboard_paste_shortcut(ui, key, modifiers) {
+        ui.paste_clipboard_image();
+        return glib::Propagation::Stop;
+    }
+    if !ui.slash_deck.is_open()
+        || modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK)
+    {
+        return glib::Propagation::Proceed;
+    }
+    handle_slash_deck_key(ui, key, modifiers)
+}
+
+fn is_image_clipboard_paste_shortcut(ui: &Ui, key: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    shortcut_command(key, modifiers) == Some('v')
+        && ui.can_stage_images_now()
+        && studio::clipboard_has_image_only(&ui.editor.clipboard().formats())
+}
+
+fn handle_slash_deck_key(
+    ui: &Rc<Ui>,
+    key: gdk::Key,
+    modifiers: gdk::ModifierType,
+) -> glib::Propagation {
+    match key {
+        gdk::Key::Down | gdk::Key::KP_Down => {
+            ui.slash_deck.step(1);
+            glib::Propagation::Stop
+        }
+        gdk::Key::Up | gdk::Key::KP_Up => {
+            ui.slash_deck.step(-1);
+            glib::Propagation::Stop
+        }
+        gdk::Key::Escape => {
+            let draft = ui.state.borrow().active_draft().to_string();
+            ui.slash_deck.dismiss(&draft);
+            glib::Propagation::Stop
+        }
+        gdk::Key::Tab | gdk::Key::ISO_Left_Tab => {
+            ui.complete_selected_slash(true);
+            glib::Propagation::Stop
+        }
+        gdk::Key::Return | gdk::Key::KP_Enter
+            if !modifiers.contains(gdk::ModifierType::SHIFT_MASK) =>
+        {
+            ui.complete_selected_slash(false);
+            glib::Propagation::Stop
+        }
+        _ => glib::Propagation::Proceed,
+    }
+}
+
 fn shortcut_command(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<char> {
     let clean = modifiers
         & (gdk::ModifierType::CONTROL_MASK
@@ -1597,6 +1756,11 @@ fn handle_extended_shortcut(ui: &Rc<Ui>, key: gdk::Key, modifiers: gdk::Modifier
             ui.archive_current();
             true
         }
+        Some('w') => {
+            ui.close_palette();
+            ui.open_workspace_picker();
+            true
+        }
         _ => false,
     }
 }
@@ -1635,9 +1799,18 @@ fn dispatch_workspace_shortcut(ui: &Rc<Ui>, ch: char) -> bool {
             ui.close_palette();
             ui.reload_or_reconnect();
         }
-        _ => return false,
+        _ => return dispatch_studio_shortcut(ui, ch),
     }
     true
+}
+
+fn dispatch_studio_shortcut(ui: &Rc<Ui>, ch: char) -> bool {
+    if ch == 'u' {
+        ui.close_palette();
+        ui.open_attach_image_dialog();
+        return true;
+    }
+    false
 }
 
 fn visible_selected_position(state: &AppState, visible_indices: &[usize]) -> u32 {
@@ -1678,10 +1851,12 @@ impl Ui {
         if !self.new_chat.is_sensitive() {
             return;
         }
+        let cwd = self.state.borrow().launch_cwd.clone();
         self.select_created.set(true);
         self.state.borrow_mut().creating = true;
         if !self.command(Command::Create {
             title: "New conversation".into(),
+            cwd,
         }) {
             self.state.borrow_mut().creating = false;
         }
@@ -1692,6 +1867,18 @@ impl Ui {
         self.changing_draft.set(true);
         self.editor.buffer().set_text(text);
         self.changing_draft.set(false);
+    }
+
+    fn set_editor_text_at_end(&self, text: &str) {
+        self.set_editor_text(text);
+        let buffer = self.editor.buffer();
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+    }
+
+    fn clear_active_draft(&self) {
+        self.state.borrow_mut().set_active_draft(String::new());
+        self.set_editor_text("");
     }
 
     fn select(&self, id: &str, focus_editor: bool) {
@@ -1759,7 +1946,10 @@ impl Ui {
         self.refresh();
     }
 
-    fn submit(&self) {
+    fn submit(self: &Rc<Self>) {
+        if self.try_submit_local_studio_intent() {
+            return;
+        }
         if self.state.borrow().selected.is_none() {
             self.submit_from_launch();
             return;
@@ -1770,7 +1960,11 @@ impl Ui {
         let Some((id, runtime_id, draft)) = self.extract_submit_target() else {
             return;
         };
-        match parse_composer_input(&draft) {
+        self.dispatch_live_intent(id, runtime_id, &draft);
+    }
+
+    fn dispatch_live_intent(&self, id: String, runtime_id: String, draft: &str) {
+        match parse_composer_input(draft) {
             ComposerIntent::SideQuestion(question) => {
                 self.dispatch_composer_side_question(&id, question);
             }
@@ -1782,9 +1976,28 @@ impl Ui {
                 self.clear_composer_draft(&id);
                 self.rewind_last(mode);
             }
+            ComposerIntent::Compress => {
+                self.clear_composer_draft(&id);
+                self.compress_current();
+            }
+            ComposerIntent::Empty => self.dispatch_prompt_or_steer(id, runtime_id, String::new()),
             ComposerIntent::Prompt(text) => self.dispatch_prompt_or_steer(id, runtime_id, text),
             _ => {}
         }
+    }
+
+    fn try_submit_local_studio_intent(self: &Rc<Self>) -> bool {
+        let intent = parse_composer_input(self.state.borrow().active_draft());
+        if !is_local_studio_intent(&intent) {
+            return false;
+        }
+        self.clear_active_draft();
+        match intent {
+            ComposerIntent::AttachImage => self.open_attach_image_dialog(),
+            ComposerIntent::PickWorkspace(query) => self.pick_workspace_by_query(query),
+            _ => {}
+        }
+        true
     }
 
     fn try_submit_curation_or_find(&self) -> bool {
@@ -1844,25 +2057,21 @@ impl Ui {
             self.steer(id, runtime_id, text);
             return;
         }
+        let attachments = self.state.borrow_mut().take_conversation_attachments(&id);
+        let display_text = studio::format_optimistic_prompt(&text, &attachments);
+        let activity = submit_activity_label(!attachments.is_empty());
         if !self.command(Command::Submit {
             runtime_id,
-            text: text.clone(),
+            text,
+            attachments: attachments.clone(),
         }) {
+            if let Some(c) = self.state.borrow_mut().conversations.get_mut(&id) {
+                c.attachments = attachments;
+            }
             self.refresh();
             return;
         }
-        self.sequence.set(self.sequence.get() + 1);
-        if let Some(c) = self.state.borrow_mut().conversations.get_mut(&id) {
-            c.clear_turn_reasoning();
-            c.record_message(ChatMessage {
-                id: format!("client-{}", self.sequence.get()),
-                role: Role::User,
-                text,
-            });
-            c.draft.clear();
-            c.status = TurnStatus::Submitting;
-            c.activity = "Sending…".into();
-        }
+        self.record_optimistic_submit(&id, display_text, activity);
         self.set_editor_text("");
         self.follow_bottom.set(true);
         self.refresh();
@@ -1872,44 +2081,63 @@ impl Ui {
         if !self.send.is_sensitive() {
             return;
         }
+        let cwd = self.state.borrow().launch_cwd.clone();
         let Some((title, _)) = self.state.borrow_mut().begin_launch_submit() else {
             return;
         };
         self.select_created.set(true);
-        if !self.command(Command::Create { title }) {
+        if !self.command(Command::Create { title, cwd }) {
             self.state.borrow_mut().cancel_pending_launch();
         }
         self.refresh();
     }
 
-    fn send_initial_prompt(&self, id: &str, runtime_id: String, text: String) {
+    fn send_initial_prompt(
+        &self,
+        id: &str,
+        runtime_id: String,
+        text: String,
+        attachments: Vec<StagedImage>,
+    ) {
+        let display_text = studio::format_optimistic_prompt(&text, &attachments);
+        let activity = submit_activity_label(!attachments.is_empty());
         if !self.command(Command::Submit {
             runtime_id,
             text: text.clone(),
+            attachments: attachments.clone(),
         }) {
-            if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
-                c.draft = text.clone();
-            }
-            if self.state.borrow().selected.as_deref() == Some(id) {
-                self.set_editor_text(&text);
-            }
-            self.refresh();
+            self.restore_failed_initial_prompt(id, text, attachments);
             return;
         }
+        self.record_optimistic_submit(id, display_text, activity);
+        self.follow_bottom.set(true);
+        self.refresh();
+    }
+
+    fn restore_failed_initial_prompt(&self, id: &str, text: String, attachments: Vec<StagedImage>) {
+        if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
+            c.draft = text.clone();
+            c.attachments = attachments;
+        }
+        if self.state.borrow().selected.as_deref() == Some(id) {
+            self.set_editor_text(&text);
+        }
+        self.refresh();
+    }
+
+    fn record_optimistic_submit(&self, id: &str, display_text: String, activity: &'static str) {
         self.sequence.set(self.sequence.get() + 1);
         if let Some(c) = self.state.borrow_mut().conversations.get_mut(id) {
             c.clear_turn_reasoning();
             c.record_message(ChatMessage {
                 id: format!("client-{}", self.sequence.get()),
                 role: Role::User,
-                text,
+                text: display_text,
             });
             c.draft.clear();
             c.status = TurnStatus::Submitting;
-            c.activity = "Sending…".into();
+            c.activity = activity.into();
         }
-        self.follow_bottom.set(true);
-        self.refresh();
     }
 
     fn submit_composer_as_side(&self) {
@@ -2029,6 +2257,7 @@ impl Ui {
             InspectorAction::InsertDraft(snippet) => self.insert_into_composer(&snippet),
             InspectorAction::JumpToMessage(index) => self.jump_to_message(index),
             InspectorAction::BranchAt(index) => self.branch_from(Some(index), None),
+            InspectorAction::CompressContext => self.compress_current(),
         }
     }
 
@@ -2223,6 +2452,15 @@ impl Ui {
             PaletteAction::RenameCurrent => self.prompt_rename_current(),
             PaletteAction::ArchiveCurrent => self.archive_current(),
             PaletteAction::DeleteCurrent => self.confirm_delete_current(),
+            other => self.run_palette_studio_action(other),
+        }
+    }
+
+    fn run_palette_studio_action(self: &Rc<Self>, action: PaletteAction) {
+        match action {
+            PaletteAction::SwitchWorkspace => self.open_workspace_picker(),
+            PaletteAction::AttachImage => self.open_attach_image_dialog(),
+            PaletteAction::CompressCurrent => self.compress_current(),
             _ => {}
         }
     }
@@ -2742,30 +2980,36 @@ impl Ui {
         model: Option<ModelIdentity>,
     ) {
         let id = session.stored_id.clone();
-        let launch_prompt = {
+        let launch_bundle = {
             let mut state = self.state.borrow_mut();
             let seeded_draft = state.take_launch_draft_for_blank_chat();
-            let prompt = state.take_pending_launch();
+            let seeded_attachments = state.take_launch_attachments_for_blank_chat();
+            let bundle = state.take_pending_launch_bundle();
+            let initial_cwd = state.launch_cwd.clone().unwrap_or_default();
             state.sessions.insert(0, session);
             let mut conversation = Conversation {
                 runtime_id: Some(runtime_id.clone()),
                 loaded: true,
                 draft: seeded_draft,
+                attachments: seeded_attachments,
                 ..Default::default()
             };
+            if !initial_cwd.is_empty() {
+                conversation.telemetry.cwd = initial_cwd;
+            }
             if let Some(model) = model {
                 conversation.confirm_model(model);
             }
             state.conversations.insert(id.clone(), conversation);
             state.creating = false;
-            prompt
+            bundle
         };
         self.refresh_sessions();
         if self.select_created.replace(false) {
             self.select(&id, true);
         }
-        if let Some(prompt) = launch_prompt {
-            self.send_initial_prompt(&id, runtime_id, prompt);
+        if let Some((prompt, attachments)) = launch_bundle {
+            self.send_initial_prompt(&id, runtime_id, prompt, attachments);
         }
     }
 
@@ -2835,6 +3079,8 @@ impl Ui {
                 state.disconnect();
                 // A catalog belongs to one connection; keep no stale rows across a reconnect.
                 state.catalog = Catalog::default();
+                state.workspaces = WorkspaceCatalog::default();
+                state.skills.clear();
                 self.pending_resumes.borrow_mut().clear();
             }
             state.connection = Some(connection);
@@ -2851,7 +3097,229 @@ impl Ui {
     }
 
     fn apply_auxiliary(self: &Rc<Self>, event: &Event) -> bool {
-        self.apply_model(event) || self.apply_inspector(event) || self.apply_timeline(event)
+        self.apply_model(event)
+            || self.apply_inspector(event)
+            || self.apply_timeline(event)
+            || self.apply_studio(event)
+    }
+
+    fn apply_studio(&self, event: &Event) -> bool {
+        match event {
+            Event::Workspaces { catalog } => {
+                self.state.borrow_mut().workspaces = catalog.clone();
+            }
+            Event::Skills { skills } => {
+                self.state.borrow_mut().skills = skills.clone();
+            }
+            Event::Compressed {
+                stored_id,
+                runtime_id,
+                messages,
+                before,
+                summary,
+            } => {
+                self.note_compressed(
+                    stored_id.clone(),
+                    runtime_id.clone(),
+                    messages.clone(),
+                    *before,
+                    summary.clone(),
+                );
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn note_compressed(
+        &self,
+        stored_id: String,
+        runtime_id: String,
+        messages: Option<Vec<ChatMessage>>,
+        before: usize,
+        summary: CompressSummary,
+    ) {
+        let did_reload = messages.is_some();
+        let jump_idx = {
+            let mut state = self.state.borrow_mut();
+            apply_compressed_state(
+                &mut state, &stored_id, runtime_id, messages, before, &summary,
+            );
+            did_reload
+                .then(|| sync_find_after_transcript_load(&mut state, &stored_id))
+                .flatten()
+        };
+        if did_reload {
+            self.refresh_sessions();
+        }
+        if let Some(index) = jump_idx {
+            self.schedule_scroll_to_message(index);
+        }
+    }
+
+    fn open_workspace_picker(&self) {
+        self.workspace_picker.open();
+    }
+
+    fn pick_workspace_by_query(&self, query: Option<String>) {
+        let Some(raw_query) = query else {
+            self.open_workspace_picker();
+            return;
+        };
+        let resolved = self.state.borrow().workspaces.resolve_query(&raw_query);
+        if let Some(cwd) = resolved {
+            self.choose_workspace(cwd);
+        } else {
+            self.state.borrow_mut().notice = format!("No remote workspace matched “{raw_query}”.");
+            self.refresh();
+            self.open_workspace_picker();
+        }
+    }
+
+    fn choose_workspace(&self, cwd: Option<String>) {
+        let should_launch_new = {
+            let mut state = self.state.borrow_mut();
+            state.notice.clear();
+            state.launch_cwd = cwd.clone();
+            workspace_pick_starts_new_chat(&state, cwd.as_deref())
+        };
+        if should_launch_new && self.new_chat.is_sensitive() {
+            self.create();
+        } else {
+            self.refresh();
+            self.editor.grab_focus();
+        }
+    }
+
+    fn complete_selected_slash(self: &Rc<Self>, tab_only: bool) {
+        let Some(cand) = self.slash_deck.selected_candidate() else {
+            return;
+        };
+        self.accept_slash_candidate(cand, tab_only);
+    }
+
+    fn accept_slash_candidate(self: &Rc<Self>, cand: SlashCandidate, tab_only: bool) {
+        if !tab_only && cand.zero_arg_execute {
+            self.state.borrow_mut().set_active_draft(cand.token.clone());
+            self.set_editor_text_at_end(&cand.token);
+            self.slash_deck.hide();
+            self.refresh_controls();
+            self.submit();
+            return;
+        }
+        self.state
+            .borrow_mut()
+            .set_active_draft(cand.insert_text.clone());
+        self.set_editor_text_at_end(&cand.insert_text);
+        self.slash_deck.hide();
+        self.refresh_controls();
+        self.editor.grab_focus();
+    }
+
+    fn can_stage_images_now(&self) -> bool {
+        let state = self.state.borrow();
+        let connected = state.connection.as_ref() == Some(&ConnectionState::Connected);
+        can_stage_images(&state, connected)
+    }
+
+    fn open_attach_image_dialog(self: &Rc<Self>) {
+        if !self.can_stage_images_now() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        studio::spawn_image_file_dialog(&self.window, move |files| {
+            if let Some(ui) = weak.upgrade() {
+                ui.stage_local_files(&files);
+            }
+        });
+    }
+
+    fn paste_clipboard_image(self: &Rc<Self>) {
+        if !self.can_stage_images_now() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        studio::spawn_clipboard_image_paste(self.editor.clipboard(), move |result| {
+            if let Some(ui) = weak.upgrade() {
+                ui.finish_clipboard_image_paste(result);
+            }
+        });
+    }
+
+    fn finish_clipboard_image_paste(&self, result: Result<Vec<u8>, String>) {
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.state.borrow_mut().notice = err;
+                self.refresh();
+                return;
+            }
+        };
+        let id = self.state.borrow_mut().allocate_attachment_id();
+        let name = format!("clipboard-{id}.png");
+        match StagedImage::from_bytes(id, &name, bytes) {
+            Ok(img) => self.commit_staged_images(vec![img], None),
+            Err(err) => {
+                self.state.borrow_mut().notice = err;
+                self.refresh();
+            }
+        }
+    }
+
+    fn stage_local_files(&self, files: &[gio::File]) {
+        if !self.can_stage_images_now() {
+            return;
+        }
+        let (staged, first_err) = studio::read_local_image_files(files, || {
+            self.state.borrow_mut().allocate_attachment_id()
+        });
+        self.commit_staged_images(staged, first_err);
+    }
+
+    fn commit_staged_images(&self, staged: Vec<StagedImage>, read_err: Option<String>) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.notice.clear();
+            if let Err(err) = state.stage_active_images(staged) {
+                state.notice = err;
+            } else if let Some(err) = read_err {
+                state.notice = err;
+            }
+        }
+        self.refresh();
+        self.editor.grab_focus();
+    }
+
+    fn remove_staged_attachment(&self, id: u64) {
+        if self.state.borrow_mut().remove_active_attachment(id) {
+            self.refresh();
+            self.editor.grab_focus();
+        }
+    }
+
+    fn compress_current(&self) {
+        let prepared = {
+            let state = self.state.borrow();
+            prepare_compress_command(&state)
+        };
+        let Some((stored_id, cmd)) = prepared else {
+            return;
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            state.notice.clear();
+            if let Some(c) = state.conversations.get_mut(&stored_id) {
+                c.rewinding = true;
+                c.activity = "Compressing older turns…".into();
+            }
+        }
+        if !self.command(cmd)
+            && let Some(c) = self.state.borrow_mut().conversations.get_mut(&stored_id)
+        {
+            c.rewinding = false;
+            c.activity.clear();
+        }
+        self.refresh();
     }
 
     fn apply_timeline(&self, event: &Event) -> bool {
@@ -3466,6 +3934,30 @@ impl Ui {
         self.refresh_model_trigger(conversation, &state.catalog, writable);
         self.refresh_connection_badge(&state);
         self.sync_inspector_chrome(&state, conversation, writable);
+        self.sync_studio(&state, conversation, connected, writable);
+    }
+
+    fn sync_studio(
+        &self,
+        state: &AppState,
+        conversation: Option<&Conversation>,
+        connected: bool,
+        writable: bool,
+    ) {
+        let branch = conversation.map_or("", |c| c.telemetry.branch.as_str());
+        self.workspace_picker.sync(
+            &state.workspaces,
+            state.effective_active_cwd(),
+            branch,
+            state.selected.is_some(),
+            connected && !state.creating,
+        );
+        let editable = connected && editor_editable(state);
+        self.slash_deck
+            .sync(state.active_draft(), &state.skills, editable);
+        let can_stage =
+            can_stage_images(state, connected) && (state.selected.is_none() || writable);
+        self.attachments.sync(state.active_attachments(), can_stage);
     }
 
     fn sync_curation_controls(
@@ -3733,6 +4225,90 @@ impl Ui {
         buttons.append(&submit);
         buttons.append(&cancel);
         self.interaction.append(&buttons);
+    }
+}
+
+fn prepare_compress_command(state: &AppState) -> Option<(String, Command)> {
+    if state.connection.as_ref() != Some(&ConnectionState::Connected) {
+        return None;
+    }
+    let stored_id = state.selected.clone()?;
+    let c = state.conversations.get(&stored_id)?;
+    if c.read_only_reason.is_some() || c.status.busy() || c.rewinding || c.messages.len() < 2 {
+        return None;
+    }
+    let runtime_id = c.runtime_id.clone()?;
+    let cmd = Command::Compress {
+        stored_id: stored_id.clone(),
+        runtime_id,
+    };
+    Some((stored_id, cmd))
+}
+
+fn apply_compressed_state(
+    state: &mut AppState,
+    stored_id: &str,
+    runtime_id: String,
+    messages: Option<Vec<ChatMessage>>,
+    before: usize,
+    summary: &CompressSummary,
+) {
+    if let Some(msgs) = &messages
+        && let Some(row) = state.sessions.iter_mut().find(|s| s.stored_id == stored_id)
+    {
+        row.message_count = before + msgs.len();
+    }
+    let Some(c) = state.conversations.get_mut(stored_id) else {
+        return;
+    };
+    c.runtime_id = Some(runtime_id);
+    c.rewinding = false;
+    c.activity = summary.status_line();
+    if let Some(msgs) = messages {
+        c.messages = msgs;
+        c.history_before = before;
+        c.revision += 1;
+    }
+    c.inspector_revision += 1;
+}
+
+fn can_stage_images(state: &AppState, connected: bool) -> bool {
+    if !connected {
+        return false;
+    }
+    match &state.selected {
+        None => !state.creating && state.pending_launch.is_none(),
+        Some(id) => state.conversations.get(id).is_some_and(|c| {
+            c.runtime_id.is_some()
+                && c.read_only_reason.is_none()
+                && !c.rewinding
+                && !c.status.busy()
+        }),
+    }
+}
+
+fn workspace_pick_starts_new_chat(state: &AppState, chosen: Option<&str>) -> bool {
+    let Some(id) = &state.selected else {
+        return false;
+    };
+    let current = state
+        .conversations
+        .get(id)
+        .map(|c| c.telemetry.cwd.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(state.workspaces.default_cwd.as_str());
+    let target = chosen
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(state.workspaces.default_cwd.as_str());
+    current != target
+}
+
+fn submit_activity_label(has_attachments: bool) -> &'static str {
+    if has_attachments {
+        "Uploading image & sending…"
+    } else {
+        "Sending…"
     }
 }
 
@@ -4771,5 +5347,90 @@ mod tests {
         );
         assert!(!rewound.rewinding);
         assert_eq!(rewound.draft, "Edited prompt");
+    }
+
+    #[test]
+    fn studio_multimodal_attachments_and_compress_controls_follow_session_state() {
+        let png = StagedImage::from_bytes(
+            1,
+            "shot.png",
+            vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+        )
+        .expect("png");
+        let mut state = AppState {
+            connection: Some(ConnectionState::Connected),
+            launch_attachments: vec![png.clone()],
+            ..Default::default()
+        };
+        assert!(can_stage_images(&state, true));
+        // Even with an empty text draft, a staged image on the Launch Screen arms Send.
+        assert!(composer_send_sensitive(&state, false));
+        state.launch_draft = "/workspace native".into();
+        assert!(composer_hint_text(&state).contains("project directory"));
+
+        state.selected = Some("chat-1".into());
+        let mut chat = Conversation {
+            runtime_id: Some("rt-1".into()),
+            attachments: vec![png],
+            messages: vec![
+                ChatMessage {
+                    id: "u1".into(),
+                    role: Role::User,
+                    text: "One".into(),
+                },
+                ChatMessage {
+                    id: "a1".into(),
+                    role: Role::Assistant,
+                    text: "Two".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        // Image-only send in an idle conversation is enabled, but disabled while busy.
+        assert!(can_send_in_conversation(&chat));
+        chat.status = TurnStatus::Streaming;
+        assert!(!can_send_in_conversation(&chat));
+        chat.status = TurnStatus::Idle;
+        chat.draft = "/compress".into();
+        assert!(can_send_in_conversation(&chat));
+        assert!(composer_conversation_hint(&chat).contains("compact older turns"));
+        state.conversations.insert("chat-1".into(), chat);
+        state.sessions.push(SessionSummary {
+            stored_id: "chat-1".into(),
+            message_count: 6,
+            ..Default::default()
+        });
+
+        let (_, cmd) = prepare_compress_command(&state).expect("compress cmd");
+        assert!(matches!(cmd, Command::Compress { .. }));
+
+        apply_compressed_state(
+            &mut state,
+            "chat-1",
+            "rt-2".into(),
+            Some(vec![ChatMessage {
+                id: "s1".into(),
+                role: Role::Assistant,
+                text: "Summary".into(),
+            }]),
+            0,
+            &CompressSummary {
+                removed: 5,
+                before_tokens: 9000,
+                after_tokens: 1200,
+                noop: false,
+                headline: "Compacted 5 messages".into(),
+            },
+        );
+        assert_eq!(state.sessions[0].message_count, 1);
+        assert_eq!(
+            state.conversations["chat-1"].runtime_id.as_deref(),
+            Some("rt-2")
+        );
+        assert_eq!(
+            state.conversations["chat-1"].activity,
+            "Compacted 5 messages"
+        );
+        assert_eq!(submit_activity_label(true), "Uploading image & sending…");
     }
 }

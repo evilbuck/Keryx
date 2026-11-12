@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use hermes_native::backend::{self, Backend};
 use hermes_native::model::{
     Catalog, ChatMessage, Command, Config, ConnectionState, Event, ModelIdentity, RewindMode, Role,
-    SearchHit, SeedMessage, SessionMutation, SessionSummary, TurnStatus,
+    SearchHit, SeedMessage, SessionMutation, SessionSummary, SkillSummary, StagedImage, TurnStatus,
+    WorkspaceCatalog,
 };
 
 const WORD: &str = "lattice";
@@ -109,7 +110,7 @@ fn run(harness: &mut Harness, created: &mut Vec<String>) -> Result<String, Strin
     prove_conversations_and_timeline(harness, created)?;
     let switched = prove_model_switch(harness, created)?;
     Ok(format!(
-        "connected created=4 turn1={WORD} turn2_context=true btw_snapshot=true branched_undo=true fts_search=true curation_pin_rename_archive=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
+        "connected created=5 turn1={WORD} turn2_context=true btw_snapshot=true branched_undo=true fts_search=true curation_pin_rename_archive=true studio_workspaces_skills_vision_compress=true second={OTHER} switched=true reconnect_history=true model_switch={switched}"
     ))
 }
 
@@ -125,7 +126,8 @@ fn prove_conversations_and_timeline(
     prove_side_question(harness, &first.1)?;
     prove_branch_and_undo(harness, &first.0, &first.1, created)?;
     prove_saved_and_reconnected(harness, &first.0, &second.0)?;
-    prove_recall_and_curation(harness, &first.0, &second.0)
+    prove_recall_and_curation(harness, &first.0, &second.0)?;
+    prove_composer_studio(harness, created)
 }
 
 fn prove_initial_turns(
@@ -665,8 +667,17 @@ fn delete_one(harness: &mut Harness, id: &str) -> Result<(), String> {
 }
 
 fn create(harness: &mut Harness, title: &str) -> Result<(String, String), String> {
+    create_in_workspace(harness, title, None)
+}
+
+fn create_in_workspace(
+    harness: &mut Harness,
+    title: &str,
+    cwd: Option<String>,
+) -> Result<(String, String), String> {
     harness.send(Command::Create {
         title: title.into(),
+        cwd,
     })?;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
@@ -801,9 +812,19 @@ fn submit(
     runtime_id: &str,
     text: &str,
 ) -> Result<(String, Option<String>), String> {
+    submit_with_attachments(harness, runtime_id, text, Vec::new())
+}
+
+fn submit_with_attachments(
+    harness: &mut Harness,
+    runtime_id: &str,
+    text: &str,
+    attachments: Vec<StagedImage>,
+) -> Result<(String, Option<String>), String> {
     harness.send(Command::Submit {
         runtime_id: runtime_id.into(),
         text: text.into(),
+        attachments,
     })?;
     let start = Instant::now();
     let mut reply = None;
@@ -952,6 +973,174 @@ fn wait_connected(harness: &mut Harness, timeout: Duration) -> Result<(), String
         std::thread::sleep(Duration::from_millis(30));
     }
     Err("timed out waiting to connect".into())
+}
+
+const SMOKE_1X1_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+    0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+fn prove_composer_studio(harness: &mut Harness, created: &mut Vec<String>) -> Result<(), String> {
+    let chosen_cwd = select_smoke_workspace(harness)?;
+    let (studio_id, studio_rt) =
+        create_in_workspace(harness, "hn-smoke-studio", Some(chosen_cwd.clone()))?;
+    created.push(studio_id.clone());
+    prove_multimodal_turn(harness, &studio_rt, &chosen_cwd)?;
+    prove_compress_session(harness, &studio_id, &studio_rt)
+}
+
+fn select_smoke_workspace(harness: &mut Harness) -> Result<String, String> {
+    let (workspaces, skills) = fetch_studio_catalogs(harness)?;
+    if skills.is_empty() {
+        return Err("expected remote skills catalog to be non-empty".into());
+    }
+    workspaces
+        .options
+        .iter()
+        .find(|opt| !opt.is_default)
+        .or_else(|| workspaces.options.first())
+        .map(|opt| opt.root.clone())
+        .ok_or_else(|| "expected at least one remote workspace option".to_string())
+}
+
+fn prove_multimodal_turn(
+    harness: &mut Harness,
+    runtime_id: &str,
+    expected_cwd: &str,
+) -> Result<(), String> {
+    let png = StagedImage::from_bytes(1, "smoke-dot.png", SMOKE_1X1_PNG.to_vec())?;
+    let (reply, _) = submit_with_attachments(
+        harness,
+        runtime_id,
+        "Reply with the single word vision. Do not use tools.",
+        vec![png],
+    )?;
+    if reply.trim().is_empty() {
+        return Err("multimodal turn returned an empty reply".into());
+    }
+    verify_session_cwd_telemetry(harness, runtime_id, expected_cwd)
+}
+
+fn fetch_studio_catalogs(
+    harness: &mut Harness,
+) -> Result<(WorkspaceCatalog, Vec<SkillSummary>), String> {
+    harness.send(Command::FetchStudio)?;
+    let start = Instant::now();
+    let mut workspaces = None;
+    let mut skills = None;
+    while start.elapsed() < Duration::from_secs(30) {
+        for event in harness.drain() {
+            note_studio_catalog_event(event, &mut workspaces, &mut skills, &mut harness.events)?;
+        }
+        if let (Some(ws), Some(sk)) = (workspaces.clone(), skills.clone()) {
+            return Ok((ws, sk));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("fetching studio workspaces and skills timed out".into())
+}
+
+fn note_studio_catalog_event(
+    event: Event,
+    workspaces: &mut Option<WorkspaceCatalog>,
+    skills: &mut Option<Vec<SkillSummary>>,
+    keep: &mut Vec<Event>,
+) -> Result<(), String> {
+    match event {
+        Event::Workspaces { catalog } => {
+            if let Some(err) = catalog.error {
+                return Err(format!("workspaces catalog error: {err}"));
+            }
+            *workspaces = Some(catalog);
+        }
+        Event::Skills { skills: list } => {
+            *skills = Some(list);
+        }
+        other => keep.push(other),
+    }
+    Ok(())
+}
+
+fn verify_session_cwd_telemetry(
+    harness: &mut Harness,
+    runtime_id: &str,
+    expected_cwd: &str,
+) -> Result<(), String> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        let mut rest = Vec::new();
+        let mut matched = false;
+        for event in harness.drain() {
+            if let Event::Telemetry {
+                runtime_id: ref id,
+                ref telemetry,
+            } = event
+                && id == runtime_id
+                && telemetry.cwd == expected_cwd
+            {
+                matched = true;
+            }
+            rest.push(event);
+        }
+        harness.events.extend(rest);
+        if matched {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("did not observe session telemetry matching requested workspace cwd".into())
+}
+
+fn prove_compress_session(
+    harness: &mut Harness,
+    stored_id: &str,
+    runtime_id: &str,
+) -> Result<(), String> {
+    harness.send(Command::Compress {
+        stored_id: stored_id.into(),
+        runtime_id: runtime_id.into(),
+    })?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        for event in harness.drain() {
+            if let Some(done) = note_compress_event(event, stored_id, &mut harness.events)? {
+                return Ok(done);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err("session.compress timed out".into())
+}
+
+fn note_compress_event(
+    event: Event,
+    target_id: &str,
+    keep: &mut Vec<Event>,
+) -> Result<Option<()>, String> {
+    match event {
+        Event::Compressed {
+            stored_id, summary, ..
+        } if stored_id == target_id => {
+            if summary.status_line().trim().is_empty() {
+                return Err("compress summary status line was empty".into());
+            }
+            Ok(Some(()))
+        }
+        Event::Error {
+            operation,
+            session_id,
+            message,
+        } if operation == "compress" && session_id.as_deref() == Some(target_id) => {
+            Err(format!("session.compress failed: {message}"))
+        }
+        other => {
+            keep.push(other);
+            Ok(None)
+        }
+    }
 }
 
 impl Harness {

@@ -17,6 +17,12 @@ pub enum InspectorAction {
     InsertDraft(String),
     JumpToMessage(usize),
     BranchAt(usize),
+    CompressContext,
+}
+
+pub fn can_compress_conversation(conversation: Option<&Conversation>, writable: bool) -> bool {
+    writable
+        && conversation.is_some_and(|c| !c.status.busy() && !c.rewinding && c.messages.len() >= 2)
 }
 
 type ActionCallback = Rc<RefCell<Option<Box<dyn Fn(InspectorAction)>>>>;
@@ -41,6 +47,7 @@ pub struct InspectorPanel {
     side_entry: gtk::Entry,
     side_send: gtk::Button,
     context_summary: gtk::Label,
+    compress_btn: gtk::Button,
     context_bar: gtk::ProgressBar,
     workspace_line: gtk::Label,
     metrics_grid: gtk::Grid,
@@ -62,6 +69,7 @@ impl InspectorPanel {
         let (
             trace_page,
             context_summary,
+            compress_btn,
             context_bar,
             workspace_line,
             metrics_grid,
@@ -69,7 +77,7 @@ impl InspectorPanel {
             reasoning_copy,
             tools_count,
             tools_list,
-        ) = build_trace_page();
+        ) = build_trace_page(&callback);
         let (outline_page, outline_list) = build_outline_page();
 
         let stack = gtk::Stack::builder()
@@ -105,6 +113,7 @@ impl InspectorPanel {
             side_entry,
             side_send,
             context_summary,
+            compress_btn,
             context_bar,
             workspace_line,
             metrics_grid,
@@ -140,6 +149,8 @@ impl InspectorPanel {
         }
         self.sync_active_tab(tab);
         self.sync_composer_sensitivity(writable);
+        self.compress_btn
+            .set_sensitive(can_compress_conversation(conversation, writable));
         let next = RenderStamp {
             session_id: session_id.unwrap_or("").to_string(),
             inspector_revision: conversation.map_or(0, |c| c.inspector_revision),
@@ -643,9 +654,12 @@ fn build_side_actions(answer: &str, cb: &ActionCallback) -> gtk::Box {
 }
 
 #[allow(clippy::type_complexity)]
-fn build_trace_page() -> (
+fn build_trace_page(
+    cb: &ActionCallback,
+) -> (
     gtk::ScrolledWindow,
     gtk::Label,
+    gtk::Button,
     gtk::ProgressBar,
     gtk::Label,
     gtk::Grid,
@@ -654,8 +668,8 @@ fn build_trace_page() -> (
     gtk::Label,
     gtk::Box,
 ) {
-    let (telemetry_card, context_summary, context_bar, workspace_line, metrics_grid) =
-        build_telemetry_card();
+    let (telemetry_card, context_summary, compress_btn, context_bar, workspace_line, metrics_grid) =
+        build_telemetry_card(cb);
     let (reasoning_card, reasoning_label, reasoning_copy) = build_reasoning_card();
     let (tools_card, tools_count, tools_list) = build_tools_card();
 
@@ -680,6 +694,7 @@ fn build_trace_page() -> (
     (
         scroll,
         context_summary,
+        compress_btn,
         context_bar,
         workspace_line,
         metrics_grid,
@@ -690,9 +705,12 @@ fn build_trace_page() -> (
     )
 }
 
-fn build_telemetry_card() -> (
+fn build_telemetry_card(
+    cb: &ActionCallback,
+) -> (
     gtk::Box,
     gtk::Label,
+    gtk::Button,
     gtk::ProgressBar,
     gtk::Label,
     gtk::Grid,
@@ -717,8 +735,19 @@ fn build_telemetry_card() -> (
         .xalign(1.0)
         .css_classes(["caption", "dim-label"])
         .build();
+    let compress_btn = gtk::Button::builder()
+        .label("⚡ Compress")
+        .sensitive(false)
+        .tooltip_text("Compact older turns on the server to free context (/compress)")
+        .css_classes(["flat", "side-action-btn", "compress-btn"])
+        .build();
+    let cb_compress = cb.clone();
+    compress_btn.connect_clicked(move |_| {
+        emit_action(&cb_compress, InspectorAction::CompressContext);
+    });
     top.append(&title);
     top.append(&summary);
+    top.append(&compress_btn);
 
     let bar = gtk::ProgressBar::builder()
         .css_classes(["context-meter"])
@@ -739,7 +768,7 @@ fn build_telemetry_card() -> (
     card.append(&bar);
     card.append(&workspace_line);
     card.append(&grid);
-    (card, summary, bar, workspace_line, grid)
+    (card, summary, compress_btn, bar, workspace_line, grid)
 }
 
 fn build_reasoning_card() -> (gtk::Box, gtk::Label, gtk::Button) {
@@ -1147,26 +1176,32 @@ mod tests {
 
     #[test]
     fn gtk_inspector_panel_renders_empty_and_populated_states() {
-        if gtk::init().is_err() {
-            return;
-        }
-        let _ = adw::init();
-        let panel = InspectorPanel::default();
-        let actions = Rc::new(RefCell::new(Vec::new()));
-        let captured = actions.clone();
-        panel.connect(move |action| captured.borrow_mut().push(action));
+        crate::with_gtk_test_thread(|| {
+            let panel = InspectorPanel::default();
+            let actions = Rc::new(RefCell::new(Vec::new()));
+            let captured = actions.clone();
+            panel.connect(move |action| captured.borrow_mut().push(action));
 
-        panel.sync(false, InspectorTab::SideAsk, None, None, false);
-        assert!(!panel.root.is_visible());
+            panel.sync(false, InspectorTab::SideAsk, None, None, false);
+            assert!(!panel.root.is_visible());
 
-        panel.sync(true, InspectorTab::SideAsk, Some("s1"), None, false);
-        assert!(panel.root.is_visible());
+            panel.sync(true, InspectorTab::SideAsk, Some("s1"), None, false);
+            assert!(panel.root.is_visible());
 
-        let conv = populated_conversation();
-        panel.sync(true, InspectorTab::Trace, Some("s1"), Some(&conv), true);
-        panel.sync(true, InspectorTab::Outline, Some("s1"), Some(&conv), true);
-        assert_eq!(panel.ask_tab.label().as_deref(), Some("Side-Ask · 3"));
-        assert_eq!(panel.trace_tab.label().as_deref(), Some("Trace · 2"));
-        assert_eq!(panel.outline_tab.label().as_deref(), Some("Map · 1"));
+            let conv = populated_conversation();
+            assert!(can_compress_conversation(Some(&conv), true));
+            assert!(!can_compress_conversation(Some(&conv), false));
+            panel.sync(true, InspectorTab::Trace, Some("s1"), Some(&conv), true);
+            assert!(panel.compress_btn.is_sensitive());
+            panel.compress_btn.emit_clicked();
+            assert_eq!(
+                actions.borrow().last(),
+                Some(&InspectorAction::CompressContext)
+            );
+            panel.sync(true, InspectorTab::Outline, Some("s1"), Some(&conv), true);
+            assert_eq!(panel.ask_tab.label().as_deref(), Some("Side-Ask · 3"));
+            assert_eq!(panel.trace_tab.label().as_deref(), Some("Trace · 2"));
+            assert_eq!(panel.outline_tab.label().as_deref(), Some("Map · 1"));
+        });
     }
 }
