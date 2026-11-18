@@ -2772,7 +2772,7 @@ impl AppState {
         let available = MAX_STAGED_IMAGES.saturating_sub(target.len());
         if available == 0 {
             return Err(format!(
-                "Up to {MAX_STAGED_IMAGES} images can be attached to one message."
+                "Up to {MAX_STAGED_IMAGES} files can be attached to one message."
             ));
         }
         let added = incoming.len().min(available);

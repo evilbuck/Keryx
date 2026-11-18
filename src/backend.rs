@@ -999,7 +999,14 @@ impl Link {
             runtime_id.clone(),
             Turn::submitting(format!("turn-{runtime_id}-{generation}"), generation),
         );
-        let wire_text = studio::effective_wire_prompt(&text, !attachments.is_empty());
+        let mut wire_text = studio::effective_wire_prompt(&text, !attachments.is_empty());
+        for file in attachments.iter().filter(|file| !file.is_image()) {
+            wire_text.push_str(&format!(
+                "\n\n--- Attached file: {} ---\n{}\n--- End attached file ---",
+                file.filename,
+                String::from_utf8_lossy(&file.bytes)
+            ));
+        }
         if attachments.is_empty() {
             self.send_submit_rpc(runtime_id, generation, wire_text)
                 .await;
@@ -1029,7 +1036,7 @@ impl Link {
         attachments: &[StagedImage],
     ) -> Result<VecDeque<String>, String> {
         let mut paths = VecDeque::with_capacity(attachments.len());
-        for image in attachments {
+        for image in attachments.iter().filter(|image| image.is_image()) {
             let uploaded = upload_chat_image_http(&self.http, &self.origin, image).await?;
             paths.push_back(uploaded);
         }

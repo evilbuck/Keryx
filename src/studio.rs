@@ -506,6 +506,37 @@ impl StagedImage {
         })
     }
 
+    pub fn from_file_bytes(id: u64, name: &str, bytes: Vec<u8>) -> Result<Self, String> {
+        if infer_image_mime(&bytes).is_some() {
+            return Self::from_bytes(id, name, bytes);
+        }
+        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+            return Err(format!("{name}: file is empty or exceeds 15 MB."));
+        }
+        let text = if bytes.starts_with(b"%PDF-") {
+            pdf_extract::extract_text_from_mem(&bytes)
+                .map_err(|_| format!("{name}: could not extract PDF text."))?
+        } else {
+            String::from_utf8(bytes).map_err(|_| format!("{name}: unsupported binary file."))?
+        };
+        if text.trim().is_empty() || text.contains('\0') {
+            return Err(format!("{name}: no readable text found."));
+        }
+        if text.len() > 1_000_000 {
+            return Err(format!("{name}: extracted text exceeds 1 MB."));
+        }
+        Ok(Self {
+            id,
+            filename: sanitize_image_filename(name, id, "txt"),
+            mime_type: "text/plain".into(),
+            bytes: text.into_bytes(),
+        })
+    }
+
+    pub fn is_image(&self) -> bool {
+        self.mime_type.starts_with("image/")
+    }
+
     pub fn data_url(&self) -> String {
         let encoded = glib::base64_encode(&self.bytes);
         format!("data:{};base64,{encoded}", self.mime_type)
@@ -568,7 +599,14 @@ pub fn format_optimistic_prompt(text: &str, attachments: &[StagedImage]) -> Stri
     }
     let chips: Vec<String> = attachments
         .iter()
-        .map(|img| format!("🖼 {} ({})", img.filename, img.size_label()))
+        .map(|img| {
+            format!(
+                "{} {} ({})",
+                if img.is_image() { "🖼" } else { "📄" },
+                img.filename,
+                img.size_label()
+            )
+        })
         .collect();
     let header = chips.join(" · ");
     if clean.is_empty() {
@@ -581,7 +619,7 @@ pub fn format_optimistic_prompt(text: &str, attachments: &[StagedImage]) -> Stri
 pub fn effective_wire_prompt(text: &str, has_attachments: bool) -> String {
     let clean = text.trim();
     if clean.is_empty() && has_attachments {
-        "Please inspect the attached image.".into()
+        "Please inspect the attached files.".into()
     } else {
         clean.to_string()
     }
@@ -592,7 +630,11 @@ pub fn derive_multimodal_launch_title(prompt: &str, attachments: &[StagedImage])
         return crate::model::derive_launch_title(prompt);
     }
     if let Some(first) = attachments.first() {
-        return crate::model::derive_launch_title(&format!("Image: {}", first.filename));
+        return crate::model::derive_launch_title(&format!(
+            "{}: {}",
+            if first.is_image() { "Image" } else { "File" },
+            first.filename
+        ));
     }
     "New conversation".into()
 }
@@ -1300,7 +1342,7 @@ impl AttachmentStrip {
 
         let btn_inner = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         btn_inner.append(&gtk::Image::from_icon_name("insert-image-symbolic"));
-        let btn_label = gtk::Label::new(Some("Image"));
+        let btn_label = gtk::Label::new(Some("Attach"));
         btn_label.add_css_class("palette-trigger-label");
         btn_inner.append(&btn_label);
         let attach_btn = gtk::Button::new();
@@ -1308,9 +1350,9 @@ impl AttachmentStrip {
         attach_btn.add_css_class("flat");
         attach_btn.add_css_class("attach-trigger");
         attach_btn.set_tooltip_text(Some(
-            "Attach image · Ctrl+U, paste screenshot (Ctrl+V), or drag & drop",
+            "Attach files · Ctrl+U, paste screenshot (Ctrl+V), or drag & drop",
         ));
-        attach_btn.update_property(&[gtk::accessible::Property::Label("Attach image")]);
+        attach_btn.update_property(&[gtk::accessible::Property::Label("Attach files")]);
 
         Rc::new(Self {
             root,
@@ -1379,7 +1421,7 @@ fn build_attachment_pill(
     remove.add_css_class("flat");
     remove.add_css_class("circular");
     remove.add_css_class("attachment-remove");
-    remove.set_tooltip_text(Some("Remove attached image"));
+    remove.set_tooltip_text(Some("Remove attachment"));
     remove.set_sensitive(editable);
     let id = img.id;
     let cb = Rc::clone(on_remove);
@@ -1400,15 +1442,19 @@ pub fn read_local_image_files(
     let mut first_err = None;
     for file in files {
         let Some(path) = file.path() else {
-            first_err.get_or_insert_with(|| "Only local image files can be attached.".into());
+            first_err.get_or_insert_with(|| "Only local files can be attached.".into());
             continue;
         };
         let filename = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("image.png");
+        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_IMAGE_BYTES as u64) {
+            first_err.get_or_insert_with(|| format!("{filename}: file exceeds 15 MB."));
+            continue;
+        }
         match std::fs::read(&path) {
-            Ok(bytes) => match StagedImage::from_bytes(next_id(), filename, bytes) {
+            Ok(bytes) => match StagedImage::from_file_bytes(next_id(), filename, bytes) {
                 Ok(image) => staged.push(image),
                 Err(err) => {
                     first_err.get_or_insert(err);
@@ -1444,18 +1490,7 @@ pub fn spawn_image_file_dialog(
     window: &adw::ApplicationWindow,
     on_files: impl FnOnce(Vec<gio::File>) + 'static,
 ) {
-    let filter = gtk::FileFilter::new();
-    filter.set_name(Some("Images (PNG, JPEG, WebP, GIF)"));
-    for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
-        filter.add_mime_type(mime);
-    }
-    let filters = gio::ListStore::new::<gtk::FileFilter>();
-    filters.append(&filter);
-    let dialog = gtk::FileDialog::builder()
-        .title("Attach image")
-        .filters(&filters)
-        .default_filter(&filter)
-        .build();
+    let dialog = gtk::FileDialog::builder().title("Attach files").build();
     let win = window.clone();
     glib::MainContext::default().spawn_local(async move {
         let Ok(model) = dialog.open_multiple_future(Some(&win)).await else {
@@ -1625,6 +1660,17 @@ mod tests {
     }
 
     #[test]
+    fn stages_text_and_rejects_unreadable_documents() {
+        let file =
+            StagedImage::from_file_bytes(1, "notes.txt", b"Important context".to_vec()).unwrap();
+        assert!(!file.is_image());
+        assert_eq!(file.bytes, b"Important context");
+        assert!(StagedImage::from_file_bytes(2, "binary.bin", vec![0xff, 0xfe]).is_err());
+        assert!(StagedImage::from_file_bytes(3, "bad.pdf", b"%PDF-invalid".to_vec()).is_err());
+        assert!(StagedImage::from_file_bytes(4, "empty.txt", b"   ".to_vec()).is_err());
+    }
+
+    #[test]
     fn formats_multimodal_prompts_and_byte_sizes() {
         let img = StagedImage::from_bytes(1, "shot.png", TINY_PNG.to_vec()).unwrap();
         assert_eq!(format_byte_size(512), "512 B");
@@ -1636,7 +1682,7 @@ mod tests {
         );
         assert_eq!(
             effective_wire_prompt("   ", true),
-            "Please inspect the attached image."
+            "Please inspect the attached files."
         );
         assert_eq!(effective_wire_prompt("Hello", true), "Hello");
         assert_eq!(
@@ -1692,7 +1738,7 @@ mod tests {
         let bad = dir.join("bad.png");
         let missing = dir.join("missing.png");
         std::fs::write(&good, VALID_1X1_PNG).expect("write good png");
-        std::fs::write(&bad, b"plain text").expect("write bad file");
+        std::fs::write(&bad, [0xff, 0xfe]).expect("write bad file");
 
         let mut seq = 10u64;
         let files = vec![

@@ -61,6 +61,7 @@ struct Ui {
     model_selection: gtk::SingleSelection,
     model_status: gtk::Label,
     model_pending: RefCell<Option<PendingModel>>,
+    launch_model: RefCell<Option<ModelIdentity>>,
     send: gtk::Button,
     stop: gtk::Button,
     new_chat: gtk::Button,
@@ -389,6 +390,10 @@ fn can_send_timeline_intent(c: &Conversation, intent: &ComposerIntent) -> bool {
     }
 }
 
+fn can_pick_launch_model(state: &AppState, connected: bool) -> bool {
+    connected && state.selected.is_none() && !state.creating
+}
+
 fn can_send_on_launch(state: &AppState) -> bool {
     if state.creating || state.pending_launch.is_some() {
         return false;
@@ -416,7 +421,7 @@ fn composer_hint_text(state: &AppState) -> &'static str {
     let Some(id) = &state.selected else {
         let cmd = state.launch_draft.split_whitespace().next().unwrap_or("");
         return composer_studio_slash_hint(cmd).unwrap_or(
-            "Enter to start a new chat · / skills · Ctrl+U image · Ctrl+Shift+W workspace",
+            "Enter to start a new chat · / skills · Ctrl+U attach files · Ctrl+Shift+W workspace",
         );
     };
     let Some(c) = state.conversations.get(id) else {
@@ -435,7 +440,7 @@ fn composer_conversation_hint(c: &Conversation) -> &'static str {
     if c.status.steerable() {
         "Enter to steer active turn · Alt+Enter or /btw side-ask · Ctrl+I Flight Deck"
     } else {
-        "Enter to send · / skills & commands · Ctrl+U image · Ctrl+K omnisearch"
+        "Enter to send · / skills & commands · Ctrl+U attach files · Ctrl+K omnisearch"
     }
 }
 
@@ -924,8 +929,8 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         bind_model_row(current_for_factory.as_ref(), object);
     });
     let model_list = gtk::ListView::new(Some(model_selection.clone()), Some(model_factory));
-    // Hover must never choose a model; only an explicit activation commits.
-    model_list.set_single_click_activate(false);
+    // Hover may highlight a row; only activation commits the model.
+    model_list.set_single_click_activate(true);
     model_list.add_css_class("model-list");
     let model_scroll = gtk::ScrolledWindow::builder()
         .min_content_height(200)
@@ -1039,6 +1044,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         model_selection,
         model_status,
         model_pending: RefCell::new(None),
+        launch_model: RefCell::new(None),
         send,
         stop,
         new_chat,
@@ -1175,8 +1181,11 @@ fn connect_model_picker(ui: &Rc<Ui>) {
         weak.upgrade().inspect(|ui| select_first_model(ui));
     });
     let weak = Rc::downgrade(ui);
-    ui.model_list.connect_activate(move |_, _| {
-        weak.upgrade().inspect(|ui| ui.commit_model_selection());
+    ui.model_list.connect_activate(move |_, position| {
+        weak.upgrade().inspect(|ui| {
+            ui.model_selection.set_selected(position);
+            ui.commit_model_selection();
+        });
     });
     let weak = Rc::downgrade(ui);
     ui.model_popover.connect_show(move |_| {
@@ -2040,6 +2049,9 @@ impl Ui {
             return;
         }
         if self.try_submit_curation_or_find() {
+            return;
+        }
+        if !self.send.is_sensitive() {
             return;
         }
         let Some((id, runtime_id, draft)) = self.extract_submit_target() else {
@@ -2908,7 +2920,16 @@ impl Ui {
         }
         self.model_popover.popdown();
         self.editor.grab_focus();
-        self.choose_model(identity, false);
+        let on_launch = self.state.borrow().selected.is_none();
+        if on_launch {
+            *self.launch_model.borrow_mut() = Some(identity);
+            self.create();
+            if !self.state.borrow().creating {
+                self.launch_model.borrow_mut().take();
+            }
+        } else {
+            self.choose_model(identity, false);
+        }
     }
 
     /// Ask the backend to switch the open conversation. `confirm` is only ever true after
@@ -3094,6 +3115,13 @@ impl Ui {
         self.refresh_sessions();
         if self.select_created.replace(false) {
             self.select(&id, true);
+        }
+        let launch_model = self.launch_model.borrow_mut().take();
+        let created_is_selected = self.state.borrow().selected.as_deref() == Some(id.as_str());
+        if let Some(target) = launch_model
+            && created_is_selected
+        {
+            self.choose_model(target, false);
         }
         if let Some((prompt, attachments)) = launch_bundle {
             self.send_initial_prompt(&id, runtime_id, prompt, attachments);
@@ -3353,14 +3381,37 @@ impl Ui {
         }
     }
 
-    fn stage_local_files(&self, files: &[gio::File]) {
+    fn stage_local_files(self: &Rc<Self>, files: &[gio::File]) {
         if !self.can_stage_images_now() {
             return;
         }
-        let (staged, first_err) = studio::read_local_image_files(files, || {
-            self.state.borrow_mut().allocate_attachment_id()
+        let uris: Vec<_> = files.iter().map(|file| file.uri().to_string()).collect();
+        let ids: Vec<_> = files
+            .iter()
+            .map(|_| self.state.borrow_mut().allocate_attachment_id())
+            .collect();
+        let selected = self.state.borrow().selected.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = gio::spawn_blocking(move || {
+                let files: Vec<_> = uris.iter().map(|uri| gio::File::for_uri(uri)).collect();
+                let mut ids = ids.into_iter();
+                studio::read_local_image_files(&files, || ids.next().unwrap_or_default())
+            })
+            .await;
+            if let Some(ui) = weak.upgrade() {
+                if ui.state.borrow().selected != selected {
+                    ui.state.borrow_mut().notice =
+                        "Conversation changed while reading files; attach them again.".into();
+                    ui.refresh();
+                } else if let Ok((staged, err)) = result {
+                    ui.commit_staged_images(staged, err);
+                } else {
+                    ui.state.borrow_mut().notice = "Could not read selected files.".into();
+                    ui.refresh();
+                }
+            }
         });
-        self.commit_staged_images(staged, first_err);
     }
 
     fn commit_staged_images(&self, staged: Vec<StagedImage>, read_err: Option<String>) {
@@ -3734,6 +3785,7 @@ impl Ui {
     ) {
         state.notice = format!("{operation}: {message}");
         if operation == "create" {
+            self.launch_model.borrow_mut().take();
             state.cancel_pending_launch();
         }
         state.creating = false;
@@ -4030,6 +4082,14 @@ impl Ui {
         *self.model_current.borrow_mut() = model.confirmed().or_else(|| model.target()).cloned();
     }
 
+    fn send_available(&self, state: &AppState, reload_pending: bool) -> bool {
+        let pending = self.model_pending.borrow();
+        !pending
+            .as_ref()
+            .is_some_and(|request| state.selected.as_deref() == Some(request.stored_id.as_str()))
+            && composer_send_sensitive(state, reload_pending)
+    }
+
     fn refresh_controls(&self) {
         let state = self.state.borrow();
         let connected = state.connection.as_ref() == Some(&ConnectionState::Connected);
@@ -4045,7 +4105,7 @@ impl Ui {
             .is_some_and(|id| self.pending_resumes.borrow().contains(id));
         self.editor.set_editable(editor_editable(&state));
         self.send
-            .set_sensitive(composer_send_sensitive(&state, reload_pending));
+            .set_sensitive(self.send_available(&state, reload_pending));
         self.composer_hint.set_text(composer_hint_text(&state));
         self.delete_chat
             .set_visible(connected && state.selected.is_some());
@@ -4065,7 +4125,11 @@ impl Ui {
         );
         self.sync_branch_controls(&state, conversation, connected);
         self.sync_curation_controls(&state, conversation, connected);
-        self.refresh_model_trigger(conversation, &state.catalog, writable);
+        self.refresh_model_trigger(
+            conversation,
+            &state.catalog,
+            writable || can_pick_launch_model(&state, connected),
+        );
         self.refresh_connection_badge(&state);
         self.sync_inspector_chrome(&state, conversation, writable);
         self.sync_studio(&state, conversation, connected, writable);
