@@ -553,6 +553,9 @@ async fn run(
                     Some(LoopWork::Readonly(outcome)) => {
                         link.apply_readonly(*outcome).await;
                     }
+                    Some(LoopWork::Resumed(page)) => {
+                        link.apply_resumed(*page).await;
+                    }
                     None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
@@ -663,6 +666,7 @@ enum LoopWork {
     },
     Branch(Box<BranchSeedsOutcome>),
     Readonly(Box<ReadonlyOutcome>),
+    Resumed(Box<ResumedPage>),
 }
 
 /// A branch request whose earlier pages are fetched off the transport loop.
@@ -694,6 +698,17 @@ struct ReadonlyOutcome {
     stored_id: String,
     reason: String,
     result: Result<ReadonlyHistory, String>,
+}
+
+/// The saved page for a successful resume, fetched off the transport loop;
+/// the continuation (Resumed event, live info, turn adoption, open-request
+/// replay) applies on the loop with the original reply carried alongside.
+struct ResumedPage {
+    stored_id: String,
+    runtime_id: Option<String>,
+    before: usize,
+    messages: Result<Vec<ChatMessage>, String>,
+    result: Value,
 }
 
 fn mid_connect(command: Option<Command>) -> MidConnect {
@@ -4149,7 +4164,6 @@ impl Link {
             self.runtime_of
                 .insert(stored_id.clone(), runtime_id.clone());
         }
-        let running = is_resumed_running(result);
         let Some(count) = result
             .get("message_count")
             .and_then(Value::as_u64)
@@ -4165,27 +4179,56 @@ impl Link {
         };
         self.message_counts.insert(stored_id.clone(), count);
         let before = count.saturating_sub(PAGE);
-        let messages =
-            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
-            {
-                Ok(messages) => messages,
-                Err(message) => {
-                    self.fail("resume", Some(stored_id), message).await;
-                    return;
-                }
-            };
+        // The saved page loads off the transport loop — a slow history
+        // endpoint must not stall frames on the most common open path. The
+        // reply travels with the fetch so the continuation replays exactly:
+        // Resumed, live info, turn adoption, open requests.
+        tokio::spawn(resumed_history_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work.clone(),
+            ResumedPage {
+                stored_id,
+                runtime_id,
+                before,
+                // The task overwrites this with the fetched rows.
+                messages: Ok(Vec::new()),
+                result: result.clone(),
+            },
+            count - before,
+        ));
+    }
+
+    /// Applies a finished resume page on the loop: the same continuation the
+    /// inline path ran after the fetch.
+    async fn apply_resumed(&mut self, page: ResumedPage) {
+        let ResumedPage {
+            stored_id,
+            runtime_id,
+            before,
+            messages,
+            result,
+        } = page;
+        let messages = match messages {
+            Ok(messages) => messages,
+            Err(message) => {
+                self.fail("resume", Some(stored_id), message).await;
+                return;
+            }
+        };
+        let running = is_resumed_running(&result);
         self.emit(Event::Resumed {
             stored_id,
             runtime_id: runtime_id.clone(),
             messages,
             before,
             read_only_reason: None,
-            model: model_identity(result),
+            model: model_identity(&result),
         })
         .await;
         if let Some(rt) = &runtime_id {
-            self.emit_live_info(rt, result).await;
-            self.request_session_info_if_needed(rt, result).await;
+            self.emit_live_info(rt, &result).await;
+            self.request_session_info_if_needed(rt, &result).await;
         }
         if running && let Some(runtime_id) = runtime_id.clone() {
             self.next_turn_generation += 1;
@@ -4802,6 +4845,20 @@ async fn readonly_history(
         messages,
         warmed,
     })
+}
+
+/// The saved page for a successful resume, off the transport loop: the
+/// continuation replays on the loop with the original reply in hand.
+async fn resumed_history_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    mut page: ResumedPage,
+    limit: usize,
+) {
+    let messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
+    page.messages = messages;
+    let _ = work.send(LoopWork::Resumed(Box::new(page)));
 }
 
 /// The session patch as its own task: the fenced patch (and its one
@@ -6978,6 +7035,101 @@ mod tests {
                     && read_only_reason.as_deref() == Some("The gateway refused it.")
             ));
             assert_eq!(link.message_counts.get("st-1"), Some(&2));
+        });
+    }
+
+    #[test]
+    fn resume_pages_load_off_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // With the saved page hung against a stalling gateway, the
+            // resume handler must record the runtime mapping and count, and
+            // frames must keep processing while the page loads.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                link.on_resumed(
+                    "st-1".into(),
+                    &json!({"session_id": "rt", "message_count": 40}),
+                )
+                .await;
+                assert_eq!(link.runtime_of.get("st-1").map(String::as_str), Some("rt"));
+                assert_eq!(link.message_counts.get("st-1"), Some(&40));
+                link.events
+                    .try_send(Event::Connection(ConnectionState::Connecting))
+                    .expect("fill");
+                link.emit_delta("rt", "m1", "hello").await;
+                assert!(incoming.try_recv().is_ok());
+                link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                    Vec::new().into(),
+                ))))
+                .await;
+                let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                    panic!("frames must process while the resume page hangs");
+                };
+                assert_eq!(delta, "hello");
+            })
+            .await
+            .expect("transport loop must stay responsive");
+
+            // Against a live origin the page re-enters via the work channel
+            // and the continuation replays: the Resumed event with the
+            // runtime mapping and saved rows.
+            let origin = spawn_sessions_http(r#"{"total":0,"sessions":[]}"#).await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+            link.on_resumed(
+                "st-1".into(),
+                &json!({"session_id": "rt", "message_count": 2}),
+            )
+            .await;
+            let resumed =
+                tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                    .await
+                    .expect("resume work within 5s")
+                    .expect("sender alive");
+            let LoopWork::Resumed(page) = resumed else {
+                panic!("expected resume work");
+            };
+            link.apply_resumed(*page).await;
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("resumed event within 5s")
+                .expect("sender alive");
+            assert!(matches!(
+                &event,
+                Event::Resumed {
+                    stored_id,
+                    runtime_id,
+                    messages,
+                    read_only_reason,
+                    ..
+                } if stored_id == "st-1"
+                    && runtime_id.as_deref() == Some("rt")
+                    && messages.len() == 2
+                    && read_only_reason.is_none()
+            ));
         });
     }
 
