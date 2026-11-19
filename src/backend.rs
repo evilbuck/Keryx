@@ -460,7 +460,10 @@ struct Link {
     queued: VecDeque<Command>,
     /// Streaming tails parked when the bounded event channel is full, keyed by
     /// runtime. The transport loop must not stall on UI consumption speed.
+    /// Text tails carry their message id; reasoning tails carry the replace
+    /// flag their flush must replay.
     pending_deltas: HashMap<String, (String, String)>,
+    pending_reasoning: HashMap<String, (bool, String)>,
     heartbeat: bool,
     ready: bool,
     opened_at: Option<Instant>,
@@ -696,6 +699,7 @@ impl Link {
             opened_at: None,
             last_inbound: Instant::now(),
             pending_deltas: HashMap::new(),
+            pending_reasoning: HashMap::new(),
             retryable: false,
         })
     }
@@ -2184,7 +2188,7 @@ impl Link {
         // had a whole inter-frame gap to drain, so resume latency is one
         // frame instead of the 5s maintenance tick. The tick stays as the
         // fallback when no frames flow (server-side compress).
-        self.flush_pending_deltas();
+        self.flush_pending_streams();
         match frame {
             Message::Text(text) => self.on_text(text.as_str()).await,
             Message::Ping(payload) => {
@@ -2294,11 +2298,10 @@ impl Link {
         match event_type {
             "thinking.delta" | "reasoning.delta" => {
                 self.activity(runtime_id, "Hermes is thinking…").await;
-                self.emit_reasoning_payload(runtime_id, payload, false)
-                    .await;
+                self.emit_reasoning_payload(runtime_id, payload, false);
             }
             "reasoning.available" => {
-                self.emit_reasoning_payload(runtime_id, payload, true).await;
+                self.emit_reasoning_payload(runtime_id, payload, true);
             }
             "btw.complete" => self.on_btw_complete(runtime_id, payload).await,
             "session.usage" => {
@@ -2318,19 +2321,33 @@ impl Link {
         }
     }
 
-    async fn emit_reasoning_payload(&self, runtime_id: &str, payload: &Value, replace: bool) {
+    /// Reasoning streams are per-token like text deltas, so they park with
+    /// the same shape the UI applies live: a replace resets the tail, a
+    /// delta appends. Flushed on the next inbound frame or maintenance tick.
+    fn emit_reasoning_payload(&mut self, runtime_id: &str, payload: &Value, replace: bool) {
         let Some(raw) = payload.get("text").and_then(Value::as_str) else {
             return;
         };
         if raw.is_empty() {
             return;
         }
-        self.emit(Event::Reasoning {
+        let sent = self.events.try_send(Event::Reasoning {
             runtime_id: runtime_id.to_string(),
             text: redact_secrets(raw, &self.secrets),
             replace,
-        })
-        .await;
+        });
+        if let Err(TrySendError::Full(Event::Reasoning { text, replace, .. })) = sent {
+            let entry = self
+                .pending_reasoning
+                .entry(runtime_id.to_string())
+                .or_insert((false, String::new()));
+            if replace {
+                *entry = (true, text);
+            } else {
+                entry.1.push_str(&text);
+            }
+            trim_to_cap(&mut entry.1, DELTA_TAIL_CAP);
+        }
     }
 
     async fn on_btw_complete(&self, runtime_id: &str, payload: &Value) {
@@ -2589,6 +2606,25 @@ impl Link {
         }
     }
 
+    /// Hand a parked reasoning tail to the UI if it has room now, replaying
+    /// the replace flag the live stream would have carried.
+    fn try_flush_reasoning(&mut self, runtime_id: &str) -> bool {
+        let Some((replace, tail)) = self.pending_reasoning.get(runtime_id) else {
+            return false;
+        };
+        let event = Event::Reasoning {
+            runtime_id: runtime_id.to_string(),
+            text: tail.clone(),
+            replace: *replace,
+        };
+        if self.events.try_send(event).is_ok() {
+            self.pending_reasoning.remove(runtime_id);
+            true
+        } else {
+            false
+        }
+    }
+
     async fn on_complete(&mut self, runtime_id: &str, payload: &Value) {
         if self
             .turns
@@ -2692,6 +2728,9 @@ impl Link {
             if rolls {
                 self.next_turn_generation += 1;
                 let generation = self.next_turn_generation;
+                // A stale reasoning tail belongs to the finished turn; the
+                // new turn's trace starts clean.
+                self.pending_reasoning.remove(runtime_id);
                 self.turns.insert(
                     runtime_id.to_string(),
                     Turn::streaming(message_id.to_string(), generation),
@@ -4131,7 +4170,7 @@ impl Link {
     async fn maintain(&mut self) {
         // Parked streaming tails get a retry on every tick; a slow UI must not
         // stall the transport loop (see emit_delta).
-        self.flush_pending_deltas();
+        self.flush_pending_streams();
         let now = Instant::now();
         self.fail_expired_jobs(now).await;
         if self.write.is_some()
@@ -4187,10 +4226,19 @@ impl Link {
         }
     }
 
-    /// Retries every parked streaming tail once per maintenance tick.
-    fn flush_pending_deltas(&mut self) {
+    /// Retries every parked streaming tail (text deltas and reasoning) once
+    /// per maintenance tick.
+    fn flush_pending_streams(&mut self) {
         for runtime_id in self.pending_deltas.keys().cloned().collect::<Vec<_>>() {
             self.try_flush_delta(&runtime_id);
+        }
+        for runtime_id in self
+            .pending_reasoning
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.try_flush_reasoning(&runtime_id);
         }
     }
 
@@ -4243,6 +4291,7 @@ impl Link {
         self.asks.clear();
         self.activity.clear();
         self.pending_deltas.clear();
+        self.pending_reasoning.clear();
         self.runtime_of.clear();
     }
 }
@@ -5875,6 +5924,79 @@ mod tests {
             };
             assert_eq!(delta, "hello");
             assert!(link.pending_deltas.is_empty());
+        });
+    }
+
+    #[test]
+    fn slow_ui_parks_reasoning_instead_of_stalling_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+
+            // Occupy the only slot: reasoning deltas park and concatenate
+            // instead of stalling the loop on a blocking send.
+            link.events
+                .try_send(Event::Connection(ConnectionState::Connecting))
+                .expect("fill");
+            link.emit_reasoning_payload("rt", &json!({"text": "think"}), false);
+            link.emit_reasoning_payload("rt", &json!({"text": " more"}), false);
+            assert_eq!(
+                link.pending_reasoning.get("rt"),
+                Some(&(false, "think more".to_string()))
+            );
+
+            // An available summary replaces the parked tail wholesale.
+            link.emit_reasoning_payload("rt", &json!({"text": "Summary."}), true);
+            assert_eq!(
+                link.pending_reasoning.get("rt"),
+                Some(&(true, "Summary.".to_string()))
+            );
+
+            // With room again the next inbound frame hands the tail over,
+            // replaying the replace flag.
+            assert!(incoming.try_recv().is_ok());
+            link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                Vec::new().into(),
+            ))))
+            .await;
+            let Ok(Event::Reasoning { text, replace, .. }) = incoming.try_recv() else {
+                panic!("parked reasoning must hand over on flush");
+            };
+            assert_eq!((text.as_str(), replace), ("Summary.", true));
+            assert!(link.pending_reasoning.is_empty());
+
+            // A turn roll drops the stale tail: the new turn's trace starts
+            // clean instead of inheriting finished-turn reasoning.
+            link.events
+                .try_send(Event::Connection(ConnectionState::Connecting))
+                .expect("refill");
+            link.emit_reasoning_payload("rt", &json!({"text": "old turn"}), false);
+            assert!(link.pending_reasoning.contains_key("rt"));
+            link.turns.insert("rt".into(), Turn::streaming("m1".into(), 1));
+            if let Some(turn) = link.turns.get_mut("rt") {
+                turn.phase = TurnPhase::Terminal;
+            }
+            let _ = link.ensure_turn("rt", "m2");
+            assert!(!link.pending_reasoning.contains_key("rt"));
+
+            // A socket close drops parked reasoning with the rest of the
+            // live state.
+            link.emit_reasoning_payload("rt", &json!({"text": "tail"}), false);
+            assert!(link.pending_reasoning.contains_key("rt"));
+            link.close_socket().await;
+            assert!(link.pending_reasoning.is_empty());
         });
     }
 
