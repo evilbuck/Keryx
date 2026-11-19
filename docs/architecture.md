@@ -78,6 +78,8 @@ Idle keepalive is protocol-level: after 30s without any inbound frame the client
 
 On `gateway.ready` the queued commands drain first, then the studio workspace and skill catalogs are fetched over HTTP concurrently. Queued user actions never wait on catalog round-trips, and the two catalog requests share one wall-clock window.
 
+Streaming deltas never block the transport loop on UI speed: `MessageDelta` events ride a non-blocking send with a per-runtime in-memory tail (capped at 1 MB), retried on every 5s maintenance tick. A slow UI therefore cannot stall ping/pong answering or command processing, and the bounded event channel still protects memory. `MessageComplete` carries the authoritative text, so a dropped tail degrades only live streaming display.
+
 ## Configuration
 
 `main` loads `./.env` from the process working directory only. There is no parent-directory walk. Variables already set in the process are left as they are. Client configuration consumes only `HERMES_GATEWAY_URL`, `HERMES_USER`, and `HERMES_PASSWORD`. The URL must be an origin: no userinfo, path, query, or fragment. `HERMES_BASIC_AUTH_SECRET` is not consumed as client configuration, sent, or bundled.

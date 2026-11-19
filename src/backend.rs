@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc::error::TrySendError;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
@@ -23,6 +24,10 @@ const COMPRESS_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const PROBE_SILENCE: Duration = Duration::from_secs(30);
+/// Per-runtime cap on delta text buffered while the UI is too slow to keep up.
+/// `MessageComplete` carries the authoritative text, so dropping the front of a
+/// capped tail degrades only live streaming display, never the transcript.
+const DELTA_TAIL_CAP: usize = 1 << 20;
 const EVENT_BOUND: usize = 512;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -442,6 +447,9 @@ struct Link {
     turns: HashMap<String, Turn>,
     activity: HashMap<String, String>,
     queued: VecDeque<Command>,
+    /// Streaming tails parked when the bounded event channel is full, keyed by
+    /// runtime. The transport loop must not stall on UI consumption speed.
+    pending_deltas: HashMap<String, (String, String)>,
     heartbeat: bool,
     ready: bool,
     opened_at: Option<Instant>,
@@ -676,6 +684,7 @@ impl Link {
             ready: false,
             opened_at: None,
             last_inbound: Instant::now(),
+            pending_deltas: HashMap::new(),
             retryable: false,
         })
     }
@@ -2504,12 +2513,61 @@ impl Link {
             })
             .await;
         }
-        self.emit(Event::MessageDelta {
+        self.emit_delta(runtime_id, &message_id, text).await;
+    }
+
+    /// Delta events ride a non-blocking send with an in-memory tail: a slow UI
+    /// must never stall the transport loop, which has to keep answering pings
+    /// and draining commands. A tail is capped; `MessageComplete` carries the
+    /// authoritative text, so trimming is a display-only degradation.
+    async fn emit_delta(&mut self, runtime_id: &str, message_id: &str, delta: &str) {
+        let (id, tail) = self
+            .pending_deltas
+            .entry(runtime_id.to_string())
+            .or_insert_with(|| (message_id.to_string(), String::new()));
+        if id != message_id {
+            // The UI's streaming row moved to a new message. Try to hand over
+            // the old tail first; if the channel is still full, the old tail
+            // is dropped rather than concatenated out of order.
+            let (old_id, old_tail) = (std::mem::take(id), std::mem::take(tail));
+            let _ = self.events.try_send(Event::MessageDelta {
+                runtime_id: runtime_id.to_string(),
+                message_id: old_id,
+                delta: old_tail,
+            });
+            *id = message_id.to_string();
+        }
+        tail.push_str(delta);
+        trim_to_cap(tail, DELTA_TAIL_CAP);
+        let sent = self.events.try_send(Event::MessageDelta {
             runtime_id: runtime_id.to_string(),
-            message_id,
-            delta: text.to_owned(),
-        })
-        .await;
+            message_id: message_id.to_string(),
+            delta: std::mem::take(tail),
+        });
+        if sent.is_ok() {
+            self.pending_deltas.remove(runtime_id);
+        } else if let Err(TrySendError::Full(Event::MessageDelta { delta, .. })) = sent {
+            // Park the tail for the next delta or the next maintenance tick.
+            *tail = delta;
+        }
+    }
+
+    /// Hand a parked streaming tail to the UI if it has room now.
+    fn try_flush_delta(&mut self, runtime_id: &str) -> bool {
+        let Some((message_id, tail)) = self.pending_deltas.get(runtime_id) else {
+            return false;
+        };
+        let event = Event::MessageDelta {
+            runtime_id: runtime_id.to_string(),
+            message_id: message_id.clone(),
+            delta: tail.clone(),
+        };
+        if self.events.try_send(event).is_ok() {
+            self.pending_deltas.remove(runtime_id);
+            true
+        } else {
+            false
+        }
     }
 
     async fn on_complete(&mut self, runtime_id: &str, payload: &Value) {
@@ -2529,6 +2587,8 @@ impl Link {
         }
         self.retire_turn_jobs(runtime_id);
         self.activity.remove(runtime_id);
+        // The authoritative completion supersedes any parked streaming tail.
+        self.pending_deltas.remove(runtime_id);
         self.emit(Event::MessageComplete {
             runtime_id: runtime_id.to_string(),
             message: ChatMessage {
@@ -4050,6 +4110,9 @@ impl Link {
     }
 
     async fn maintain(&mut self) {
+        // Parked streaming tails get a retry on every tick; a slow UI must not
+        // stall the transport loop (see emit_delta).
+        self.flush_pending_deltas();
         let now = Instant::now();
         let expired: Vec<u64> = self
             .jobs
@@ -4091,6 +4154,13 @@ impl Link {
             let _ = self
                 .send_rpc("gateway.ping", json!({}), JobKind::Ping, RPC_TIMEOUT)
                 .await;
+        }
+    }
+
+    /// Retries every parked streaming tail once per maintenance tick.
+    fn flush_pending_deltas(&mut self) {
+        for runtime_id in self.pending_deltas.keys().cloned().collect::<Vec<_>>() {
+            self.try_flush_delta(&runtime_id);
         }
     }
 
@@ -4142,6 +4212,7 @@ impl Link {
         self.turns.clear();
         self.asks.clear();
         self.activity.clear();
+        self.pending_deltas.clear();
         self.runtime_of.clear();
     }
 }
@@ -4152,6 +4223,20 @@ impl Link {
 /// before `maintain` treats the link as dead.
 fn probe_due(last_inbound: Instant, now: Instant) -> bool {
     now.duration_since(last_inbound) > PROBE_SILENCE
+}
+
+/// Keeps a parked delta tail under `cap` bytes, dropping the front. Trims on a
+/// UTF-8 character boundary so the UI never receives half a character.
+fn trim_to_cap(text: &mut String, cap: usize) {
+    if text.len() <= cap {
+        return;
+    }
+    let mut cut = text.len() - cap;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let rest = text[cut..].to_string();
+    *text = rest;
 }
 
 fn http_client(origin: &url::Url) -> Result<reqwest::Client, String> {
@@ -5603,6 +5688,81 @@ mod tests {
             assert_eq!(link.turns["rt"].phase, TurnPhase::Terminal);
             assert!(link.jobs.contains_key(&3));
             assert!(incoming.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn slow_ui_parks_deltas_instead_of_stalling_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+
+            // Occupy the only slot: the bounded channel is full, so a delta
+            // must park instead of stalling the loop on a blocking send.
+            link.events
+                .try_send(Event::Connection(ConnectionState::Connecting))
+                .expect("fill");
+            link.emit_delta("rt", "m1", "hello").await;
+            assert_eq!(
+                link.pending_deltas
+                    .get("rt")
+                    .map(|(id, tail)| (id.as_str(), tail.as_str())),
+                Some(("m1", "hello"))
+            );
+
+            // A follow-up delta concatenates into the same parked tail.
+            link.emit_delta("rt", "m1", " world").await;
+            assert_eq!(
+                link.pending_deltas.get("rt").map(|(_, tail)| tail.as_str()),
+                Some("hello world")
+            );
+
+            // A new message rolls the tail; with the channel full the old tail
+            // is dropped rather than concatenated out of order.
+            link.emit_delta("rt", "m2", "fresh").await;
+            assert_eq!(
+                link.pending_deltas
+                    .get("rt")
+                    .map(|(id, tail)| (id.as_str(), tail.as_str())),
+                Some(("m2", "fresh"))
+            );
+
+            // With room again the parked tail hands over and the entry clears.
+            assert!(incoming.try_recv().is_ok());
+            assert!(link.try_flush_delta("rt"));
+            let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                panic!("parked delta must hand over on flush");
+            };
+            assert_eq!(delta, "fresh");
+            assert!(link.pending_deltas.is_empty());
+
+            // A capped tail stays bounded and never splits a UTF-8 character.
+            let big = "é".repeat(DELTA_TAIL_CAP / 2 + 40);
+            link.events
+                .try_send(Event::Connection(ConnectionState::Connecting))
+                .expect("refill");
+            link.emit_delta("rt", "m3", &big).await;
+            let Some((_, tail)) = link.pending_deltas.get("rt") else {
+                panic!("oversized tail must park, not stall");
+            };
+            assert!(tail.len() <= DELTA_TAIL_CAP + 3);
+            assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+
+            // A socket close drops parked tails with the rest of the live state;
+            // the server's saved history is reloaded after reconnecting.
+            link.close_socket().await;
+            assert!(link.pending_deltas.is_empty());
         });
     }
 
