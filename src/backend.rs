@@ -527,8 +527,20 @@ async fn run(
                 continue;
             }
             work = work_rx.recv() => {
-                if let Some(LoopWork::Listed(listed)) = work {
-                    link.apply_listed(listed).await;
+                match work {
+                    Some(LoopWork::Listed(listed)) => {
+                        link.apply_listed(*listed).await;
+                    }
+                    Some(LoopWork::Uploaded {
+                        runtime_id,
+                        generation,
+                        result,
+                        prompt_text,
+                    }) => {
+                        link.apply_uploaded(runtime_id, generation, result, prompt_text)
+                            .await;
+                    }
+                    None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
                 continue;
@@ -620,11 +632,17 @@ enum MidConnect {
     Shutdown,
 }
 
-/// Results fetched off the transport loop that must be re-applied on it.
-/// Today only the session list qualifies: its listing caches (message
-/// counts, pin state, refused sources) live on the link.
+/// Results fetched off the transport loop that must be re-applied on it:
+/// the session list (its listing caches live on the link) and attachment
+/// uploads (the submit RPC waits for the uploaded paths).
 enum LoopWork {
-    Listed(Result<Event, String>),
+    Listed(Box<Result<Event, String>>),
+    Uploaded {
+        runtime_id: String,
+        generation: u64,
+        result: Result<VecDeque<String>, String>,
+        prompt_text: String,
+    },
 }
 
 fn mid_connect(command: Option<Command>) -> MidConnect {
@@ -1182,9 +1200,43 @@ impl Link {
                 .await;
             return;
         }
-        match self.upload_staged_images(&attachments).await {
+        // Image uploads run off the transport loop and concurrently: a slow
+        // upload must not stall frames, and N images no longer cost N
+        // serial round trips. The result re-enters via the work channel,
+        // where the generation guard discards stale uploads.
+        let images: Vec<StagedImage> = attachments
+            .into_iter()
+            .filter(|attachment| attachment.is_image())
+            .collect();
+        if images.is_empty() {
+            self.advance_attach_or_submit(runtime_id, generation, VecDeque::new(), wire_text)
+                .await;
+            return;
+        }
+        tokio::spawn(upload_images_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work.clone(),
+            runtime_id,
+            generation,
+            images,
+            wire_text,
+        ));
+    }
+
+    /// Applies a finished upload set on the loop: the submit RPC proceeds
+    /// with the uploaded paths, or the turn fails exactly as the inline
+    /// path did.
+    async fn apply_uploaded(
+        &mut self,
+        runtime_id: String,
+        generation: u64,
+        result: Result<VecDeque<String>, String>,
+        prompt_text: String,
+    ) {
+        match result {
             Ok(paths) => {
-                self.advance_attach_or_submit(runtime_id, generation, paths, wire_text)
+                self.advance_attach_or_submit(runtime_id, generation, paths, prompt_text)
                     .await;
             }
             Err(err) => {
@@ -1199,18 +1251,6 @@ impl Link {
                 .await;
             }
         }
-    }
-
-    async fn upload_staged_images(
-        &self,
-        attachments: &[StagedImage],
-    ) -> Result<VecDeque<String>, String> {
-        let mut paths = VecDeque::with_capacity(attachments.len());
-        for image in attachments.iter().filter(|image| image.is_image()) {
-            let uploaded = upload_chat_image_http(&self.http, &self.origin, image).await?;
-            paths.push_back(uploaded);
-        }
-        Ok(paths)
     }
 
     async fn advance_attach_or_submit(
@@ -1721,7 +1761,9 @@ impl Link {
         let http = self.http.clone();
         let origin = self.origin.clone();
         tokio::spawn(async move {
-            let _ = work.send(LoopWork::Listed(fetch_sessions(&http, &origin, offset).await));
+            let _ = work.send(LoopWork::Listed(Box::new(
+                fetch_sessions(&http, &origin, offset).await,
+            )));
         });
     }
 
@@ -4669,6 +4711,35 @@ async fn upload_chat_image_http(
         .ok_or_else(|| "Gateway did not return an uploaded image path.".into())
 }
 
+/// The submit path's image uploads as their own task: concurrent (N images
+/// cost one wall-clock window instead of N serial round trips) and off the
+/// transport loop. The uploaded paths — or the first failure — re-enter the
+/// loop via the work channel, where the generation guard discards stale
+/// results.
+async fn upload_images_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    runtime_id: String,
+    generation: u64,
+    images: Vec<StagedImage>,
+    prompt_text: String,
+) {
+    let result = futures_util::future::try_join_all(
+        images
+            .iter()
+            .map(|image| upload_chat_image_http(&http, &origin, image)),
+    )
+    .await
+    .map(VecDeque::from);
+    let _ = work.send(LoopWork::Uploaded {
+        runtime_id,
+        generation,
+        result,
+        prompt_text,
+    });
+}
+
 /// The catalog fetch body that runs as its own task: two independent HTTP
 /// calls (concurrent halves the wall time), whose results land on the event
 /// channel with the same redaction the inline version used.
@@ -6316,8 +6387,11 @@ mod tests {
                 .await
                 .expect("listed within 5s")
                 .expect("sender alive");
-            let LoopWork::Listed(Ok(event)) = listed else {
+            let LoopWork::Listed(listed) = listed else {
                 panic!("expected a fetched session list");
+            };
+            let Ok(event) = *listed else {
+                panic!("expected a successful list fetch");
             };
             link.apply_listed(Ok(event)).await;
             let sessions = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
@@ -6344,6 +6418,96 @@ mod tests {
                 (stored_id.as_str(), messages.len(), messages[0].text.as_str()),
                 ("st-1", 2, "first")
             );
+        });
+    }
+
+    #[test]
+    fn image_uploads_run_off_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let png = vec![
+                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+            ];
+
+            // With the image upload hung against a stalling gateway, the
+            // submit launcher must return and frames must keep processing.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let img = StagedImage::from_bytes(1, "p.png", png.clone()).expect("staged");
+                link.begin_submit("rt".into(), "with picture".into(), vec![img])
+                    .await;
+                link.events
+                    .try_send(Event::Connection(ConnectionState::Connecting))
+                    .expect("fill");
+                link.emit_delta("rt", "m1", "hello").await;
+                assert!(incoming.try_recv().is_ok());
+                link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                    Vec::new().into(),
+                ))))
+                .await;
+                let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                    panic!("frames must process while the upload hangs");
+                };
+                assert_eq!(delta, "hello");
+            })
+            .await
+            .expect("transport loop must stay responsive");
+
+            // Against a live origin the upload result re-enters the loop via
+            // the work channel; a failed upload fails the submit turn with
+            // the same error the inline path produced.
+            let origin = spawn_one_http_status("200 OK", "{}").await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+            let img = StagedImage::from_bytes(1, "p.png", png).expect("staged");
+            link.begin_submit("rt".into(), "with picture".into(), vec![img])
+                .await;
+            let uploaded = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("upload work within 5s")
+                .expect("sender alive");
+            let LoopWork::Uploaded {
+                runtime_id,
+                generation,
+                result,
+                prompt_text,
+            } = uploaded
+            else {
+                panic!("expected upload work");
+            };
+            assert!(result.is_err());
+            link.apply_uploaded(runtime_id, generation, result, prompt_text)
+                .await;
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("submit error within 5s")
+                .expect("sender alive");
+            assert!(matches!(
+                &error,
+                Event::Error { operation, .. } if operation == "submit"
+            ));
         });
     }
 

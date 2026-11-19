@@ -82,6 +82,8 @@ Streaming deltas never block the transport loop on UI speed: `MessageDelta` and 
 
 Session reads (conversation list, saved history, and session search) also run off the transport loop as their own tasks. The history and search tasks emit their events directly; the list fetch re-enters the loop through a small internal work channel, where title/preview cleaning and the listing caches (message counts, pin state, refused sources) are applied before the event reaches the UI. A slow or stuck gateway HTTP endpoint therefore cannot stall frame processing on user-initiated reads either — including the post-reconnect refresh, whose list and history fetches used to block the loop up to 30s each.
 
+Attachment uploads ride the same shape: `begin_submit` hands the staged images to a task that uploads them **concurrently** (`try_join_all`, so N images cost one wall-clock window instead of N serial round trips) and hands the paths back through the work channel, where the turn's generation guard discards results that arrive after the turn rolled, stopped, or the link reconnected. A slow or stuck upload therefore cannot stall frame processing on the message-send path.
+
 Socket writes (JSON-RPC frames and Pong replies) are bounded by a 5s `WRITE_TIMEOUT`, far below the 30s RPC response wait: a gateway that stops reading its socket fails the write within 5s, the link drops, and automatic reconnect takes over instead of stalling the transport loop.
 
 ## Configuration
