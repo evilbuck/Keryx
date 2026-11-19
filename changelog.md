@@ -34,6 +34,7 @@
 - Undo and compress stalls: rewinding or compacting a conversation no longer fetches the updated history on the network loop, so a slow gateway cannot freeze frame processing while the action completes (previously up to 30s of transport-loop blockage per action).
 
 - Ghost turns after a reconnect: off-loop fetches are now stamped with the connection they ran under, and results from a torn-down connection are discarded — so a resume that raced a disconnect can no longer leave a permanently "submitted" phantom turn, send requests for a dead runtime, or replay stale approval prompts on the new connection.
+- Deferred renames and pins no longer fail silently: when a conversation's saved title/pin is flushed after its first message, a refused save now re-defers the change and surfaces a curation error instead of dropping the outcome — previously the rename or pin silently reverted on the next conversation-list refresh. Concurrent patches for the same conversation are serialized, so a background flush can no longer cause a confusing "HTTP 409" on a pin or rename pressed at the same time.
 - Commands issued mid-reconnect: commands pressed while a reconnect dial is in flight now follow the same rule as when disconnected — list, create, resume, search, and studio fetch wait for the new connection, while submit, steer, interrupt, and timeline actions fail immediately with "Not connected. Reconnect to try again." instead of replaying against a runtime id from the torn-down connection, which previously produced an opaque gateway failure.
 
 ### Limitations

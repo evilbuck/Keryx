@@ -455,6 +455,12 @@ struct Link {
     message_counts: HashMap<String, usize>,
     pinned_sessions: HashSet<String>,
     deferred_mutations: HashMap<String, (Option<String>, Option<bool>)>,
+    /// Sessions with a patch in flight (user-initiated or deferred flush).
+    /// A second concurrent patch would race the fenced revision and surface
+    /// HTTP 409 to the user, so colliding mutations ride the deferral
+    /// instead. Cleared on teardown: epoch-guarded results from a torn-down
+    /// connection never reach the apply paths that clear it.
+    patching: HashSet<String>,
     jobs: HashMap<u64, Job>,
     runtime_of: HashMap<String, String>,
     refused: HashSet<String>,
@@ -580,6 +586,15 @@ async fn run(
                         } => {
                             link.apply_archived(stored_id, retried, result).await;
                         }
+                        LoopWork::Deferred {
+                            stored_id,
+                            title,
+                            pinned,
+                            result,
+                        } => {
+                            link.apply_deferred_patch(stored_id, title, pinned, result)
+                                .await;
+                        }
                     }
                 }
                 track(&link, &mut attempts, &mut retry_at);
@@ -704,6 +719,12 @@ enum LoopWork {
     Archived {
         stored_id: String,
         retried: bool,
+        result: Result<PatchOutcome, String>,
+    },
+    Deferred {
+        stored_id: String,
+        title: Option<String>,
+        pinned: Option<bool>,
         result: Result<PatchOutcome, String>,
     },
 }
@@ -911,6 +932,7 @@ impl Link {
             message_counts: HashMap::new(),
             pinned_sessions: HashSet::new(),
             deferred_mutations: HashMap::new(),
+            patching: HashSet::new(),
             jobs: HashMap::new(),
             runtime_of: HashMap::new(),
             refused: HashSet::new(),
@@ -2015,9 +2037,19 @@ impl Link {
             self.begin_archive(stored_id).await;
             return;
         }
+        if self.patching.contains(&stored_id) {
+            // A patch for this conversation is already in flight — a user
+            // patch or a deferred flush. A second concurrent patch would
+            // race the fenced revision and surface HTTP 409 to the user, so
+            // the new mutation rides the deferral and flushes when the
+            // in-flight patch resolves.
+            self.absorb_into_deferral(stored_id, mutation).await;
+            return;
+        }
         // The patch — including its one conflict retry — runs off the
         // transport loop; the outcome applies where curation state lives.
         let body = recall::mutation_patch_body(&mutation);
+        self.patching.insert(stored_id.clone());
         tokio::spawn(patch_session_task(
             self.http.clone(),
             self.origin.clone(),
@@ -2037,8 +2069,17 @@ impl Link {
         mutation: SessionMutation,
         result: Result<PatchOutcome, String>,
     ) {
+        self.patching.remove(&stored_id);
+        let chained = stored_id.clone();
         match result {
-            Ok(PatchOutcome::Applied) => self.finish_applied_mutation(stored_id, mutation).await,
+            Ok(PatchOutcome::Applied) => {
+                self.finish_applied_mutation(stored_id, mutation).await;
+                // A mutation absorbed while this patch was in flight rides
+                // the deferral; with the patch applied, flush it now.
+                // Failure arms do not chain: the next real trigger (a
+                // completed message) retries the absorbed changes.
+                self.chain_deferred_flush(&chained);
+            }
             Ok(PatchOutcome::NotFound) if self.is_unpersisted_live(&stored_id) => {
                 self.apply_unpersisted_mutation(stored_id, mutation).await;
             }
@@ -2056,6 +2097,22 @@ impl Link {
             }
             Err(message) => self.fail("curation", Some(stored_id), message).await,
         }
+    }
+
+    /// Records a mutation into the deferral map and shows it as applied:
+    /// the pin cache updates, the entry waits for a flush trigger, and the
+    /// UI sees success immediately. Shared by the unpersisted path and the
+    /// in-flight-patch collision path.
+    async fn absorb_into_deferral(&mut self, stored_id: String, mutation: SessionMutation) {
+        if let SessionMutation::SetPinned(pinned) = mutation {
+            self.set_pinned_cache(&stored_id, pinned);
+        }
+        self.record_deferred_mutation(&stored_id, &mutation);
+        self.emit(Event::SessionMutated {
+            stored_id,
+            mutation,
+        })
+        .await;
     }
 
     async fn begin_archive(&mut self, stored_id: String) {
@@ -2210,18 +2267,16 @@ impl Link {
         if matches!(mutation, SessionMutation::Archive) {
             self.pinned_sessions.remove(&stored_id);
             self.deferred_mutations.remove(&stored_id);
+            self.patching.remove(&stored_id);
             self.close_live_runtime_quietly(&stored_id).await;
+            self.emit(Event::SessionMutated {
+                stored_id,
+                mutation,
+            })
+            .await;
         } else {
-            if let SessionMutation::SetPinned(pinned) = mutation {
-                self.set_pinned_cache(&stored_id, pinned);
-            }
-            self.record_deferred_mutation(&stored_id, &mutation);
+            self.absorb_into_deferral(stored_id, mutation).await;
         }
-        self.emit(Event::SessionMutated {
-            stored_id,
-            mutation,
-        })
-        .await;
     }
 
     fn record_deferred_mutation(&mut self, stored_id: &str, mutation: &SessionMutation) {
@@ -2267,20 +2322,114 @@ impl Link {
         let Some(stored_id) = self.stored_id_for_runtime(runtime_id) else {
             return;
         };
-        let count = self.message_counts.entry(stored_id.clone()).or_insert(0);
+        self.flush_deferred(&stored_id);
+    }
+
+    /// Sends one conversation's deferred title/pin to the gateway, now that
+    /// its first message has completed. Skips while any patch for the same
+    /// conversation is in flight (the deferral retries on the next trigger)
+    /// and marks its own patch in flight, so a concurrent user mutation
+    /// rides the deferral instead of racing the fenced revision.
+    fn flush_deferred(&mut self, stored_id: &str) {
+        let count = self.message_counts.entry(stored_id.to_string()).or_insert(0);
         *count = (*count).max(2);
-        let Some((title, pinned)) = self.deferred_mutations.remove(&stored_id) else {
+        if self.patching.contains(stored_id) {
+            return;
+        }
+        let Some((title, pinned)) = self.deferred_mutations.remove(stored_id) else {
             return;
         };
-        let Some(body) = deferred_patch_body(title, pinned) else {
+        let Some(body) = deferred_patch_body(title.clone(), pinned) else {
             return;
         };
-        // Fire-and-forget: the deferred patch runs off the transport loop.
-        let http = self.http.clone();
-        let origin = self.origin.clone();
-        tokio::spawn(async move {
-            let _ = patch_session_http(&http, &origin, &stored_id, &body).await;
-        });
+        self.patching.insert(stored_id.to_string());
+        tokio::spawn(deferred_patch_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work_sink(),
+            stored_id.to_string(),
+            title,
+            pinned,
+            body,
+        ));
+    }
+
+    /// Flushes a deferred mutation that arrived while a patch for the same
+    /// conversation was in flight: that patch window has closed, so the
+    /// absorbed changes get their turn now.
+    fn chain_deferred_flush(&mut self, stored_id: &str) {
+        // The unpersisted case is excluded: a 404 there means the gateway
+        // has no row yet, so an immediate re-patch would fail again — the
+        // deferral waits for the real trigger (a completed message).
+        if !self.is_unpersisted_live(stored_id)
+            && self.runtime_of.contains_key(stored_id)
+            && self.deferred_mutations.contains_key(stored_id)
+        {
+            self.flush_deferred(stored_id);
+        }
+    }
+
+    /// Applies a finished deferred patch on the loop. Success is silent (the
+    /// UI already showed the mutation when it was deferred); a refused save
+    /// re-defers the title/pin — the user's intent survives and the next
+    /// flush trigger retries — and surfaces, so a rename or pin can no
+    /// longer silently revert on the next list refresh. A transport failure
+    /// re-defers without an event: it is transient by nature and event spam
+    /// per message would be noise.
+    async fn apply_deferred_patch(
+        &mut self,
+        stored_id: String,
+        title: Option<String>,
+        pinned: Option<bool>,
+        result: Result<PatchOutcome, String>,
+    ) {
+        self.patching.remove(&stored_id);
+        match result {
+            Ok(PatchOutcome::Applied) => {
+                // A mutation absorbed while this flush was in flight rides
+                // the deferral; with the save applied, flush it now.
+                // Failure arms do not chain: a permanent refusal would loop,
+                // and the next real trigger (a completed message) retries.
+                self.chain_deferred_flush(&stored_id);
+            }
+            Ok(PatchOutcome::NotFound) => {
+                self.reinsert_deferred(&stored_id, title, pinned);
+                self.fail(
+                    "curation",
+                    Some(stored_id.clone()),
+                    "Could not save conversation changes (HTTP 404).",
+                )
+                .await;
+            }
+            Ok(PatchOutcome::Conflict) => {
+                self.reinsert_deferred(&stored_id, title, pinned);
+                self.fail(
+                    "curation",
+                    Some(stored_id.clone()),
+                    "Could not save conversation changes (HTTP 409).",
+                )
+                .await;
+            }
+            Err(_) => {
+                self.reinsert_deferred(&stored_id, title, pinned);
+            }
+        }
+    }
+
+    fn reinsert_deferred(&mut self, stored_id: &str, title: Option<String>, pinned: Option<bool>) {
+        // Merge, not overwrite: anything already in the map was absorbed
+        // while this patch was in flight, so it is the user's LATER intent
+        // for that field; only fill fields nothing newer has claimed.
+        let entry = self
+            .deferred_mutations
+            .entry(stored_id.to_string())
+            .or_insert((None, None));
+        if entry.0.is_none() {
+            entry.0 = title;
+        }
+        if entry.1.is_none() {
+            entry.1 = pinned;
+        }
     }
 
     fn stored_id_for_runtime(&self, runtime_id: &str) -> Option<String> {
@@ -4693,6 +4842,9 @@ impl Link {
         self.pending_deltas.clear();
         self.pending_reasoning.clear();
         self.runtime_of.clear();
+        // In-flight patches from this connection are epoch-staled below;
+        // their stored_ids must not stay marked as patching forever.
+        self.patching.clear();
         // Stales every in-flight off-loop fetch: results stamped with an
         // earlier epoch are discarded instead of applied to the next
         // connection.
@@ -5171,6 +5323,28 @@ async fn patch_session_task(
     work.deliver(LoopWork::Mutated {
         stored_id,
         mutation,
+        result,
+    });
+}
+
+/// A deferred title/pin patch as its own task: unlike the old
+/// fire-and-forget flush, the outcome re-enters the loop, where a refused
+/// or failed save re-defers the user's intent and surfaces instead of
+/// silently reverting on the next list refresh.
+async fn deferred_patch_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: WorkSink,
+    stored_id: String,
+    title: Option<String>,
+    pinned: Option<bool>,
+    body: Value,
+) {
+    let result = patch_session_http(&http, &origin, &stored_id, &body).await;
+    work.deliver(LoopWork::Deferred {
+        stored_id,
+        title,
+        pinned,
         result,
     });
 }
@@ -7101,7 +7275,7 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let png = vec![
-                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
             ];
 
             // With the image upload hung against a stalling gateway, the
@@ -8563,6 +8737,140 @@ mod tests {
     }
 
     #[test]
+    fn deferred_flush_refusal_re_defers_and_surfaces_instead_of_reverting() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // The gateway refuses the deferred save with 404 (and has no
+            // mutation snapshot). The old fire-and-forget flush dropped this
+            // outcome; the rename and pin silently reverted on the next
+            // list refresh.
+            let origin = spawn_one_http_status("404 Not Found", "{}").await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+            link.runtime_of.insert("st-live".into(), "rt-live".into());
+            link.message_counts.insert("st-live".into(), 0);
+            link.deferred_mutations.insert(
+                "st-live".into(),
+                (Some("Renamed".into()), Some(true)),
+            );
+
+            link.flush_deferred_for_runtime("rt-live");
+            // The flush marks its own patch in flight; a user mutation for
+            // the same conversation must ride the deferral, not race it.
+            assert!(link.patching.contains("st-live"));
+            assert!(!link.deferred_mutations.contains_key("st-live"));
+            link.mutate_session("st-live".into(), SessionMutation::SetPinned(false))
+                .await;
+            assert!(link.deferred_mutations.contains_key("st-live"));
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated { stored_id, .. }) if stored_id == "st-live"
+            ));
+
+            let deferred =
+                tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                    .await
+                    .expect("deferred work within 5s")
+                    .expect("sender alive");
+            let StampedWork {
+                work: LoopWork::Deferred {
+                    stored_id,
+                    title,
+                    pinned,
+                    result,
+                },
+                ..
+            } = deferred
+            else {
+                panic!("expected deferred patch work");
+            };
+            assert_eq!(stored_id, "st-live");
+            assert!(matches!(result, Ok(PatchOutcome::NotFound)));
+            link.apply_deferred_patch(stored_id, title, pinned, result)
+                .await;
+            // The refusal re-defers the user's earlier intent and surfaces;
+            // the absorbed SetPinned(false) rides on top of it.
+            assert_eq!(
+                link.deferred_mutations.get("st-live"),
+                Some(&(Some("Renamed".into()), Some(false)))
+            );
+            assert!(!link.patching.contains("st-live"));
+            match incoming.try_recv() {
+                Ok(Event::Error { message, .. }) => assert!(
+                    message.contains("Could not save conversation changes (HTTP 404)")
+                ),
+                other => panic!("unexpected: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn deferred_flush_in_flight_absorbs_user_mutations_without_racing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // A stalling gateway keeps the in-flight patch unresolved.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.runtime_of.insert("st-live".into(), "rt-live".into());
+            link.message_counts.insert("st-live".into(), 2);
+            link.deferred_mutations.insert(
+                "st-live".into(),
+                (None, Some(true)),
+            );
+
+            link.flush_deferred_for_runtime("rt-live");
+            assert!(link.patching.contains("st-live"));
+
+            // The mutation pressed while the deferred flush is in flight is
+            // absorbed into the deferral and shown as applied — no second
+            // concurrent patch that would surface HTTP 409, no dropped
+            // mutation. The pin is still in flight (the flush carries it),
+            // so the map holds only the newer pending rename.
+            link.mutate_session("st-live".into(), SessionMutation::Rename("Pinned fork".into()))
+                .await;
+            assert_eq!(
+                link.deferred_mutations.get("st-live"),
+                Some(&(Some("Pinned fork".into()), None))
+            );
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::SessionMutated { stored_id, .. }) if stored_id == "st-live"
+            ));
+            // Still exactly one patch in flight.
+            assert!(link.patching.contains("st-live"));
+
+            // A teardown clears the in-flight marker: epoch-staled results
+            // never reach the apply paths that would clear it.
+            link.close_socket().await;
+            assert!(link.patching.is_empty());
+        });
+    }
+
+    #[test]
     fn session_summary_extracts_pinned_preview_and_model_fields() {
         let summary = session_summary(&json!({
             "id": "s-curated",
@@ -8822,7 +9130,7 @@ mod tests {
             )
             .await;
             let png = vec![
-                0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
             ];
             let img = StagedImage::from_bytes(1, "p.png", png).unwrap();
             let uploaded = upload_chat_image_http(&http, &up_url, &img).await.unwrap();
