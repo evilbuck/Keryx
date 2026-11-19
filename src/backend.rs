@@ -29,6 +29,12 @@ const PROBE_SILENCE: Duration = Duration::from_secs(30);
 /// reconnect take over instead of stalling the transport loop for a full
 /// RPC response wait.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Inbound silence bound. Long enough to cover a server-side compress
+/// (`COMPRESS_TIMEOUT`) that pushes no intermediate frames; anything quieter
+/// despite keepalive probes is a dead link.
+const SILENCE_BOUND: Duration = Duration::from_secs(90);
+/// Quiet window after which heartbeat mode sends a `gateway.ping`.
+const HEARTBEAT_SILENCE: Duration = Duration::from_secs(20);
 /// Per-runtime cap on delta text buffered while the UI is too slow to keep up.
 /// `MessageComplete` carries the authoritative text, so dropping the front of a
 /// capped tail degrades only live streaming display, never the transcript.
@@ -4129,6 +4135,26 @@ impl Link {
         // stall the transport loop (see emit_delta).
         self.flush_pending_deltas();
         let now = Instant::now();
+        self.fail_expired_jobs(now).await;
+        if self.write.is_some()
+            && !self.ready
+            && self
+                .opened_at
+                .is_some_and(|opened| opened.elapsed() > READY_TIMEOUT)
+        {
+            self.drop_socket("The gateway did not become ready.").await;
+            return;
+        }
+        self.probe_keepalive(now).await;
+        if self.write.is_some() && self.last_inbound.elapsed() > SILENCE_BOUND {
+            self.drop_socket("The gateway stopped responding.").await;
+            return;
+        }
+        self.heartbeat_ping().await;
+    }
+
+    /// Fails every job whose response deadline passed on this tick.
+    async fn fail_expired_jobs(&mut self, now: Instant) {
         let expired: Vec<u64> = self
             .jobs
             .iter()
@@ -4148,23 +4174,14 @@ impl Link {
                 .await;
             }
         }
-        if self.write.is_some()
-            && !self.ready
-            && self
-                .opened_at
-                .is_some_and(|opened| opened.elapsed() > READY_TIMEOUT)
-        {
-            self.drop_socket("The gateway did not become ready.").await;
-            return;
-        }
-        self.probe_keepalive(now).await;
-        if self.write.is_some() && self.last_inbound.elapsed() > Duration::from_secs(90) {
-            self.drop_socket("The gateway stopped responding.").await;
-            return;
-        }
+    }
+
+    /// In heartbeat mode the gateway expects a periodic JSON-RPC ping once
+    /// traffic has been quiet for 20s.
+    async fn heartbeat_ping(&mut self) {
         if self.write.is_some()
             && self.heartbeat
-            && self.last_inbound.elapsed() > Duration::from_secs(20)
+            && self.last_inbound.elapsed() > HEARTBEAT_SILENCE
         {
             let _ = self
                 .send_rpc("gateway.ping", json!({}), JobKind::Ping, RPC_TIMEOUT)

@@ -25,11 +25,6 @@
     "complexity": 14
   },
   {
-    "file": "src/backend.rs",
-    "function": "maintain",
-    "complexity": 11
-  },
-  {
     "file": "examples/remote_smoke.rs",
     "function": "run",
     "complexity": 17
