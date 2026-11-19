@@ -30,6 +30,7 @@ Nine-loop hardening pass over `src/backend.rs` transport. Branch `feat/loop-impr
 5. **Streaming deltas never block the transport loop**: `emit_delta` uses `try_send` with a per-runtime pending tail capped at `DELTA_TAIL_CAP` (1 MB, UTF-8 boundary trim via `trim_to_cap`), retried each 5s maintenance tick; rollover drops the old tail (never concatenates out of order); `MessageComplete` supersedes parked tails (it carries authoritative text); `close_socket` clears them. The bounded event channel (`EVENT_BOUND` 512) stays bounded.
 6. **On `gateway.ready`, queued commands drain BEFORE the studio catalog fetch**, and the two catalog HTTP requests run concurrently (`tokio::join!`); post-reconnect time-to-interactive does not wait on catalog RTTs. The UI's `note_connection` re-lists sessions and re-resumes the selected one on every Connected event, so auto-reconnect restores context end-to-end.
 7. **Handshake decomposition** (`sign_in`, `request_ticket`, `ws_dial_url`, `dial_socket`), supervision decomposition (`fail_expired_jobs`, `heartbeat_ping`, `flush_pending_deltas`, `probe_keepalive`): backend.rs has zero baselined complexity hotspots; the guardrails complexity baseline is 4 entries and exactly matches the live CCN>10 warnings.
+8. **No HTTP call and no work-result application crosses a connection boundary** (`b5cdc77`): every off-loop task delivers through a `WorkSink` (work channel + connection epoch bound together; the plain sender type never reaches a task signature, so the stamp cannot be forgotten), `close_socket` bumps `epoch` on every teardown, and `run()`'s dispatch drops results whose epoch no longer matches. A fetch racing a disconnect can therefore never adopt a turn for a dead runtime or surface a stale failure. Audits taught twice that "closed" claims must be grep-mechanical; the epoch guard makes the remaining class (spawn/deliver across teardown) impossible by construction.
 
 ## Rejected with reasons (do not re-propose without new evidence)
 
@@ -39,5 +40,4 @@ Nine-loop hardening pass over `src/backend.rs` transport. Branch `feat/loop-impr
 - Reqwest TCP `connect_timeout`: per-step sign-in bounds already exist via the 30s total request timeout.
 
 ## Verification snapshot
-
-`cargo test` 113 passed; `cargo clippy --all-targets -- -D warnings` clean; coverage 56.8% (ratchet baseline 53.3%); guardrails lizard command: 4 warnings, all baseline-covered.
+`cargo test` 123 passed; `cargo clippy --all-targets -- -D warnings` clean; coverage 60.2% (ratchet baseline 53.3%); guardrails lizard command: 4 warnings (3 baselined + 1 ui.rs length-only). Re-observed at HEAD `b5cdc77` on 2026-11-19.
