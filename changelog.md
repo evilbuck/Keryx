@@ -24,7 +24,9 @@
 - Session-read and mutation stalls: the conversation list, saved-history, session-search, and pin/rename patch requests now run off the network loop, so a slow gateway cannot freeze frame processing while you list, open, search, pin, or rename conversations — including the automatic refresh right after reconnecting (previously up to 30s of transport-loop blockage per request).
 
 - Upload stalls: attached images now upload concurrently and off the network loop, so sending a message with attachments no longer freezes frame processing while the gateway accepts the files (previously up to 30s per image, serially). Stale uploads after a retry or reconnect are discarded by the turn guard.
-- Branch stalls: forking a conversation now fetches its earlier messages off the network loop, so a slow gateway cannot freeze frame processing while the branch is prepared (previously up to 30s per history page, serially).
+- Branch stalls: forking a conversation now fetches both its earlier messages and the new branch's first page off the network loop (the seed fallback rides on a failed or empty fetch), so a slow gateway cannot freeze frame processing while the branch is prepared (previously up to 30s per history page, serially).
+
+- Archive stalls: archiving a conversation and flushing deferred pin/rename changes after a message completes now patch off the network loop, so a slow gateway cannot freeze frame processing during archival. With this, no HTTP call runs on the network loop anymore.
 
 - Read-only resumes: opening a conversation the gateway refuses to continue now loads its saved transcript off the network loop, so a slow gateway cannot freeze frame processing during the load.
 

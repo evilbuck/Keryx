@@ -559,6 +559,16 @@ async fn run(
                     Some(LoopWork::Page(page)) => {
                         link.apply_synced_page(*page).await;
                     }
+                    Some(LoopWork::Branched(page)) => {
+                        link.apply_branched(*page).await;
+                    }
+                    Some(LoopWork::Archived {
+                        stored_id,
+                        retried,
+                        result,
+                    }) => {
+                        link.apply_archived(stored_id, retried, result).await;
+                    }
                     None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
@@ -671,6 +681,12 @@ enum LoopWork {
     Readonly(Box<ReadonlyOutcome>),
     Resumed(Box<ResumedPage>),
     Page(Box<SyncedPage>),
+    Branched(Box<BranchedPage>),
+    Archived {
+        stored_id: String,
+        retried: bool,
+        result: Result<PatchOutcome, String>,
+    },
 }
 
 /// A branch request whose earlier pages are fetched off the transport loop.
@@ -737,6 +753,21 @@ struct SyncedPage {
     before: usize,
     messages: Result<Vec<ChatMessage>, String>,
     action: PageAction,
+}
+
+/// The branched conversation's first page, fetched off the transport loop;
+/// on error or an empty page the fallback seed rides instead, and the
+/// `Branched` event applies on the loop when the rows return.
+struct BranchedPage {
+    stored_id: String,
+    runtime_id: String,
+    parent_stored_id: String,
+    parent_title: String,
+    title: String,
+    fallback_messages: Vec<ChatMessage>,
+    model: Option<ModelIdentity>,
+    before: usize,
+    messages: Vec<ChatMessage>,
 }
 
 fn mid_connect(command: Option<Command>) -> MidConnect {
@@ -2008,7 +2039,27 @@ impl Link {
 
     async fn request_archive_patch(&mut self, stored_id: String, retried: bool) {
         let body = recall::mutation_patch_body(&SessionMutation::Archive);
-        match patch_session_http(&self.http, &self.origin, &stored_id, &body).await {
+        // The archive patch runs off the transport loop; the outcome maps
+        // on the loop, where archive-completion state lives.
+        tokio::spawn(archive_patch_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work.clone(),
+            stored_id,
+            retried,
+            body,
+        ));
+    }
+
+    /// Maps a finished archive patch on the loop — the same outcomes the
+    /// inline path produced, including the zero-message NotFound guard.
+    async fn apply_archived(
+        &mut self,
+        stored_id: String,
+        retried: bool,
+        result: Result<PatchOutcome, String>,
+    ) {
+        match result {
             Ok(PatchOutcome::Applied) => self.finish_archive(stored_id).await,
             Ok(PatchOutcome::NotFound)
                 if self.message_counts.get(&stored_id).copied() == Some(0) =>
@@ -2148,7 +2199,7 @@ impl Link {
         }
     }
 
-    async fn flush_deferred_for_runtime(&mut self, runtime_id: &str) {
+    fn flush_deferred_for_runtime(&mut self, runtime_id: &str) {
         let Some(stored_id) = self.stored_id_for_runtime(runtime_id) else {
             return;
         };
@@ -2160,7 +2211,12 @@ impl Link {
         let Some(body) = deferred_patch_body(title, pinned) else {
             return;
         };
-        let _ = patch_session_http(&self.http, &self.origin, &stored_id, &body).await;
+        // Fire-and-forget: the deferred patch runs off the transport loop.
+        let http = self.http.clone();
+        let origin = self.origin.clone();
+        tokio::spawn(async move {
+            let _ = patch_session_http(&http, &origin, &stored_id, &body).await;
+        });
     }
 
     fn stored_id_for_runtime(&self, runtime_id: &str) -> Option<String> {
@@ -2837,7 +2893,7 @@ impl Link {
             status,
         })
         .await;
-        self.flush_deferred_for_runtime(runtime_id).await;
+        self.flush_deferred_for_runtime(runtime_id);
         self.emit_complete_metadata(runtime_id, payload).await;
     }
 
@@ -3608,9 +3664,42 @@ impl Link {
             .insert(stored_id.clone(), runtime_id.clone());
         self.message_counts.insert(stored_id.clone(), count);
         let before = count.saturating_sub(PAGE);
-        let messages = self
-            .load_branch_messages(&stored_id, before, count - before, fallback_messages)
-            .await;
+        // The branched conversation's first page loads off the transport
+        // loop; on error or an empty page the fallback seed rides instead.
+        tokio::spawn(branched_page_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work.clone(),
+            BranchedPage {
+                stored_id,
+                runtime_id,
+                parent_stored_id,
+                parent_title,
+                title,
+                fallback_messages,
+                model,
+                before,
+                // The task overwrites this with the fetched rows.
+                messages: Vec::new(),
+            },
+            count - before,
+        ));
+    }
+
+    /// Applies a fetched branched page on the loop: the same `Branched`
+    /// event the inline path emitted, with the fetched rows or the fallback.
+    async fn apply_branched(&mut self, page: BranchedPage) {
+        let BranchedPage {
+            stored_id,
+            runtime_id,
+            parent_stored_id,
+            parent_title,
+            title,
+            fallback_messages: _,
+            model,
+            before,
+            messages,
+        } = page;
         let model_name = model
             .as_ref()
             .map_or_else(String::new, |entry| entry.model.clone());
@@ -3635,21 +3724,6 @@ impl Link {
             model,
         })
         .await;
-    }
-
-    async fn load_branch_messages(
-        &self,
-        stored_id: &str,
-        before: usize,
-        limit: usize,
-        fallback: Vec<ChatMessage>,
-    ) -> Vec<ChatMessage> {
-        if let Ok(rows) = fetch_history(&self.http, &self.origin, stored_id, before, limit).await
-            && !rows.is_empty()
-        {
-            return rows;
-        }
-        fallback
     }
 
     async fn on_undo_reply(
@@ -4961,6 +5035,41 @@ async fn synced_page_task(
 ) {
     page.messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
     let _ = work.send(LoopWork::Page(Box::new(page)));
+}
+
+/// The branched conversation's first page, off the transport loop; on error
+/// or an empty page the fallback seed rides instead.
+async fn branched_page_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    mut page: BranchedPage,
+    limit: usize,
+) {
+    page.messages = match fetch_history(&http, &origin, &page.stored_id, page.before, limit).await {
+        Ok(rows) if !rows.is_empty() => rows,
+        _ => std::mem::take(&mut page.fallback_messages),
+    };
+    let _ = work.send(LoopWork::Branched(Box::new(page)));
+}
+
+/// The archive patch as its own task: the fenced patch (and its one
+/// conflict retry) runs off the transport loop, and the outcome re-enters
+/// via the work channel where archive-completion state applies it.
+async fn archive_patch_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    stored_id: String,
+    retried: bool,
+    body: Value,
+) {
+    let result = patch_session_http(&http, &origin, &stored_id, &body).await;
+    let _ = work.send(LoopWork::Archived {
+        stored_id,
+        retried,
+        result,
+    });
 }
 
 /// The session patch as its own task: the fenced patch (and its one
@@ -8125,6 +8234,7 @@ mod tests {
                 events,
             )
             .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
             // Disconnected timeline commands emit clean non-fatal branch/undo errors.
             link.timeline_command(Command::Branch {
                 stored_id: "root-1".into(),
@@ -8158,6 +8268,14 @@ mod tests {
                 }),
             )
             .await;
+            let paged = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("branched page within 5s")
+                .expect("sender alive");
+            let LoopWork::Branched(page) = paged else {
+                panic!("expected branched page work");
+            };
+            link.apply_branched(*page).await;
             match incoming.try_recv().expect("branched") {
                 Event::Branched {
                     session,
@@ -8196,6 +8314,14 @@ mod tests {
                 &json!({"session_id": "rt-resumed", "message_count": 1}),
             )
             .await;
+            let reopened = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("reopened page within 5s")
+                .expect("sender alive");
+            let LoopWork::Branched(page) = reopened else {
+                panic!("expected reopened page work");
+            };
+            link.apply_branched(*page).await;
             assert_eq!(
                 link.runtime_of.get("st-reopened").map(String::as_str),
                 Some("rt-resumed")
@@ -8381,6 +8507,7 @@ mod tests {
                 events,
             )
             .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
             link.on_curation_job(
                 JobKind::ArchiveClose {
                     stored_id: "st-arc".into(),
@@ -8389,6 +8516,19 @@ mod tests {
                 &json!({"closed": true}),
             )
             .await;
+            let archived = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("archive work within 5s")
+                .expect("sender alive");
+            let LoopWork::Archived {
+                stored_id,
+                retried,
+                result,
+            } = archived
+            else {
+                panic!("expected archive work");
+            };
+            link.apply_archived(stored_id, retried, result).await;
             assert!(matches!(
                 incoming.try_recv(),
                 Ok(Event::SessionMutated {
