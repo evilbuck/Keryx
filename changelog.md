@@ -15,6 +15,7 @@
 - Post-reconnect delay: queued commands now run before the workspace and skill catalogs are fetched, and the two catalog requests run concurrently instead of serially, so reconnecting no longer blocks user actions behind catalog round-trips (previously up to 60s worst case).
 - Stuck sign-ins: pressing Reconnect during an in-flight connection attempt now aborts it and retries immediately; previously the press was ignored until the 90-second connect bound expired.
 - Streaming stalls: message deltas now use a non-blocking send with a capped in-memory tail (retried every 5s), so a busy UI can no longer stall the network loop; previously a slow UI blocked pings and command processing during fast streams.
+- Wedged writes: socket writes now time out in 5s instead of 30s, so a gateway that stops reading drops the link promptly and the automatic reconnect takes over rather than freezing the network loop.
 
 ### Limitations
 

@@ -24,6 +24,11 @@ const COMPRESS_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const PROBE_SILENCE: Duration = Duration::from_secs(30);
+/// Bound for socket writes. A write that cannot complete in this window means
+/// the gateway stopped reading; dropping the link lets the automatic
+/// reconnect take over instead of stalling the transport loop for a full
+/// RPC response wait.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-runtime cap on delta text buffered while the UI is too slow to keep up.
 /// `MessageComplete` carries the authoritative text, so dropping the front of a
 /// capped tail degrades only live streaming display, never the transcript.
@@ -2135,7 +2140,7 @@ impl Link {
         };
         let text = value.to_string();
         if matches!(
-            tokio::time::timeout(RPC_TIMEOUT, write.send(Message::text(text))).await,
+            tokio::time::timeout(WRITE_TIMEOUT, write.send(Message::text(text))).await,
             Ok(Ok(()))
         ) {
             Ok(())
@@ -2171,7 +2176,7 @@ impl Link {
             Message::Ping(payload) => {
                 let failed = if let Some(write) = self.write.as_mut() {
                     !matches!(
-                        tokio::time::timeout(RPC_TIMEOUT, write.send(Message::Pong(payload))).await,
+                        tokio::time::timeout(WRITE_TIMEOUT, write.send(Message::Pong(payload))).await,
                         Ok(Ok(()))
                     )
                 } else {
