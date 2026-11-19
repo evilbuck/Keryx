@@ -780,6 +780,39 @@ impl WorkSink {
     }
 }
 
+/// Zero-copy shape of the per-token delta frames. Streaming is the hot
+/// path: a `message.delta` frame parses straight into borrowed fields —
+/// no JSON DOM — and dispatches to the delta state machine directly.
+/// Anything that does not match the shape (or any other frame) falls back
+/// to the full `Value` parse in `on_text`, unchanged.
+#[derive(serde::Deserialize)]
+struct DeltaFrame<'a> {
+    #[serde(borrow)]
+    method: &'a str,
+    params: DeltaParams<'a>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeltaParams<'a> {
+    #[serde(borrow)]
+    r#type: &'a str,
+    #[serde(borrow)]
+    session_id: &'a str,
+    payload: DeltaPayload<'a>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeltaPayload<'a> {
+    #[serde(borrow)]
+    text: &'a str,
+    #[serde(borrow, default)]
+    turn_id: &'a str,
+    #[serde(default)]
+    segment: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
 /// A branch request whose earlier pages are fetched off the transport loop.
 struct BranchSeeds {
     stored_id: String,
@@ -859,6 +892,25 @@ struct BranchedPage {
     model: Option<ModelIdentity>,
     before: usize,
     messages: Vec<ChatMessage>,
+}
+
+/// The borrowed fast path for streaming frames: `Some` when `text` is a
+/// `message.delta` event frame, with every field borrowed straight out of
+/// the input — no JSON DOM is built for the frame.
+fn delta_frame_fields(
+    text: &str,
+) -> Option<(&str, &str, &str, i64, i64)> {
+    let frame = serde_json::from_str::<DeltaFrame>(text).ok()?;
+    if frame.method != "event" || frame.params.r#type != "message.delta" {
+        return None;
+    }
+    Some((
+        frame.params.session_id,
+        frame.params.payload.text,
+        frame.params.payload.turn_id,
+        frame.params.payload.segment,
+        frame.params.payload.offset,
+    ))
 }
 
 fn mid_connect(command: Option<Command>) -> MidConnect {
@@ -2686,6 +2738,20 @@ impl Link {
     }
 
     async fn on_text(&mut self, text: &str) {
+        // Streaming is the hot path: a `message.delta` frame parses straight
+        // into borrowed fields with no JSON DOM. The needle pre-filter keeps
+        // every other frame — including big tool outputs and history
+        // replies — on its single full parse; a literal needle inside a
+        // payload falls through to the envelope check and then the fallback,
+        // so routing is unchanged.
+        if text.contains("\"message.delta\"")
+            && let Some((runtime_id, payload_text, turn_id, segment, offset)) =
+                delta_frame_fields(text)
+        {
+            self.on_delta_fields(runtime_id, payload_text, turn_id, segment, offset)
+                .await;
+            return;
+        }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
@@ -2996,12 +3062,27 @@ impl Link {
         let Some(text) = payload.get("text").and_then(Value::as_str) else {
             return;
         };
-        if text.is_empty() {
-            return;
-        }
         let turn_id = payload.get("turn_id").and_then(Value::as_str).unwrap_or("");
         let segment = payload.get("segment").and_then(Value::as_i64).unwrap_or(0);
         let offset = payload.get("offset").and_then(Value::as_i64).unwrap_or(0);
+        self.on_delta_fields(runtime_id, text, turn_id, segment, offset)
+            .await;
+    }
+
+    /// The delta state machine, shared by the borrowed fast path and the
+    /// DOM fallback: accept-ordering against the turn, segment rollover,
+    /// then the non-blocking emit.
+    async fn on_delta_fields(
+        &mut self,
+        runtime_id: &str,
+        text: &str,
+        turn_id: &str,
+        segment: i64,
+        offset: i64,
+    ) {
+        if text.is_empty() {
+            return;
+        }
         let (turn, server_started) = self.ensure_turn(runtime_id, turn_id);
         let accepted = turn.note_accepted();
         if !accepted {
@@ -3031,10 +3112,20 @@ impl Link {
     /// and draining commands. A tail is capped; `MessageComplete` carries the
     /// authoritative text, so trimming is a display-only degradation.
     async fn emit_delta(&mut self, runtime_id: &str, message_id: &str, delta: &str) {
-        let (id, tail) = self
-            .pending_deltas
-            .entry(runtime_id.to_string())
-            .or_insert_with(|| (message_id.to_string(), String::new()));
+        // Steady streaming hits an existing entry on every frame; skip the
+        // key allocation the entry() call would make each time.
+        let (id, tail) = match self.pending_deltas.get_mut(runtime_id) {
+            Some(entry) => entry,
+            None => {
+                self.pending_deltas.insert(
+                    runtime_id.to_string(),
+                    (message_id.to_string(), String::new()),
+                );
+                self.pending_deltas
+                    .get_mut(runtime_id)
+                    .expect("entry inserted above")
+            }
+        };
         if id != message_id {
             // The UI's streaming row moved to a new message. Try to hand over
             // the old tail first; if the channel is still full, the old tail
@@ -6539,6 +6630,105 @@ mod tests {
             jittered(Duration::from_secs(4), 999_999_999),
             Duration::from_nanos(3_999_999_998)
         );
+    }
+
+    #[test]
+    fn delta_frames_parse_borrowed_without_the_json_dom() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+
+            // A raw socket frame through on_text: the borrowed fast path.
+            // Extra unknown fields ride along; turn_id/segment/offset are
+            // absent and take the struct defaults, exactly like the DOM
+            // fallback's unwrap_or values. An empty turn id adopts a
+            // generated message id silently (no TurnRolled).
+            link.on_text(
+                r#"{"method":"event","params":{"type":"message.delta","session_id":"rt","payload":{"text":"hello world","vendor":"x"}}}"#,
+            )
+            .await;
+            match incoming.try_recv().expect("delta") {
+                Event::MessageDelta { runtime_id, delta, .. } => {
+                    assert_eq!(runtime_id, "rt");
+                    assert_eq!(delta, "hello world");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+
+            // Steady state: the second frame reuses the entry (no key
+            // allocation) and honors the accept-ordering offset.
+            link.on_text(
+                r#"{"method":"event","params":{"type":"message.delta","session_id":"rt","payload":{"text":" more","offset":11}}}"#,
+            )
+            .await;
+            match incoming.try_recv().expect("second delta") {
+                Event::MessageDelta { delta, .. } => assert_eq!(delta, " more"),
+                other => panic!("unexpected: {other:?}"),
+            }
+            assert!(incoming.try_recv().is_err());
+
+            // A frame carrying the needle but not the delta shape — text
+            // missing — falls back and is ignored, no misroute, no panic.
+            link.on_text(
+                r#"{"method":"event","params":{"type":"message.delta","session_id":"rt","payload":{"text":null,"note":"mentions \"message.delta\" again"}}}"#,
+            )
+            .await;
+            assert!(incoming.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn needle_inside_a_tool_payload_does_not_take_the_delta_fast_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+
+            // The needle appears inside a tool payload; the envelope check
+            // must reject it and the DOM fallback must route the frame to
+            // the tool handler, not the delta state machine.
+            link.on_text(
+                r#"{"method":"event","params":{"type":"tool.start","session_id":"rt","payload":{"tool":"grep","note":"watching \"message.delta\" frames"}}}"#,
+            )
+            .await;
+            let mut saw_activity = false;
+            while let Ok(event) = incoming.try_recv() {
+                match event {
+                    Event::MessageDelta { .. } => {
+                        panic!("delta misrouted through the borrowed fast path")
+                    }
+                    Event::Activity { .. } => saw_activity = true,
+                    _ => {}
+                }
+            }
+            assert!(
+                saw_activity,
+                "tool frame must reach the tool handler"
+            );
+        });
     }
 
     #[test]
