@@ -734,6 +734,24 @@ impl Link {
         self.close_socket().await;
         self.fail_jobs("The connection closed before the gateway answered.")
             .await;
+        self.sign_in().await?;
+        let ticket = self.request_ticket().await?;
+        self.secrets.truncate(2);
+        self.secrets.push(ticket.clone());
+        let Some(url) = ws_dial_url(&self.origin, &ticket) else {
+            self.retryable = false;
+            self.emit(Event::Connection(ConnectionState::Disconnected(
+                "Could not open the gateway socket.".into(),
+            )))
+            .await;
+            return Err("scheme".into());
+        };
+        self.dial_socket(url).await
+    }
+
+    /// Password sign-in. Emits the connection state for every refusal; a
+    /// rejected credential or login rate limit marks the failure permanent.
+    async fn sign_in(&mut self) -> Result<(), String> {
         let login = self
             .http
             .post(endpoint(&self.origin, "/auth/password-login"))
@@ -754,27 +772,33 @@ impl Link {
                 return Err("Could not reach the gateway.".into());
             }
         };
-        if !login.status().is_success() {
-            let state = if login.status().as_u16() == 401 || login.status().as_u16() == 404 {
-                self.retryable = false;
-                ConnectionState::AuthenticationFailed(
-                    "The gateway rejected the username or password.".into(),
-                )
-            } else if login.status().as_u16() == 429 {
-                self.retryable = false;
-                ConnectionState::AuthenticationFailed(
-                    "Too many login attempts. Try again shortly.".into(),
-                )
-            } else {
-                ConnectionState::Disconnected(format!(
-                    "Login failed (HTTP {}).",
-                    login.status().as_u16()
-                ))
-            };
-            self.emit(Event::Connection(state)).await;
-            return Err("login failed".into());
+        if login.status().is_success() {
+            return Ok(());
         }
-        let ticket_response = match self
+        let state = if login.status().as_u16() == 401 || login.status().as_u16() == 404 {
+            self.retryable = false;
+            ConnectionState::AuthenticationFailed(
+                "The gateway rejected the username or password.".into(),
+            )
+        } else if login.status().as_u16() == 429 {
+            self.retryable = false;
+            ConnectionState::AuthenticationFailed(
+                "Too many login attempts. Try again shortly.".into(),
+            )
+        } else {
+            ConnectionState::Disconnected(format!(
+                "Login failed (HTTP {}).",
+                login.status().as_u16()
+            ))
+        };
+        self.emit(Event::Connection(state)).await;
+        Err("login failed".into())
+    }
+
+    /// Requests the fresh one-connection WebSocket ticket. A 401 here means the
+    /// login session itself was rejected, which is permanent.
+    async fn request_ticket(&mut self) -> Result<String, String> {
+        let response = match self
             .http
             .post(endpoint(&self.origin, "/api/auth/ws-ticket"))
             .send()
@@ -789,7 +813,7 @@ impl Link {
                 return Err("ticket request failed".into());
             }
         };
-        if ticket_response.status().as_u16() == 401 {
+        if response.status().as_u16() == 401 {
             self.retryable = false;
             self.emit(Event::Connection(ConnectionState::AuthenticationFailed(
                 "The gateway did not accept the login session.".into(),
@@ -797,15 +821,15 @@ impl Link {
             .await;
             return Err("ticket unauthorized".into());
         }
-        if !ticket_response.status().is_success() {
+        if !response.status().is_success() {
             self.emit(Event::Connection(ConnectionState::Disconnected(format!(
                 "Could not request a connection ticket (HTTP {}).",
-                ticket_response.status().as_u16()
+                response.status().as_u16()
             ))))
             .await;
             return Err("ticket failed".into());
         }
-        let ticket_body: Value = match ticket_response.json().await {
+        let body: Value = match response.json().await {
             Ok(body) => body,
             Err(_) => {
                 self.emit(Event::Connection(ConnectionState::Disconnected(
@@ -815,40 +839,26 @@ impl Link {
                 return Err("ticket body".into());
             }
         };
-        let Some(ticket) = ticket_body
+        match body
             .get("ticket")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-        else {
-            self.emit(Event::Connection(ConnectionState::Disconnected(
-                "The gateway did not provide a connection ticket.".into(),
-            )))
-            .await;
-            return Err("missing ticket".into());
-        };
-        self.secrets.truncate(2);
-        self.secrets.push(ticket.clone());
-        let mut ws_url = self.origin.clone();
-        let scheme = if self.origin.scheme() == "https" {
-            "wss"
-        } else {
-            "ws"
-        };
-        if ws_url.set_scheme(scheme).is_err() {
-            self.retryable = false;
-            self.emit(Event::Connection(ConnectionState::Disconnected(
-                "Could not open the gateway socket.".into(),
-            )))
-            .await;
-            return Err("scheme".into());
+        {
+            Some(ticket) => Ok(ticket),
+            None => {
+                self.emit(Event::Connection(ConnectionState::Disconnected(
+                    "The gateway did not provide a connection ticket.".into(),
+                )))
+                .await;
+                Err("missing ticket".into())
+            }
         }
-        ws_url.set_path("/api/ws");
-        ws_url
-            .query_pairs_mut()
-            .clear()
-            .append_pair("ticket", &ticket);
-        let url_string: String = ws_url.into();
+    }
+
+    /// Dials the ticketed WebSocket and installs both halves as the live link.
+    async fn dial_socket(&mut self, url: url::Url) -> Result<(), String> {
+        let url_string: String = url.into();
         let connected =
             tokio::time::timeout(RPC_TIMEOUT, tokio_tungstenite::connect_async(&url_string)).await;
         drop(url_string);
@@ -4244,6 +4254,20 @@ fn trim_to_cap(text: &mut String, cap: usize) {
     *text = rest;
 }
 
+/// The WebSocket dial URL for a one-connection ticket: same origin with a
+/// ws/wss scheme, the `/api/ws` path, and the ticket as the only query pair.
+/// Returns `None` when the scheme flip is impossible for this origin.
+fn ws_dial_url(origin: &url::Url, ticket: &str) -> Option<url::Url> {
+    let mut url = origin.clone();
+    let scheme = if origin.scheme() == "https" { "wss" } else { "ws" };
+    url.set_scheme(scheme).ok()?;
+    url.set_path("/api/ws");
+    url.query_pairs_mut()
+        .clear()
+        .append_pair("ticket", ticket);
+    Some(url)
+}
+
 fn http_client(origin: &url::Url) -> Result<reqwest::Client, String> {
     let expected = origin.clone();
     reqwest::Client::builder()
@@ -6091,6 +6115,22 @@ mod tests {
             assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
             assert_eq!(link.turns["rt"].generation, 4);
         });
+    }
+
+    #[test]
+    fn ws_dial_url_flips_scheme_sets_path_and_carries_only_the_ticket() {
+        let origin = url::Url::parse("https://gw.example:8443").expect("origin");
+        let url = ws_dial_url(&origin, "TK-1").expect("dial url");
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.host_str(), Some("gw.example"));
+        assert_eq!(url.port(), Some(8443));
+        assert_eq!(url.path(), "/api/ws");
+        assert_eq!(url.query(), Some("ticket=TK-1"));
+
+        let plain = url::Url::parse("http://gw.example").expect("origin");
+        let url = ws_dial_url(&plain, "a b").expect("dial url");
+        assert_eq!(url.scheme(), "ws");
+        assert_eq!(url.query(), Some("ticket=a+b"));
     }
 
     #[test]

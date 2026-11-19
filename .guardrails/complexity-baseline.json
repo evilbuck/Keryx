@@ -26,11 +26,6 @@
   },
   {
     "file": "src/backend.rs",
-    "function": "connect",
-    "complexity": 13
-  },
-  {
-    "file": "src/backend.rs",
     "function": "maintain",
     "complexity": 11
   },
