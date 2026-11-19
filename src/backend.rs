@@ -514,6 +514,12 @@ struct Link {
     last_inbound: Instant,
     /// Whether the last disconnect was transient and worth retrying automatically.
     retryable: bool,
+    /// Queueable work parked while fully disconnected behind a retryable
+    /// failure: the next backoff attempt is pulled forward to the
+    /// schedule's minimum step. Consumed by `run()`'s wake clamp — one
+    /// accelerated attempt per parked command, so a down gateway is
+    /// retried at the 1s floor, never hammered.
+    reconnect_wake: bool,
     /// Absorbs duplicate login-session rejections while one teardown is in
     /// flight; reset when a fresh sign-in succeeds.
     auth_reject_seen: bool,
@@ -546,7 +552,9 @@ async fn run(
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
     let mut attempts: u32 = 0;
     let mut retry_at: Option<tokio::time::Instant> = None;
-    let track = |link: &Link, attempts: &mut u32, retry_at: &mut Option<tokio::time::Instant>| {
+    let track = |link: &mut Link,
+                 attempts: &mut u32,
+                 retry_at: &mut Option<tokio::time::Instant>| {
         *retry_at = reconnect_deadline(
             link.write.is_some(),
             link.retryable,
@@ -555,6 +563,9 @@ async fn run(
             tokio::time::Instant::now(),
             jitter_subsec(),
         );
+        // Work the user parked while fully disconnected pulls the next
+        // attempt forward, but never past the schedule's minimum step.
+        apply_reconnect_wake(link, retry_at);
     };
     loop {
         let command = tokio::select! {
@@ -562,12 +573,12 @@ async fn run(
             command = incoming.recv() => command,
             frame = next_frame(&mut link.read) => {
                 link.on_socket(frame).await;
-                track(&link, &mut attempts, &mut retry_at);
+                track(&mut link, &mut attempts, &mut retry_at);
                 continue;
             }
             _ = maintenance.tick() => {
                 link.maintain().await;
-                track(&link, &mut attempts, &mut retry_at);
+                track(&mut link, &mut attempts, &mut retry_at);
                 continue;
             }
             work = work_rx.recv() => {
@@ -636,7 +647,7 @@ async fn run(
                         }
                     }
                 }
-                track(&link, &mut attempts, &mut retry_at);
+                track(&mut link, &mut attempts, &mut retry_at);
                 continue;
             }
             _ = retry_wait(retry_at) => {
@@ -644,7 +655,7 @@ async fn run(
                 if !open_link(&mut link, &mut incoming).await {
                     break;
                 }
-                track(&link, &mut attempts, &mut retry_at);
+                track(&mut link, &mut attempts, &mut retry_at);
                 continue;
             }
         };
@@ -659,11 +670,11 @@ async fn run(
             if !open_link(&mut link, &mut incoming).await {
                 break;
             }
-            track(&link, &mut attempts, &mut retry_at);
+            track(&mut link, &mut attempts, &mut retry_at);
             continue;
         }
         link.handle(command).await;
-        track(&link, &mut attempts, &mut retry_at);
+        track(&mut link, &mut attempts, &mut retry_at);
     }
     link.close_socket().await;
 }
@@ -720,6 +731,44 @@ fn reconnect_deadline(
     }
     *attempts = attempts.saturating_add(1);
     Some(now + jittered(reconnect_delay(*attempts), subsec))
+}
+
+/// Clamps a scheduled reconnect attempt that parked user work is waiting
+/// on to the schedule's minimum step: the jittered 1s backoff, never
+/// sooner. A gateway that is down is still retried at that floor, so a
+/// queue-full of activity cannot hammer it; a gateway whose backoff had
+/// grown to the 30s cap reconnects within a second of the user asking
+/// for it. Each parked command buys exactly one accelerated attempt —
+/// the wake is consumed when the deadline is clamped, so a failing
+/// attempt resumes the normal backoff schedule.
+fn woke_deadline(
+    pending: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    subsec: u32,
+) -> Option<tokio::time::Instant> {
+    let floor = now + jittered(reconnect_delay(1), subsec);
+    pending.map(|deadline| deadline.min(floor))
+}
+
+/// Applies a parked-command wake to the reconnect schedule. A scheduled
+/// attempt compresses to the backoff floor and consumes the wake (the
+/// flag cannot pin retries at 1s — each parked command buys exactly one
+/// accelerated attempt); a connected link has nothing to wake; an
+/// in-flight attempt keeps the wake for the schedule its failure
+/// produces.
+fn apply_reconnect_wake(link: &mut Link, retry_at: &mut Option<tokio::time::Instant>) {
+    if !link.reconnect_wake {
+        return;
+    }
+    match *retry_at {
+        Some(deadline) => {
+            *retry_at =
+                woke_deadline(Some(deadline), tokio::time::Instant::now(), jitter_subsec());
+            link.reconnect_wake = false;
+        }
+        None if link.write.is_some() => link.reconnect_wake = false,
+        None => {}
+    }
 }
 
 async fn retry_wait(retry_at: Option<tokio::time::Instant>) {
@@ -1090,6 +1139,7 @@ impl Link {
             work,
             work_rx: Some(work_rx),
             retryable: false,
+            reconnect_wake: false,
             auth_reject_seen: false,
         })
     }
@@ -1402,6 +1452,13 @@ impl Link {
 
     async fn handle_unready_command(&mut self, command: Command) {
         if self.write.is_some() || is_queueable_while_connecting(&command) {
+            // Parked while fully disconnected behind a retryable failure:
+            // the user is waiting on this work, so the next backoff
+            // attempt is pulled forward (`woke_deadline` consumes the
+            // wake, one accelerated attempt per parked command).
+            if self.write.is_none() && self.retryable {
+                self.reconnect_wake = true;
+            }
             self.queued.push_back(command);
             return;
         }
@@ -7026,6 +7083,84 @@ mod tests {
             jittered(Duration::from_secs(4), 999_999_999),
             Duration::from_nanos(3_999_999_998)
         );
+    }
+
+    #[test]
+    fn queued_work_pulls_a_far_reconnect_attempt_to_the_backoff_floor() {
+        let now = tokio::time::Instant::now();
+        // Fixed jitter sample: the 1s schedule's jittered floor lands at
+        // exactly 750ms with subsec 500ms.
+        let subsec = 500_000_000;
+
+        // A fully-grown 30s backoff compresses to the floor when user
+        // work is waiting on the attempt.
+        let woken = woke_deadline(Some(now + Duration::from_secs(30)), now, subsec)
+            .expect("the attempt stays scheduled");
+        assert_eq!(woken, now + Duration::from_millis(750));
+
+        // A deadline already at or inside the floor is untouched: the
+        // wake never fires an attempt earlier than the schedule's own
+        // minimum step.
+        let soon = now + Duration::from_millis(500);
+        assert_eq!(woke_deadline(Some(soon), now, subsec), Some(soon));
+
+        // Nothing scheduled stays unscheduled.
+        assert_eq!(woke_deadline(None, now, subsec), None);
+    }
+
+    #[test]
+    fn queued_commands_while_disconnected_wake_the_next_attempt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut events_rx) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("http://gateway.invalid").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+
+            // Fully disconnected behind a transient failure: queueable
+            // work parks and marks the wake.
+            link.retryable = true;
+            link.handle_unready_command(Command::List { offset: 0 }).await;
+            assert_eq!(link.queued.len(), 1);
+            assert!(link.reconnect_wake, "parked work wakes the attempt");
+
+            // Non-queueable work is rejected and wakes nothing.
+            link.reconnect_wake = false;
+            link.handle_unready_command(Command::Submit {
+                runtime_id: "runtime".into(),
+                text: "hello".into(),
+                attachments: Vec::new(),
+            })
+            .await;
+            assert!(!link.reconnect_wake);
+            assert!(
+                matches!(events_rx.try_recv(), Ok(Event::Error { operation, .. }) if operation == "connect"),
+                "the submit was rejected with the shared unready message"
+            );
+
+            // A permanent failure (rejected password) never wakes.
+            link.retryable = false;
+            link.reconnect_wake = false;
+            link.handle_unready_command(Command::List { offset: 8 }).await;
+            assert!(!link.reconnect_wake, "auth failure wakes nothing");
+
+            // A live (not-ready) socket parks without waking: the
+            // attempt already succeeded, only the ready frame pends.
+            link.retryable = true;
+            link.reconnect_wake = false;
+            install_fake_writer(&mut link).await;
+            link.handle_unready_command(Command::List { offset: 0 }).await;
+            assert!(!link.reconnect_wake, "no wake while connected");
+        });
     }
 
     #[test]
