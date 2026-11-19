@@ -86,6 +86,8 @@ Attachment uploads ride the same shape: `begin_submit` hands the staged images t
 
 Branching a conversation fetches its earlier visible pages the same way: `begin_branch` hands the page walk (up to ceil(before_loaded / PAGE) history round trips) to a task and applies the seeds on the loop when they arrive, so a slow history endpoint cannot stall frames while a branch is prepared. The branch-completion page (the new conversation's first rows, with the fallback seed riding on error or an empty page) and the archive patches (including the deferred fire-and-forget patch after a message completes) also run off the loop — a mechanical sweep of HTTP-helper call sites confirms no user-initiated HTTP call executes on the transport loop anywhere.
 
+Every off-loop fetch is stamped with the connection epoch it was spawned on. `close_socket` bumps the epoch on every teardown — drop, reconnect, shutdown — and the work-channel dispatch in `run()` discards any result whose epoch no longer matches, so a fetch that started under one connection never applies state to the next: a resume page fetched before a drop cannot adopt a turn for a runtime the new connection never resumed, and stale branch, mutation, archive, and upload results are dropped rather than misapplied. Tasks carry the channel as a `WorkSink` bound to the live epoch, so a future task cannot forget the stamp — the plain sender type never reaches a task signature.
+
 Socket writes (JSON-RPC frames and Pong replies) are bounded by a 5s `WRITE_TIMEOUT`, far below the 30s RPC response wait: a gateway that stops reading its socket fails the write within 5s, the link drops, and automatic reconnect takes over instead of stalling the transport loop.
 
 ## Configuration

@@ -33,5 +33,7 @@
 - Resume stalls: opening a conversation no longer fetches its saved history on the network loop, so a slow gateway cannot freeze frame processing while a conversation loads — including the automatic reload after reconnecting (previously up to 30s of transport-loop blockage on the most common open path).
 - Undo and compress stalls: rewinding or compacting a conversation no longer fetches the updated history on the network loop, so a slow gateway cannot freeze frame processing while the action completes (previously up to 30s of transport-loop blockage per action).
 
+- Ghost turns after a reconnect: off-loop fetches are now stamped with the connection they ran under, and results from a torn-down connection are discarded — so a resume that raced a disconnect can no longer leave a permanently "submitted" phantom turn, send requests for a dead runtime, or replay stale approval prompts on the new connection.
+
 ### Limitations
 - Up to six files can be attached per message. Each file is limited to 15 MB, and extracted document text is limited to 1 MB per file. Unsupported binary files and PDFs without extractable text are rejected; scanned PDFs require OCR first.

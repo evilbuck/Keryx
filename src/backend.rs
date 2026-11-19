@@ -448,6 +448,10 @@ struct Link {
     write: Option<futures_util::stream::SplitSink<Socket, Message>>,
     next_id: u64,
     next_turn_generation: u64,
+    /// Connection epoch: bumped on every socket teardown, so off-loop work
+    /// results stamped with an older epoch are discarded instead of applied
+    /// to a connection they were not fetched for.
+    epoch: u64,
     message_counts: HashMap<String, usize>,
     pinned_sessions: HashSet<String>,
     deferred_mutations: HashMap<String, (Option<String>, Option<bool>)>,
@@ -465,9 +469,10 @@ struct Link {
     pending_deltas: HashMap<String, (String, String)>,
     pending_reasoning: HashMap<String, (bool, String)>,
     /// Sender for off-loop fetch results that need on-loop application;
-    /// `run()` takes the receiving half before the select loop starts.
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
-    work_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LoopWork>>,
+    /// `run()` takes the receiving half before the select loop starts. Each
+    /// result carries the connection epoch it was spawned on.
+    work: tokio::sync::mpsc::UnboundedSender<StampedWork>,
+    work_rx: Option<tokio::sync::mpsc::UnboundedReceiver<StampedWork>>,
     heartbeat: bool,
     ready: bool,
     opened_at: Option<Instant>,
@@ -527,49 +532,55 @@ async fn run(
                 continue;
             }
             work = work_rx.recv() => {
-                match work {
-                    Some(LoopWork::Listed(listed)) => {
-                        link.apply_listed(*listed).await;
+                // A result whose epoch predates the current connection is
+                // stale: its fetch ran under a socket that has since torn
+                // down, so applying it would act on a dead runtime.
+                if let Some(stamped) = work
+                    && let Some(work) = link.live_work(stamped)
+                {
+                    match work {
+                        LoopWork::Listed(listed) => {
+                            link.apply_listed(*listed).await;
+                        }
+                        LoopWork::Uploaded {
+                            runtime_id,
+                            generation,
+                            result,
+                            prompt_text,
+                        } => {
+                            link.apply_uploaded(runtime_id, generation, result, prompt_text)
+                                .await;
+                        }
+                        LoopWork::Mutated {
+                            stored_id,
+                            mutation,
+                            result,
+                        } => {
+                            link.apply_mutated(stored_id, mutation, result).await;
+                        }
+                        LoopWork::Branch(outcome) => {
+                            link.apply_branch(outcome.request, outcome.seeds).await;
+                        }
+                        LoopWork::Readonly(outcome) => {
+                            link.apply_readonly(*outcome).await;
+                        }
+                        LoopWork::Resumed(page) => {
+                            link.apply_resumed(*page).await;
+                        }
+                        LoopWork::Page(page) => {
+                            link.apply_synced_page(*page).await;
+                        }
+                        LoopWork::Branched(page) => {
+                            link.apply_branched(*page).await;
+                        }
+                        LoopWork::Archived {
+                            stored_id,
+                            retried,
+                            result,
+                        } => {
+                            link.apply_archived(stored_id, retried, result).await;
+                        }
                     }
-                    Some(LoopWork::Uploaded {
-                        runtime_id,
-                        generation,
-                        result,
-                        prompt_text,
-                    }) => {
-                        link.apply_uploaded(runtime_id, generation, result, prompt_text)
-                            .await;
-                    }
-                    Some(LoopWork::Mutated {
-                        stored_id,
-                        mutation,
-                        result,
-                    }) => {
-                        link.apply_mutated(stored_id, mutation, result).await;
-                    }
-                    Some(LoopWork::Branch(outcome)) => {
-                        link.apply_branch(outcome.request, outcome.seeds).await;
-                    }
-                    Some(LoopWork::Readonly(outcome)) => {
-                        link.apply_readonly(*outcome).await;
-                    }
-                    Some(LoopWork::Resumed(page)) => {
-                        link.apply_resumed(*page).await;
-                    }
-                    Some(LoopWork::Page(page)) => {
-                        link.apply_synced_page(*page).await;
-                    }
-                    Some(LoopWork::Branched(page)) => {
-                        link.apply_branched(*page).await;
-                    }
-                    Some(LoopWork::Archived {
-                        stored_id,
-                        retried,
-                        result,
-                    }) => {
-                        link.apply_archived(stored_id, retried, result).await;
-                    }
-                    None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
                 continue;
@@ -687,6 +698,35 @@ enum LoopWork {
         retried: bool,
         result: Result<PatchOutcome, String>,
     },
+}
+
+/// An off-loop work result stamped with the connection epoch it was spawned
+/// on. A drop or reconnect bumps the link's epoch in `close_socket`, so
+/// `run()` discards results whose epoch no longer matches: a fetch started
+/// under one connection never applies state to the next (a stale resume
+/// would otherwise adopt a turn for a runtime the new connection never
+/// resumed).
+struct StampedWork {
+    epoch: u64,
+    work: LoopWork,
+}
+
+/// The work channel together with the connection epoch it was spawned on.
+/// Off-loop tasks deliver through the sink, so every result is stamped with
+/// the live epoch; a task cannot forget the stamp, because the plain sender
+/// type never reaches a task signature.
+#[derive(Clone)]
+struct WorkSink {
+    sender: tokio::sync::mpsc::UnboundedSender<StampedWork>,
+    epoch: u64,
+}
+
+impl WorkSink {
+    fn deliver(&self, work: LoopWork) {
+        let _ = self
+            .sender
+            .send(StampedWork { epoch: self.epoch, work });
+    }
 }
 
 /// A branch request whose earlier pages are fetched off the transport loop.
@@ -852,6 +892,7 @@ impl Link {
             write: None,
             next_id: 1,
             next_turn_generation: 0,
+            epoch: 0,
             message_counts: HashMap::new(),
             pinned_sessions: HashSet::new(),
             deferred_mutations: HashMap::new(),
@@ -1341,7 +1382,7 @@ impl Link {
         tokio::spawn(upload_images_task(
             self.http.clone(),
             self.origin.clone(),
-            self.work.clone(),
+            self.work_sink(),
             runtime_id,
             generation,
             images,
@@ -1588,7 +1629,7 @@ impl Link {
                 self.http.clone(),
                 self.origin.clone(),
                 before_loaded,
-                self.work.clone(),
+                self.work_sink(),
                 request,
             ));
             return;
@@ -1891,11 +1932,11 @@ impl Link {
     /// the post-reconnect refresh). The fetched rows re-enter the loop via
     /// the work channel, where the listing caches and cleaning live.
     fn list(&self, offset: usize) {
-        let work = self.work.clone();
+        let work = self.work_sink();
         let http = self.http.clone();
         let origin = self.origin.clone();
         tokio::spawn(async move {
-            let _ = work.send(LoopWork::Listed(Box::new(
+            work.deliver(LoopWork::Listed(Box::new(
                 fetch_sessions(&http, &origin, offset).await,
             )));
         });
@@ -1957,7 +1998,7 @@ impl Link {
         tokio::spawn(patch_session_task(
             self.http.clone(),
             self.origin.clone(),
-            self.work.clone(),
+            self.work_sink(),
             stored_id,
             mutation,
             body,
@@ -2044,7 +2085,7 @@ impl Link {
         tokio::spawn(archive_patch_task(
             self.http.clone(),
             self.origin.clone(),
-            self.work.clone(),
+            self.work_sink(),
             stored_id,
             retried,
             body,
@@ -3404,7 +3445,7 @@ impl Link {
         tokio::spawn(synced_page_task(
             self.http.clone(),
             self.origin.clone(),
-            self.work.clone(),
+            self.work_sink(),
             SyncedPage {
                 stored_id,
                 before,
@@ -3669,7 +3710,7 @@ impl Link {
         tokio::spawn(branched_page_task(
             self.http.clone(),
             self.origin.clone(),
-            self.work.clone(),
+            self.work_sink(),
             BranchedPage {
                 stored_id,
                 runtime_id,
@@ -4349,7 +4390,7 @@ impl Link {
         tokio::spawn(resumed_history_task(
             self.http.clone(),
             self.origin.clone(),
-            self.work.clone(),
+            self.work_sink(),
             ResumedPage {
                 stored_id,
                 runtime_id,
@@ -4450,7 +4491,7 @@ impl Link {
         tokio::spawn(readonly_history_task(
             self.http.clone(),
             self.origin.clone(),
-            self.work.clone(),
+            self.work_sink(),
             stored_id,
             reason,
             cached,
@@ -4629,6 +4670,26 @@ impl Link {
         self.pending_deltas.clear();
         self.pending_reasoning.clear();
         self.runtime_of.clear();
+        // Stales every in-flight off-loop fetch: results stamped with an
+        // earlier epoch are discarded instead of applied to the next
+        // connection.
+        self.epoch += 1;
+    }
+
+    /// Unwraps a work result stamped on a still-live connection. `None`
+    /// means the fetch belonged to a connection that has since torn down;
+    /// `run()` drops it rather than applying stale state.
+    fn live_work(&self, stamped: StampedWork) -> Option<LoopWork> {
+        (stamped.epoch == self.epoch).then_some(stamped.work)
+    }
+
+    /// The work channel stamped with the current connection epoch; task
+    /// launchers hand this to spawned fetches.
+    fn work_sink(&self) -> WorkSink {
+        WorkSink {
+            sender: self.work.clone(),
+            epoch: self.epoch,
+        }
     }
 }
 
@@ -4916,11 +4977,11 @@ async fn branch_seeds_task(
     http: reqwest::Client,
     origin: url::Url,
     before_loaded: usize,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     request: BranchSeeds,
 ) {
     let seeds = fetch_earlier_pages(&http, &origin, &request.stored_id, before_loaded).await;
-    let _ = work.send(LoopWork::Branch(Box::new(BranchSeedsOutcome {
+    work.deliver(LoopWork::Branch(Box::new(BranchSeedsOutcome {
         request,
         seeds,
     })));
@@ -4949,13 +5010,13 @@ async fn fetch_earlier_pages(
 async fn readonly_history_task(
     http: reqwest::Client,
     origin: url::Url,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     stored_id: String,
     reason: String,
     cached: Option<usize>,
 ) {
     let result = readonly_history(&http, &origin, &stored_id, cached).await;
-    let _ = work.send(LoopWork::Readonly(Box::new(ReadonlyOutcome {
+    work.deliver(LoopWork::Readonly(Box::new(ReadonlyOutcome {
         stored_id,
         reason,
         result,
@@ -5015,13 +5076,13 @@ async fn readonly_history(
 async fn resumed_history_task(
     http: reqwest::Client,
     origin: url::Url,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     mut page: ResumedPage,
     limit: usize,
 ) {
     let messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
     page.messages = messages;
-    let _ = work.send(LoopWork::Resumed(Box::new(page)));
+    work.deliver(LoopWork::Resumed(Box::new(page)));
 }
 
 /// A post-sync history page (undo or compress), off the transport loop; the
@@ -5029,12 +5090,12 @@ async fn resumed_history_task(
 async fn synced_page_task(
     http: reqwest::Client,
     origin: url::Url,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     mut page: SyncedPage,
     limit: usize,
 ) {
     page.messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
-    let _ = work.send(LoopWork::Page(Box::new(page)));
+    work.deliver(LoopWork::Page(Box::new(page)));
 }
 
 /// The branched conversation's first page, off the transport loop; on error
@@ -5042,7 +5103,7 @@ async fn synced_page_task(
 async fn branched_page_task(
     http: reqwest::Client,
     origin: url::Url,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     mut page: BranchedPage,
     limit: usize,
 ) {
@@ -5050,7 +5111,7 @@ async fn branched_page_task(
         Ok(rows) if !rows.is_empty() => rows,
         _ => std::mem::take(&mut page.fallback_messages),
     };
-    let _ = work.send(LoopWork::Branched(Box::new(page)));
+    work.deliver(LoopWork::Branched(Box::new(page)));
 }
 
 /// The archive patch as its own task: the fenced patch (and its one
@@ -5059,13 +5120,13 @@ async fn branched_page_task(
 async fn archive_patch_task(
     http: reqwest::Client,
     origin: url::Url,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     stored_id: String,
     retried: bool,
     body: Value,
 ) {
     let result = patch_session_http(&http, &origin, &stored_id, &body).await;
-    let _ = work.send(LoopWork::Archived {
+    work.deliver(LoopWork::Archived {
         stored_id,
         retried,
         result,
@@ -5078,13 +5139,13 @@ async fn archive_patch_task(
 async fn patch_session_task(
     http: reqwest::Client,
     origin: url::Url,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     stored_id: String,
     mutation: SessionMutation,
     body: Value,
 ) {
     let result = patch_session_http(&http, &origin, &stored_id, &body).await;
-    let _ = work.send(LoopWork::Mutated {
+    work.deliver(LoopWork::Mutated {
         stored_id,
         mutation,
         result,
@@ -5178,7 +5239,7 @@ async fn upload_chat_image_http(
 async fn upload_images_task(
     http: reqwest::Client,
     origin: url::Url,
-    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work: WorkSink,
     runtime_id: String,
     generation: u64,
     images: Vec<StagedImage>,
@@ -5191,7 +5252,7 @@ async fn upload_images_task(
     )
     .await
     .map(VecDeque::from);
-    let _ = work.send(LoopWork::Uploaded {
+    work.deliver(LoopWork::Uploaded {
         runtime_id,
         generation,
         result,
@@ -6846,7 +6907,7 @@ mod tests {
                 .await
                 .expect("listed within 5s")
                 .expect("sender alive");
-            let LoopWork::Listed(listed) = listed else {
+            let StampedWork { work: LoopWork::Listed(listed), .. } = listed else {
                 panic!("expected a fetched session list");
             };
             let Ok(event) = *listed else {
@@ -6877,6 +6938,62 @@ mod tests {
                 (stored_id.as_str(), messages.len(), messages[0].text.as_str()),
                 ("st-1", 2, "first")
             );
+        });
+    }
+
+    #[test]
+    fn stale_work_results_discarded_after_reconnect() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let origin = spawn_sessions_http(
+                r#"{"total":1,"sessions":[{"id":"st-1","title":"Any","source":"tui","message_count":3,"started_at":1794452594}]}"#,
+            )
+            .await;
+            let (events, _incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "top-secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+
+            // While the connection is live, a fetched list re-enters the
+            // loop and applies.
+            link.list(0);
+            let live = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("list within 5s")
+                .expect("sender alive");
+            assert!(link.live_work(live).is_some());
+
+            // A teardown between spawn and delivery stales the result: a
+            // resume fetched under the dropped connection would otherwise
+            // adopt a turn for a runtime the next connection never resumed.
+            link.list(0);
+            link.close_socket().await;
+            let stale = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("stale list within 5s")
+                .expect("sender alive");
+            assert_eq!(stale.epoch, 0);
+            assert!(link.live_work(stale).is_none());
+
+            // Work spawned after the teardown stamps the new epoch and
+            // applies again.
+            link.list(0);
+            let fresh = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("fresh list within 5s")
+                .expect("sender alive");
+            assert_eq!(fresh.epoch, 1);
+            assert!(link.live_work(fresh).is_some());
         });
     }
 
@@ -6947,11 +7064,14 @@ mod tests {
                 .await
                 .expect("upload work within 5s")
                 .expect("sender alive");
-            let LoopWork::Uploaded {
-                runtime_id,
-                generation,
-                result,
-                prompt_text,
+            let StampedWork {
+                work: LoopWork::Uploaded {
+                    runtime_id,
+                    generation,
+                    result,
+                    prompt_text,
+                },
+                ..
             } = uploaded
             else {
                 panic!("expected upload work");
@@ -7033,10 +7153,13 @@ mod tests {
                     .await
                     .expect("mutation work within 5s")
                     .expect("sender alive");
-            let LoopWork::Mutated {
-                stored_id,
-                mutation,
-                result,
+            let StampedWork {
+                work: LoopWork::Mutated {
+                    stored_id,
+                    mutation,
+                    result,
+                },
+                ..
             } = mutated
             else {
                 panic!("expected mutation work");
@@ -7140,7 +7263,7 @@ mod tests {
                     .await
                     .expect("branch work within 5s")
                     .expect("sender alive");
-            let LoopWork::Branch(outcome) = branched else {
+            let StampedWork { work: LoopWork::Branch(outcome), .. } = branched else {
                 panic!("expected branch work");
             };
             let BranchSeedsOutcome { request, seeds } = *outcome;
@@ -7226,7 +7349,7 @@ mod tests {
                     .await
                     .expect("readonly work within 5s")
                     .expect("sender alive");
-            let LoopWork::Readonly(outcome) = readonly else {
+            let StampedWork { work: LoopWork::Readonly(outcome), .. } = readonly else {
                 panic!("expected readonly work");
             };
             link.apply_readonly(*outcome).await;
@@ -7320,7 +7443,7 @@ mod tests {
                     .await
                     .expect("resume work within 5s")
                     .expect("sender alive");
-            let LoopWork::Resumed(page) = resumed else {
+            let StampedWork { work: LoopWork::Resumed(page), .. } = resumed else {
                 panic!("expected resume work");
             };
             link.apply_resumed(*page).await;
@@ -8272,7 +8395,7 @@ mod tests {
                 .await
                 .expect("branched page within 5s")
                 .expect("sender alive");
-            let LoopWork::Branched(page) = paged else {
+            let StampedWork { work: LoopWork::Branched(page), .. } = paged else {
                 panic!("expected branched page work");
             };
             link.apply_branched(*page).await;
@@ -8318,7 +8441,7 @@ mod tests {
                 .await
                 .expect("reopened page within 5s")
                 .expect("sender alive");
-            let LoopWork::Branched(page) = reopened else {
+            let StampedWork { work: LoopWork::Branched(page), .. } = reopened else {
                 panic!("expected reopened page work");
             };
             link.apply_branched(*page).await;
@@ -8520,10 +8643,13 @@ mod tests {
                 .await
                 .expect("archive work within 5s")
                 .expect("sender alive");
-            let LoopWork::Archived {
-                stored_id,
-                retried,
-                result,
+            let StampedWork {
+                work: LoopWork::Archived {
+                    stored_id,
+                    retried,
+                    result,
+                },
+                ..
             } = archived
             else {
                 panic!("expected archive work");
@@ -8659,7 +8785,7 @@ mod tests {
                 .await
                 .expect("compress page within 5s")
                 .expect("sender alive");
-            let LoopWork::Page(page) = paged else {
+            let StampedWork { work: LoopWork::Page(page), .. } = paged else {
                 panic!("expected compress page work");
             };
             sync_link.apply_synced_page(*page).await;
