@@ -568,6 +568,25 @@ enum OpenStop {
     Ready,
     Failed,
     TimedOut,
+    Restart,
+}
+
+/// How a command that arrives mid-connect affects the attempt.
+enum MidConnect {
+    /// Park the command; it drains once the gateway reports ready.
+    Queue(Command),
+    /// Abort the attempt and retry immediately.
+    Restart,
+    /// Stop connecting.
+    Shutdown,
+}
+
+fn mid_connect(command: Option<Command>) -> MidConnect {
+    match command {
+        None | Some(Command::Shutdown) => MidConnect::Shutdown,
+        Some(Command::Reconnect) => MidConnect::Restart,
+        Some(command) => MidConnect::Queue(command),
+    }
 }
 
 async fn open_link(
@@ -575,36 +594,48 @@ async fn open_link(
     incoming: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
 ) -> bool {
     let mut waiting = VecDeque::new();
-    let stop = {
-        let connection = link.connect();
-        tokio::pin!(connection);
-        let bound = tokio::time::sleep(CONNECT_TIMEOUT);
-        tokio::pin!(bound);
-        loop {
-            tokio::select! {
-                biased;
-                command = incoming.recv() => match command {
-                    None | Some(Command::Shutdown) => break OpenStop::Shutdown,
-                    Some(Command::Reconnect) => {},
-                    Some(command) => waiting.push_back(command),
-                },
-                result = &mut connection => break match result {
-                    Ok(()) => OpenStop::Ready,
-                    Err(_) => OpenStop::Failed,
-                },
-                _ = &mut bound => break OpenStop::TimedOut,
+    loop {
+        let stop = {
+            let connection = link.connect();
+            tokio::pin!(connection);
+            let bound = tokio::time::sleep(CONNECT_TIMEOUT);
+            tokio::pin!(bound);
+            loop {
+                tokio::select! {
+                    biased;
+                    command = incoming.recv() => match mid_connect(command) {
+                        MidConnect::Shutdown => break OpenStop::Shutdown,
+                        MidConnect::Restart => break OpenStop::Restart,
+                        MidConnect::Queue(command) => waiting.push_back(command),
+                    },
+                    result = &mut connection => break match result {
+                        Ok(()) => OpenStop::Ready,
+                        Err(_) => OpenStop::Failed,
+                    },
+                    _ = &mut bound => break OpenStop::TimedOut,
+                }
             }
+        };
+        // Leaving the block drops the in-flight attempt, cancelling its
+        // HTTP requests and socket dial.
+        if matches!(stop, OpenStop::Shutdown) {
+            link.queued.extend(waiting);
+            return false;
         }
-    };
-    if matches!(stop, OpenStop::TimedOut) {
-        link.close_socket().await;
-        link.emit(Event::Connection(ConnectionState::Disconnected(
-            "The gateway connection timed out.".into(),
-        )))
-        .await;
+        if matches!(stop, OpenStop::TimedOut) {
+            link.close_socket().await;
+            link.emit(Event::Connection(ConnectionState::Disconnected(
+                "The gateway connection timed out.".into(),
+            )))
+            .await;
+        }
+        if !matches!(stop, OpenStop::Restart) {
+            link.queued.extend(waiting);
+            return true;
+        }
+        // Restart: retry the sign-in immediately instead of waiting out the
+        // connect bound against a stuck gateway.
     }
-    link.queued.extend(waiting);
-    !matches!(stop, OpenStop::Shutdown)
 }
 
 async fn next_frame(
@@ -5187,6 +5218,25 @@ mod tests {
         assert!(running.finish());
         assert_eq!(running.phase, TurnPhase::Terminal);
         assert!(!running.accept_interrupt(4));
+    }
+
+    #[test]
+    fn reconnect_pressed_mid_connect_aborts_and_retries_instead_of_waiting() {
+        assert!(matches!(mid_connect(None), MidConnect::Shutdown));
+        assert!(matches!(
+            mid_connect(Some(Command::Shutdown)),
+            MidConnect::Shutdown
+        ));
+        // The old behavior swallowed this press and let the attempt run to the
+        // 90s connect bound; it must now restart the sign-in immediately.
+        assert!(matches!(
+            mid_connect(Some(Command::Reconnect)),
+            MidConnect::Restart
+        ));
+        assert!(matches!(
+            mid_connect(Some(Command::List { offset: 0 })),
+            MidConnect::Queue(_)
+        ));
     }
 
     #[test]
