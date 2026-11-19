@@ -464,6 +464,10 @@ struct Link {
     /// flag their flush must replay.
     pending_deltas: HashMap<String, (String, String)>,
     pending_reasoning: HashMap<String, (bool, String)>,
+    /// Sender for off-loop fetch results that need on-loop application;
+    /// `run()` takes the receiving half before the select loop starts.
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    work_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LoopWork>>,
     heartbeat: bool,
     ready: bool,
     opened_at: Option<Instant>,
@@ -490,6 +494,12 @@ async fn run(
         link.close_socket().await;
         return;
     }
+    // The link's off-loop fetch results re-enter the loop here; the channel
+    // halves were created with the link, so this take is structural.
+    let mut work_rx = link
+        .work_rx
+        .take()
+        .expect("run owns the loop work channel once");
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
     let mut attempts: u32 = 0;
     let mut retry_at: Option<tokio::time::Instant> = None;
@@ -513,6 +523,13 @@ async fn run(
             }
             _ = maintenance.tick() => {
                 link.maintain().await;
+                track(&link, &mut attempts, &mut retry_at);
+                continue;
+            }
+            work = work_rx.recv() => {
+                if let Some(LoopWork::Listed(listed)) = work {
+                    link.apply_listed(listed).await;
+                }
                 track(&link, &mut attempts, &mut retry_at);
                 continue;
             }
@@ -603,6 +620,13 @@ enum MidConnect {
     Shutdown,
 }
 
+/// Results fetched off the transport loop that must be re-applied on it.
+/// Today only the session list qualifies: its listing caches (message
+/// counts, pin state, refused sources) live on the link.
+enum LoopWork {
+    Listed(Result<Event, String>),
+}
+
 fn mid_connect(command: Option<Command>) -> MidConnect {
     match command {
         None | Some(Command::Shutdown) => MidConnect::Shutdown,
@@ -673,6 +697,7 @@ impl Link {
     fn new(config: Config, events: tokio::sync::mpsc::Sender<Event>) -> Result<Self, String> {
         let origin = config.url.clone();
         let http = http_client(&origin)?;
+        let (work, work_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             http,
             events,
@@ -700,6 +725,8 @@ impl Link {
             last_inbound: Instant::now(),
             pending_deltas: HashMap::new(),
             pending_reasoning: HashMap::new(),
+            work,
+            work_rx: Some(work_rx),
             retryable: false,
         })
     }
@@ -986,8 +1013,8 @@ impl Link {
 
     async fn http_command(&mut self, command: Command) {
         match command {
-            Command::List { offset } => self.list(offset).await,
-            Command::History { stored_id, before } => self.history(stored_id, before).await,
+            Command::List { offset } => self.list(offset),
+            Command::History { stored_id, before } => self.history(stored_id, before),
             Command::SearchSessions { query, request_seq } => {
                 self.search_sessions(query, request_seq).await;
             }
@@ -1685,8 +1712,23 @@ impl Link {
         }
     }
 
-    async fn list(&mut self, offset: usize) {
-        match fetch_sessions(&self.http, &self.origin, offset).await {
+    /// The session list fetch runs off the transport loop — a slow or stuck
+    /// gateway must not stall frames here either (it is the first command of
+    /// the post-reconnect refresh). The fetched rows re-enter the loop via
+    /// the work channel, where the listing caches and cleaning live.
+    fn list(&self, offset: usize) {
+        let work = self.work.clone();
+        let http = self.http.clone();
+        let origin = self.origin.clone();
+        tokio::spawn(async move {
+            let _ = work.send(LoopWork::Listed(fetch_sessions(&http, &origin, offset).await));
+        });
+    }
+
+    /// Applies a fetched session list on the loop: title/preview cleaning
+    /// plus the listing caches, then the same event the inline path emitted.
+    async fn apply_listed(&mut self, listed: Result<Event, String>) {
+        match listed {
             Ok(mut event) => {
                 if let Event::Sessions { sessions, .. } = &mut event {
                     self.note_and_clean_listed(sessions);
@@ -1705,9 +1747,10 @@ impl Link {
         }
     }
 
+    /// Search hits ride the same off-loop task shape as the catalog and
+    /// history reads; the pinned set is cloned so marking stays identical.
     async fn search_sessions(&self, query: String, request_seq: u64) {
-        let trimmed = query.trim().to_string();
-        if trimmed.is_empty() {
+        if query.trim().is_empty() {
             self.emit(Event::SearchResults {
                 query,
                 request_seq,
@@ -1716,30 +1759,15 @@ impl Link {
             .await;
             return;
         }
-        match fetch_search_hits(&self.http, &self.origin, &trimmed, &self.secrets).await {
-            Ok(mut hits) => {
-                for hit in &mut hits {
-                    if self.pinned_sessions.contains(&hit.stored_id) {
-                        hit.pinned = true;
-                    }
-                }
-                self.emit(Event::SearchResults {
-                    query,
-                    request_seq,
-                    hits,
-                })
-                .await;
-            }
-            Err(message) => {
-                self.emit(Event::SearchResults {
-                    query,
-                    request_seq,
-                    hits: Vec::new(),
-                })
-                .await;
-                self.fail("search", None, message).await;
-            }
-        }
+        tokio::spawn(fetch_search_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.secrets.clone(),
+            self.pinned_sessions.clone(),
+            self.events.clone(),
+            query,
+            request_seq,
+        ));
     }
 
     async fn mutate_session(&mut self, stored_id: String, mutation: SessionMutation) {
@@ -1975,28 +2003,17 @@ impl Link {
             .find_map(|(stored, rt)| (rt == runtime_id).then(|| stored.clone()))
     }
 
-    async fn history(&self, stored_id: String, before: usize) {
-        let next_before = before.saturating_sub(PAGE);
-        match fetch_history(
-            &self.http,
-            &self.origin,
-            &stored_id,
-            next_before,
-            before - next_before,
-        )
-        .await
-        {
-            Ok(messages) => {
-                self.emit(Event::History {
-                    stored_id,
-                    messages,
-                    before,
-                    next_before,
-                })
-                .await
-            }
-            Err(message) => self.fail("history", Some(stored_id), message).await,
-        }
+    /// History reads run off the transport loop; the task emits the same
+    /// events with the same redaction as the inline path.
+    fn history(&self, stored_id: String, before: usize) {
+        tokio::spawn(fetch_history_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.secrets.clone(),
+            self.events.clone(),
+            stored_id,
+            before,
+        ));
     }
 
     async fn begin_delete(&mut self, stored_id: String) {
@@ -4679,6 +4696,95 @@ async fn fetch_studio_catalogs_task(
     }
 }
 
+/// The history read as its own task: same events, same redaction, emitted
+/// directly on the bounded channel.
+async fn fetch_history_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    secrets: Vec<String>,
+    events: tokio::sync::mpsc::Sender<Event>,
+    stored_id: String,
+    before: usize,
+) {
+    let next_before = before.saturating_sub(PAGE);
+    let result = fetch_history(
+        &http,
+        &origin,
+        &stored_id,
+        next_before,
+        before - next_before,
+    )
+    .await;
+    match result {
+        Ok(messages) => {
+            let _ = events
+                .send(Event::History {
+                    stored_id,
+                    messages,
+                    before,
+                    next_before,
+                })
+                .await;
+        }
+        Err(message) => {
+            let _ = events
+                .send(Event::Error {
+                    operation: "history".into(),
+                    session_id: Some(stored_id),
+                    message: sanitize(&message, &secrets),
+                })
+                .await;
+        }
+    }
+}
+
+/// The search read as its own task: pinned marking against the cloned pin
+/// set, and on failure an empty result set followed by the same error event
+/// the inline path emitted.
+async fn fetch_search_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    secrets: Vec<String>,
+    pinned: std::collections::HashSet<String>,
+    events: tokio::sync::mpsc::Sender<Event>,
+    query: String,
+    request_seq: u64,
+) {
+    let trimmed = query.trim().to_string();
+    match fetch_search_hits(&http, &origin, &trimmed, &secrets).await {
+        Ok(mut hits) => {
+            for hit in &mut hits {
+                if pinned.contains(&hit.stored_id) {
+                    hit.pinned = true;
+                }
+            }
+            let _ = events
+                .send(Event::SearchResults {
+                    query,
+                    request_seq,
+                    hits,
+                })
+                .await;
+        }
+        Err(message) => {
+            let _ = events
+                .send(Event::SearchResults {
+                    query,
+                    request_seq,
+                    hits: Vec::new(),
+                })
+                .await;
+            let _ = events
+                .send(Event::Error {
+                    operation: "search".into(),
+                    session_id: None,
+                    message: sanitize(&message, &secrets),
+                })
+                .await;
+        }
+    }
+}
+
 fn session_summary(row: &Value) -> Result<SessionSummary, String> {
     let stored_id = optional_trimmed_str(row, "id")
         .ok_or_else(|| "The conversation list was not usable.".to_string())?;
@@ -6113,6 +6219,131 @@ mod tests {
                 .expect("skills within 5s")
                 .expect("sender alive");
             assert!(matches!(&skills, Event::Skills { skills } if skills.len() == 1));
+        });
+    }
+
+    /// A local HTTP server serving the session list and message history by
+    /// path, so the off-loop read tasks can be driven end to end.
+    async fn spawn_sessions_http(sessions_body: &'static str) -> url::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("/api/sessions") && req.contains("/messages") {
+                    r#"{"messages":[{"id":1,"role":"user","content":"first"},{"id":2,"role":"assistant","content":"second"}],"pagination":{"order":"oldest","returned":2}}"#
+                } else if req.contains("/api/sessions") {
+                    sessions_body
+                } else {
+                    "{}"
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    #[test]
+    fn session_reads_run_off_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // With the list and history HTTP calls hung against a stalling
+            // gateway, the launchers must return immediately and the
+            // transport path must keep processing frames.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                link.list(0);
+                link.history("st-1".into(), PAGE);
+                link.events
+                    .try_send(Event::Connection(ConnectionState::Connecting))
+                    .expect("fill");
+                link.emit_delta("rt", "m1", "hello").await;
+                assert!(incoming.try_recv().is_ok());
+                link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                    Vec::new().into(),
+                ))))
+                .await;
+                let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                    panic!("frames must process while list and history hang");
+                };
+                assert_eq!(delta, "hello");
+            })
+            .await
+            .expect("transport loop must stay responsive");
+
+            // Against a live origin the fetched list re-enters the loop via
+            // the work channel, where titles are cleaned and the listing
+            // caches update; the history task emits directly.
+            let origin = spawn_sessions_http(
+                r#"{"total":1,"sessions":[{"id":"st-1","title":"Chat top-secret tail","source":"tui","message_count":3,"started_at":1794452594}]}"#,
+            )
+            .await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "top-secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+            link.list(0);
+            let listed = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("listed within 5s")
+                .expect("sender alive");
+            let LoopWork::Listed(Ok(event)) = listed else {
+                panic!("expected a fetched session list");
+            };
+            link.apply_listed(Ok(event)).await;
+            let sessions = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("sessions within 5s")
+                .expect("sender alive");
+            assert!(matches!(
+                &sessions,
+                Event::Sessions { sessions, .. }
+                    if sessions.len() == 1
+                        && sessions[0].title == "Chat [REDACTED] tail"
+                        && link.message_counts.get("st-1") == Some(&3)
+            ));
+
+            link.history("st-1".into(), 2);
+            let history = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("history within 5s")
+                .expect("sender alive");
+            let Event::History { stored_id, messages, .. } = &history else {
+                panic!("expected history, got {history:?}");
+            };
+            assert_eq!(
+                (stored_id.as_str(), messages.len(), messages[0].text.as_str()),
+                ("st-1", 2, "first")
+            );
         });
     }
 

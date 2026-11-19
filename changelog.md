@@ -21,5 +21,7 @@
 
 - Reasoning stalls: thinking and reasoning stream events now use the same non-blocking park-and-flush path as message text, so a busy UI can no longer freeze the network loop during a chatty reasoning stream; parked reasoning replays with correct replace semantics and never leaks into the next turn.
 
+- Session-read stalls: the conversation list, saved-history, and session-search fetches now run off the network loop, so a slow gateway cannot freeze frame processing while you list, open, or search conversations — including the automatic refresh right after reconnecting (previously up to 30s of transport-loop blockage per request).
+
 ### Limitations
 - Up to six files can be attached per message. Each file is limited to 15 MB, and extracted document text is limited to 1 MB per file. Unsupported binary files and PDFs without extractable text are rejected; scanned PDFs require OCR first.
