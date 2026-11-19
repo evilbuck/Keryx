@@ -2187,6 +2187,11 @@ impl Link {
             }
         };
         self.last_inbound = Instant::now();
+        // Retry parked streaming tails now that a frame has arrived: the UI
+        // had a whole inter-frame gap to drain, so resume latency is one
+        // frame instead of the 5s maintenance tick. The tick stays as the
+        // fallback when no frames flow (server-side compress).
+        self.flush_pending_deltas();
         match frame {
             Message::Text(text) => self.on_text(text.as_str()).await,
             Message::Ping(payload) => {
@@ -5808,6 +5813,47 @@ mod tests {
             // A socket close drops parked tails with the rest of the live state;
             // the server's saved history is reloaded after reconnecting.
             link.close_socket().await;
+            assert!(link.pending_deltas.is_empty());
+        });
+    }
+
+    #[test]
+    fn parked_deltas_resume_on_the_next_inbound_frame() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+
+            // Park a tail behind a full channel, then let the UI catch up.
+            link.events
+                .try_send(Event::Connection(ConnectionState::Connecting))
+                .expect("fill");
+            link.emit_delta("rt", "m1", "hello").await;
+            assert!(link.pending_deltas.contains_key("rt"));
+            assert!(incoming.try_recv().is_ok());
+
+            // The next inbound frame — not the 5s maintenance tick — hands
+            // the parked tail over. Pong needs no write half, so this works
+            // without a live socket.
+            link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                Vec::new().into(),
+            ))))
+            .await;
+            let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                panic!("frame arrival must resume parked tails");
+            };
+            assert_eq!(delta, "hello");
             assert!(link.pending_deltas.is_empty());
         });
     }
