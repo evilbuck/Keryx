@@ -21,7 +21,7 @@
 
 - Reasoning stalls: thinking and reasoning stream events now use the same non-blocking park-and-flush path as message text, so a busy UI can no longer freeze the network loop during a chatty reasoning stream; parked reasoning replays with correct replace semantics and never leaks into the next turn.
 
-- Session-read stalls: the conversation list, saved-history, and session-search fetches now run off the network loop, so a slow gateway cannot freeze frame processing while you list, open, or search conversations — including the automatic refresh right after reconnecting (previously up to 30s of transport-loop blockage per request).
+- Session-read and mutation stalls: the conversation list, saved-history, session-search, and pin/rename patch requests now run off the network loop, so a slow gateway cannot freeze frame processing while you list, open, search, pin, or rename conversations — including the automatic refresh right after reconnecting (previously up to 30s of transport-loop blockage per request).
 
 - Upload stalls: attached images now upload concurrently and off the network loop, so sending a message with attachments no longer freezes frame processing while the gateway accepts the files (previously up to 30s per image, serially). Stale uploads after a retry or reconnect are discarded by the turn guard.
 

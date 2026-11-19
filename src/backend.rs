@@ -540,6 +540,13 @@ async fn run(
                         link.apply_uploaded(runtime_id, generation, result, prompt_text)
                             .await;
                     }
+                    Some(LoopWork::Mutated {
+                        stored_id,
+                        mutation,
+                        result,
+                    }) => {
+                        link.apply_mutated(stored_id, mutation, result).await;
+                    }
                     None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
@@ -637,6 +644,11 @@ enum MidConnect {
 /// uploads (the submit RPC waits for the uploaded paths).
 enum LoopWork {
     Listed(Box<Result<Event, String>>),
+    Mutated {
+        stored_id: String,
+        mutation: SessionMutation,
+        result: Result<PatchOutcome, String>,
+    },
     Uploaded {
         runtime_id: String,
         generation: u64,
@@ -1817,8 +1829,29 @@ impl Link {
             self.begin_archive(stored_id).await;
             return;
         }
+        // The patch — including its one conflict retry — runs off the
+        // transport loop; the outcome applies where curation state lives.
         let body = recall::mutation_patch_body(&mutation);
-        match patch_session_http(&self.http, &self.origin, &stored_id, &body).await {
+        tokio::spawn(patch_session_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work.clone(),
+            stored_id,
+            mutation,
+            body,
+        ));
+    }
+
+    /// Applies a finished session patch on the loop: the same outcome
+    /// mapping the inline path used, including the unpersisted-live guard
+    /// that only the loop can evaluate.
+    async fn apply_mutated(
+        &mut self,
+        stored_id: String,
+        mutation: SessionMutation,
+        result: Result<PatchOutcome, String>,
+    ) {
+        match result {
             Ok(PatchOutcome::Applied) => self.finish_applied_mutation(stored_id, mutation).await,
             Ok(PatchOutcome::NotFound) if self.is_unpersisted_live(&stored_id) => {
                 self.apply_unpersisted_mutation(stored_id, mutation).await;
@@ -4632,6 +4665,25 @@ async fn patch_session_http(
     send_fenced_patch(http, origin, stored_id, body).await
 }
 
+/// The session patch as its own task: the fenced patch (and its one
+/// conflict retry) runs off the transport loop, and the outcome re-enters
+/// via the work channel where curation state applies it.
+async fn patch_session_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    stored_id: String,
+    mutation: SessionMutation,
+    body: Value,
+) {
+    let result = patch_session_http(&http, &origin, &stored_id, &body).await;
+    let _ = work.send(LoopWork::Mutated {
+        stored_id,
+        mutation,
+        result,
+    });
+}
+
 async fn fetch_workspaces_http(
     http: &reqwest::Client,
     origin: &url::Url,
@@ -6508,6 +6560,93 @@ mod tests {
                 &error,
                 Event::Error { operation, .. } if operation == "submit"
             ));
+        });
+    }
+
+    #[test]
+    fn session_mutations_run_off_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // With the session patch hung against a stalling gateway, the
+            // mutation launcher must return and frames must keep processing.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                link.mutate_session("st-1".into(), SessionMutation::SetPinned(true))
+                    .await;
+                link.events
+                    .try_send(Event::Connection(ConnectionState::Connecting))
+                    .expect("fill");
+                link.emit_delta("rt", "m1", "hello").await;
+                assert!(incoming.try_recv().is_ok());
+                link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                    Vec::new().into(),
+                ))))
+                .await;
+                let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                    panic!("frames must process while the patch hangs");
+                };
+                assert_eq!(delta, "hello");
+            })
+            .await
+            .expect("transport loop must stay responsive");
+
+            // A 404 for an unpersisted live conversation re-enters the loop
+            // and defers the mutation, exactly as the inline path did.
+            let origin = spawn_one_http_status("404 Not Found", "{}").await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+            link.runtime_of.insert("st-new".into(), "rt-new".into());
+            link.message_counts.insert("st-new".into(), 0);
+            link.mutate_session("st-new".into(), SessionMutation::SetPinned(true))
+                .await;
+            let mutated =
+                tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                    .await
+                    .expect("mutation work within 5s")
+                    .expect("sender alive");
+            let LoopWork::Mutated {
+                stored_id,
+                mutation,
+                result,
+            } = mutated
+            else {
+                panic!("expected mutation work");
+            };
+            assert_eq!(stored_id, "st-new");
+            assert!(matches!(result, Ok(PatchOutcome::NotFound)));
+            link.apply_mutated(stored_id, mutation, result).await;
+            let mutated_event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                    .await
+                    .expect("session-mutated within 5s")
+                    .expect("sender alive");
+            assert!(matches!(
+                &mutated_event,
+                Event::SessionMutated { stored_id, .. } if stored_id == "st-new"
+            ));
+            assert!(link.deferred_mutations.contains_key("st-new"));
         });
     }
 
