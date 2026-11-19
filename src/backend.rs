@@ -5099,11 +5099,13 @@ impl Link {
             return;
         }
         self.auth_reject_seen = true;
-        self.emit(Event::Connection(ConnectionState::Disconnected(
-            "Gateway session expired — reconnecting.".into(),
-        )))
-        .await;
-        self.close_socket().await;
+        // The same teardown every socket loss takes. Closing without
+        // failing the in-flight jobs would leave each one to expire at
+        // its own RPC deadline — up to 30s later, and with a misleading
+        // "gateway did not answer" message instead of the expired-session
+        // cause.
+        self.drop_socket("Gateway session expired — reconnecting.")
+            .await;
     }
 
     /// The background writer could not complete a write inside the write
@@ -7803,6 +7805,80 @@ mod tests {
             assert_eq!(link.epoch, 1, "the teardown bumps the epoch");
             assert!(link.auth_reject_seen);
             assert!(link.write.is_none());
+        });
+    }
+
+    #[test]
+    fn auth_rejection_fails_in_flight_jobs_immediately() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // An expired gateway session tears the socket down, but the
+            // in-flight jobs must not wait for their 30s deadline sweep
+            // (and its misleading "gateway did not answer" message): the
+            // teardown fails them at once, exactly like every other
+            // socket-loss path.
+            let (events, mut events_rx) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("http://gateway.invalid").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            install_fake_writer(&mut link).await;
+            link.jobs.insert(
+                41,
+                Job {
+                    kind: JobKind::Create {
+                        title: "new chat".into(),
+                    },
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+            );
+            link.apply_auth_rejected().await;
+            assert!(link.jobs.is_empty(), "the job failed at teardown");
+
+            let mut seen = Vec::new();
+            while let Ok(event) = events_rx.try_recv() {
+                seen.push(event);
+            }
+            let connection_events = seen
+                .iter()
+                .filter(|event| matches!(event, Event::Connection(_)))
+                .count();
+            assert_eq!(
+                connection_events, 1,
+                "exactly one teardown event: {seen:?}"
+            );
+            let job_error = seen
+                .iter()
+                .find(|event| {
+                    matches!(
+                        event,
+                        Event::Error {
+                            operation,
+                            session_id: None,
+                            ..
+                        } if operation == "create"
+                    )
+                })
+                .expect("the in-flight job failed with the disconnect");
+            let Event::Error { message, .. } = job_error else {
+                unreachable!("matched Event::Error above: {seen:?}");
+            };
+            assert!(
+                message.contains("Gateway session expired"),
+                "the failure names the real cause, not a deadline sweep: {message}"
+            );
+            assert!(
+                link.write.is_none() && link.auth_reject_seen,
+                "the teardown closed the socket"
+            );
         });
     }
 
