@@ -76,6 +76,7 @@ struct Ui {
     interaction_scroll: gtk::ScrolledWindow,
     rendered_session: RefCell<Option<String>>,
     rendered_revision: Cell<u64>,
+    rendered_stream: Cell<u64>,
     rendered_row_gate: Cell<(bool, bool)>,
     rendered_find_stamp: RefCell<(bool, String, usize, usize)>,
     rendered_lineage: RefCell<Option<LineageStamp>>,
@@ -143,8 +144,31 @@ fn build_message_rows(
     };
     let (can_branch_gate, writable_idle) = row_action_gates(Some(c), connected, creating);
     let (last_user, last_assistant, _) = last_turn_targets(&c.messages);
+    build_message_rows_from(
+        &c.messages,
+        0,
+        find,
+        can_branch_gate,
+        writable_idle,
+        last_user.as_deref(),
+        last_assistant.as_deref(),
+    )
+}
+
+/// Row construction over a message slice. `find_base` is the slice's offset
+/// in the full transcript so find highlighting keeps absolute indices.
+fn build_message_rows_from(
+    messages: &[ChatMessage],
+    find_base: usize,
+    find: &TranscriptFind,
+    can_branch_gate: bool,
+    writable_idle: bool,
+    last_user: Option<&str>,
+    last_assistant: Option<&str>,
+) -> Vec<MessageRowData> {
     let mut rows: Vec<MessageRowData> = Vec::new();
-    for (index, message) in c.messages.iter().enumerate() {
+    for (offset, message) in messages.iter().enumerate() {
+        let index = find_base + offset;
         let (is_match, is_active_match) = find.match_state(index);
         if matches!(message.role, Role::Assistant | Role::Tool)
             && let Some(row) = rows
@@ -159,7 +183,7 @@ fn build_message_rows(
                 row.message = message.clone();
                 row.can_branch = can_branch_gate && is_branchable_message(message);
                 row.can_regenerate =
-                    writable_idle && last_assistant.as_deref() == Some(message.id.as_str());
+                    writable_idle && last_assistant == Some(message.id.as_str());
             }
             continue;
         }
@@ -168,13 +192,46 @@ fn build_message_rows(
             message: message.clone(),
             parts: vec![(index, message.clone())],
             can_branch: can_branch_gate && is_branchable_message(message),
-            can_edit_retry: writable_idle && last_user.as_deref() == Some(message.id.as_str()),
-            can_regenerate: writable_idle && last_assistant.as_deref() == Some(message.id.as_str()),
+            can_edit_retry: writable_idle && last_user == Some(message.id.as_str()),
+            can_regenerate: writable_idle && last_assistant == Some(message.id.as_str()),
             is_match,
             is_active_match,
         });
     }
     rows
+}
+
+/// Rebuild only the trailing transcript row — the one streaming appends
+/// mutate. Walks back over the contiguous assistant/tool run the trailing
+/// message folds into and constructs that row with the same gates, targets,
+/// and find state a full rebuild would produce.
+fn trailing_row_update(
+    conversation: Option<&Conversation>,
+    find: &TranscriptFind,
+    connected: bool,
+    creating: bool,
+) -> Option<MessageRowData> {
+    let c = conversation?;
+    let last = c.messages.len().checked_sub(1)?;
+    let mut start = last;
+    while start > 0
+        && matches!(c.messages[start - 1].role, Role::Assistant | Role::Tool)
+        && matches!(c.messages[start].role, Role::Assistant | Role::Tool)
+    {
+        start -= 1;
+    }
+    let (can_branch_gate, writable_idle) = row_action_gates(Some(c), connected, creating);
+    let (last_user, last_assistant, _) = last_turn_targets(&c.messages);
+    build_message_rows_from(
+        &c.messages[start..],
+        start,
+        find,
+        can_branch_gate,
+        writable_idle,
+        last_user.as_deref(),
+        last_assistant.as_deref(),
+    )
+    .pop()
 }
 
 fn compute_lineage_stamp(state: &AppState) -> LineageStamp {
@@ -1082,6 +1139,7 @@ pub fn build(app: &adw::Application, config: Result<Config, String>) {
         interaction_scroll,
         rendered_session: RefCell::new(None),
         rendered_revision: Cell::new(u64::MAX),
+        rendered_stream: Cell::new(u64::MAX),
         rendered_row_gate: Cell::new((false, false)),
         rendered_find_stamp: RefCell::new((false, String::new(), 0, 0)),
         rendered_lineage: RefCell::new(None),
@@ -4036,12 +4094,40 @@ impl Ui {
         let find_stamp = find_render_stamp(&state.transcript_find);
         let identity_changed = *self.rendered_session.borrow() != state.selected;
         let revision = conversation.map_or(0, |c| c.revision);
-        if self.message_list_up_to_date(identity_changed, revision, gates, &find_stamp) {
+        let stream_revision = conversation.map_or(0, |c| c.stream_revision);
+        if self.message_list_up_to_date(
+            identity_changed,
+            revision,
+            stream_revision,
+            gates,
+            &find_stamp,
+        ) {
             return;
         }
         if identity_changed {
             self.messages.remove_all();
             *self.rendered_session.borrow_mut() = state.selected.clone();
+        }
+        // Streaming appends only ever grow the trailing row's text, so the
+        // whole-transcript rebuild and byte-for-byte diff are pure waste:
+        // splice just that row. Any other change (new rows, gate flips,
+        // find state) takes the full path below.
+        let stream_only = !identity_changed
+            && revision == self.rendered_revision.get()
+            && gates == self.rendered_row_gate.get()
+            && find_stamp == *self.rendered_find_stamp.borrow();
+        if stream_only
+            && let Some(row) =
+                trailing_row_update(conversation, &state.transcript_find, connected, state.creating)
+        {
+            let last = self.messages.n_items();
+            if last > 0 {
+                let value = glib::BoxedAnyObject::new(row.clone());
+                self.messages.splice(last - 1, 1, &[value]);
+                self.rendered_stream.set(stream_revision);
+                self.stick_to_bottom();
+                return;
+            }
         }
         let current = build_message_rows(
             conversation,
@@ -4051,8 +4137,14 @@ impl Ui {
         );
         sync_list_store_rows(&self.messages, &current);
         self.rendered_revision.set(revision);
+        self.rendered_stream.set(stream_revision);
         self.rendered_row_gate.set(gates);
         *self.rendered_find_stamp.borrow_mut() = find_stamp;
+        self.stick_to_bottom();
+    }
+
+    /// Keep the transcript pinned to the newest text when follow mode is on.
+    fn stick_to_bottom(&self) {
         if self.follow_bottom.get() {
             let adjustment = self.transcript.vadjustment();
             glib::idle_add_local_once(move || {
@@ -4065,11 +4157,13 @@ impl Ui {
         &self,
         identity_changed: bool,
         revision: u64,
+        stream_revision: u64,
         gates: (bool, bool),
         find_stamp: &FindRenderStamp,
     ) -> bool {
         !identity_changed
             && self.rendered_revision.get() == revision
+            && self.rendered_stream.get() == stream_revision
             && self.rendered_row_gate.get() == gates
             && *self.rendered_find_stamp.borrow() == *find_stamp
     }
@@ -5627,7 +5721,68 @@ mod tests {
     }
 
     #[test]
-    fn studio_multimodal_attachments_and_compress_controls_follow_session_state() {
+fn trailing_row_update_matches_full_rebuild_for_every_fold_shape() {
+    let find = TranscriptFind::default();
+    let message = |id: &str, role: Role, text: &str| ChatMessage {
+        id: id.into(),
+        role,
+        text: text.into(),
+    };
+    let shapes: Vec<Vec<ChatMessage>> = vec![
+        vec![message("u1", Role::User, "ask")],
+        vec![message("u1", Role::User, "ask"), message("a1", Role::Assistant, "reply")],
+        vec![
+            message("u1", Role::User, "ask"),
+            message("a1", Role::Assistant, "reply"),
+            message("t1", Role::Tool, "used search"),
+        ],
+        vec![
+            message("u1", Role::User, "ask"),
+            message("t1", Role::Tool, "used search"),
+            message("a1", Role::Assistant, "reply"),
+            message("t2", Role::Tool, "used terminal"),
+        ],
+        vec![
+            message("a1", Role::Assistant, " opener"),
+            message("t1", Role::Tool, "tool"),
+            message("a2", Role::Assistant, "follow-up"),
+        ],
+    ];
+    for (connected, creating) in [(true, false), (false, true), (true, true)] {
+        for messages in &shapes {
+            let conversation = Conversation {
+                messages: messages.clone(),
+                status: TurnStatus::Streaming,
+                ..Default::default()
+            };
+            let full = build_message_rows(
+                Some(&conversation),
+                &find,
+                connected,
+                creating,
+            );
+            let trailing = trailing_row_update(
+                Some(&conversation),
+                &find,
+                connected,
+                creating,
+            )
+            .expect("trailing row");
+            assert_eq!(full.last(), Some(&trailing), "messages: {messages:?}");
+        }
+    }
+}
+
+#[test]
+fn trailing_row_update_absent_without_messages() {
+    let conversation = Conversation::default();
+    assert!(trailing_row_update(Some(&conversation), &TranscriptFind::default(), true, false)
+        .is_none());
+    assert!(trailing_row_update(None, &TranscriptFind::default(), true, false).is_none());
+}
+
+    #[test]
+fn studio_multimodal_attachments_and_compress_controls_follow_session_state() {
         let png = StagedImage::from_bytes(
             1,
             "shot.png",

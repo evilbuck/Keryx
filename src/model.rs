@@ -1775,6 +1775,10 @@ pub struct Conversation {
     pub history_loading: bool,
     pub rewinding: bool,
     pub revision: u64,
+    /// Bumped only when a streaming append mutates the trailing message's
+    /// text in place. Lets the UI rebuild just the trailing transcript row
+    /// instead of diffing the whole conversation on every streamed chunk.
+    pub stream_revision: u64,
     pub inspector_revision: u64,
     pub model: ModelState,
     pub reasoning: String,
@@ -1799,7 +1803,7 @@ impl Conversation {
             .filter(|m| m.id == message_id || m.id.starts_with(&format!("{message_id}:segment:")))
         {
             message.text.push_str(&delta);
-            self.revision += 1;
+            self.stream_revision += 1;
         } else {
             self.record_message(ChatMessage {
                 id: if self.messages.iter().any(|m| m.id == message_id) {
@@ -3753,6 +3757,42 @@ mod tests {
             text: String::new(),
         });
         assert_eq!(conversation.messages[0].text, "Final");
+    }
+
+    #[test]
+    fn streaming_appends_bump_stream_revision_not_transcript_revision() {
+        let mut conversation = Conversation::default();
+        // First delta of a turn opens a new row: structural.
+        conversation.append_delta("reply", "Par".into());
+        assert_eq!(conversation.revision, 1);
+        assert_eq!(conversation.stream_revision, 0);
+        // In-place appends to the trailing row are stream-only: the UI can
+        // rebuild just that row instead of diffing the whole transcript.
+        conversation.append_delta("reply", "tial".into());
+        assert_eq!(conversation.revision, 1);
+        assert_eq!(conversation.stream_revision, 1);
+        conversation.receive_delta("reply", " text".into());
+        assert_eq!(conversation.revision, 1);
+        assert_eq!(conversation.stream_revision, 2);
+        // Completion flips busy gates (edit/branch actions), so the
+        // transcript revision moves even though only trailing text changed.
+        conversation.finish_message(ChatMessage {
+            id: "reply".into(),
+            role: Role::Assistant,
+            text: "Partial text".into(),
+        });
+        assert_eq!(conversation.revision, 2);
+        assert_eq!(conversation.stream_revision, 2);
+        // Empty completion text still takes the in-place branch, which
+        // conservatively moves the transcript revision (a full rebuild
+        // follows); stream_revision is untouched.
+        conversation.finish_message(ChatMessage {
+            id: "reply".into(),
+            role: Role::Assistant,
+            text: String::new(),
+        });
+        assert_eq!(conversation.revision, 3);
+        assert_eq!(conversation.stream_revision, 2);
     }
 
     #[test]
