@@ -1785,12 +1785,20 @@ impl Conversation {
     }
 
     pub fn append_delta(&mut self, message_id: String, delta: String) {
-        if let Some(message) = self.messages.iter_mut().find(|m| m.id == message_id) {
+        if let Some(message) = self
+            .messages
+            .last_mut()
+            .filter(|m| m.id == message_id || m.id.starts_with(&format!("{message_id}:segment:")))
+        {
             message.text.push_str(&delta);
             self.revision += 1;
         } else {
             self.record_message(ChatMessage {
-                id: message_id,
+                id: if self.messages.iter().any(|m| m.id == message_id) {
+                    format!("{message_id}:segment:{}", self.messages.len())
+                } else {
+                    message_id
+                },
                 role: Role::Assistant,
                 text: delta,
             });
@@ -1810,14 +1818,18 @@ impl Conversation {
     }
 
     pub fn finish_message(&mut self, message: ChatMessage) {
-        if let Some(old) = self.messages.iter_mut().find(|m| m.id == message.id) {
+        if let Some(old) = self
+            .messages
+            .last_mut()
+            .filter(|m| m.id == message.id || m.id.starts_with(&format!("{}:segment:", message.id)))
+        {
             if !message.text.is_empty() {
-                *old = message;
+                old.text = message.text;
             }
             self.revision += 1;
             self.inspector_revision += 1;
         } else if !message.text.is_empty() {
-            self.record_message(message);
+            self.append_delta(message.id, message.text);
         }
     }
 
@@ -2049,6 +2061,52 @@ impl Conversation {
     }
 
     pub fn apply_tool_event(&mut self, update: ToolEventUpdate) {
+        let turn_start = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .map_or(0, |i| i + 1);
+        match &update {
+            ToolEventUpdate::Started {
+                tool_id,
+                name,
+                detail,
+            } => {
+                let id = format!("live-tool:{tool_id}");
+                let text = tool_activity_text(name, detail, false);
+                if !tool_id.is_empty()
+                    && let Some(message) = self.messages[turn_start..]
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.id == id)
+                {
+                    message.text = text;
+                    self.revision += 1;
+                } else {
+                    self.record_message(ChatMessage {
+                        id,
+                        role: Role::Tool,
+                        text,
+                    });
+                }
+            }
+            ToolEventUpdate::Completed { tool_id, name, .. } => {
+                let id = format!("live-tool:{tool_id}");
+                if let Some(message) = self.messages[turn_start..]
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.id == id)
+                {
+                    let detail = message
+                        .text
+                        .split_once(" · ")
+                        .map_or("", |(_, detail)| detail);
+                    message.text = tool_activity_text(name, detail, true);
+                    self.revision += 1;
+                }
+            }
+            _ => {}
+        }
         upsert_tool_trace(&mut self.tools, update);
         if self.tools.len() > MAX_TOOL_TRACES {
             let overflow = self.tools.len() - MAX_TOOL_TRACES;
@@ -2189,6 +2247,16 @@ fn find_side_question_index(
             && q.task_id.is_none()
             && (question.is_empty() || q.question == question)
     })
+}
+
+fn tool_activity_text(name: &str, detail: &str, complete: bool) -> String {
+    let name = if name.is_empty() { "tool" } else { name };
+    let verb = if complete { "Used" } else { "Using" };
+    if detail.is_empty() {
+        format!("{verb} {name}")
+    } else {
+        format!("{verb} {name} · {detail}")
+    }
 }
 
 fn upsert_tool_trace(tools: &mut Vec<ToolTrace>, update: ToolEventUpdate) {
@@ -3613,6 +3681,53 @@ mod tests {
         assert!(state.conversations.contains_key("durable"));
     }
     #[test]
+    fn tool_activity_keeps_preview_after_completion() {
+        let mut chat = Conversation::default();
+        chat.apply_tool_event(ToolEventUpdate::Started {
+            tool_id: "1".into(),
+            name: "terminal".into(),
+            detail: "cargo test".into(),
+        });
+        chat.apply_tool_event(ToolEventUpdate::Completed {
+            tool_id: "1".into(),
+            name: "terminal".into(),
+            duration_s: Some(1.0),
+            summary: "done".into(),
+        });
+        assert_eq!(chat.messages[0].text, "Used terminal · cargo test");
+    }
+
+    #[test]
+    fn tool_activity_preserves_stream_order_and_final_text() {
+        let mut chat = Conversation::default();
+        chat.receive_delta("turn".into(), "Before".into());
+        chat.apply_tool_event(ToolEventUpdate::Started {
+            tool_id: "call".into(),
+            name: "search".into(),
+            detail: String::new(),
+        });
+        chat.apply_tool_event(ToolEventUpdate::Completed {
+            tool_id: "call".into(),
+            name: "search".into(),
+            duration_s: None,
+            summary: String::new(),
+        });
+        chat.receive_delta("turn".into(), "After".into());
+        chat.finish_message(ChatMessage {
+            id: "turn".into(),
+            role: Role::Assistant,
+            text: "After final".into(),
+        });
+        assert_eq!(
+            chat.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Before", "Used search", "After final"]
+        );
+    }
+
+    #[test]
     fn final_response_replaces_streamed_text_without_duplicate_rows() {
         let mut conversation = Conversation::default();
         conversation.append_delta("reply".into(), "Part".into());
@@ -4395,6 +4510,7 @@ mod tests {
         );
         assert_eq!(chat.tools[0].duration_s, Some(1.4));
 
+        chat.messages.clear();
         chat.record_message(ChatMessage {
             id: "u1".into(),
             role: Role::User,

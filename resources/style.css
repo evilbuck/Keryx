@@ -37,9 +37,9 @@
 .speaker-user { color: @blue_2; opacity: 1; }
 .speaker-assistant { color: @success_color; opacity: 1; }
 .speaker-tool { color: @warning_color; opacity: 1; }
-.tool-chip { background: alpha(@window_fg_color, 0.06); border-radius: 8px; padding: 6px 10px; }
+.tool-chip { padding: 1px 2px; }
 .tool-icon { opacity: 0.75; }
-.tool-label { font-family: monospace; font-size: 12px; opacity: 0.85; }
+.tool-label { font-size: 12px; opacity: 0.7; }
 .message-prose { font-size: 15px; line-height: 1.5; }
 .message-copy { opacity: 0.45; }
 .message-copy:hover { opacity: 1; }

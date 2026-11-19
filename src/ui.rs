@@ -101,6 +101,7 @@ type FindRenderStamp = (bool, String, usize, usize);
 struct MessageRowData {
     index: usize,
     message: ChatMessage,
+    parts: Vec<(usize, ChatMessage)>,
     can_branch: bool,
     can_edit_retry: bool,
     can_regenerate: bool,
@@ -142,23 +143,38 @@ fn build_message_rows(
     };
     let (can_branch_gate, writable_idle) = row_action_gates(Some(c), connected, creating);
     let (last_user, last_assistant, _) = last_turn_targets(&c.messages);
-    c.messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let (is_match, is_active_match) = find.match_state(index);
-            MessageRowData {
-                index,
-                message: message.clone(),
-                can_branch: can_branch_gate && is_branchable_message(message),
-                can_edit_retry: writable_idle && last_user.as_deref() == Some(message.id.as_str()),
-                can_regenerate: writable_idle
-                    && last_assistant.as_deref() == Some(message.id.as_str()),
-                is_match,
-                is_active_match,
+    let mut rows: Vec<MessageRowData> = Vec::new();
+    for (index, message) in c.messages.iter().enumerate() {
+        let (is_match, is_active_match) = find.match_state(index);
+        if matches!(message.role, Role::Assistant | Role::Tool)
+            && let Some(row) = rows
+                .last_mut()
+                .filter(|row| matches!(row.message.role, Role::Assistant | Role::Tool))
+        {
+            row.parts.push((index, message.clone()));
+            row.is_match |= is_match;
+            row.is_active_match |= is_active_match;
+            if message.role == Role::Assistant {
+                row.index = index;
+                row.message = message.clone();
+                row.can_branch = can_branch_gate && is_branchable_message(message);
+                row.can_regenerate =
+                    writable_idle && last_assistant.as_deref() == Some(message.id.as_str());
             }
-        })
-        .collect()
+            continue;
+        }
+        rows.push(MessageRowData {
+            index,
+            message: message.clone(),
+            parts: vec![(index, message.clone())],
+            can_branch: can_branch_gate && is_branchable_message(message),
+            can_edit_retry: writable_idle && last_user.as_deref() == Some(message.id.as_str()),
+            can_regenerate: writable_idle && last_assistant.as_deref() == Some(message.id.as_str()),
+            is_match,
+            is_active_match,
+        });
+    }
+    rows
 }
 
 fn compute_lineage_stamp(state: &AppState) -> LineageStamp {
@@ -533,7 +549,12 @@ fn bind_message_row(object: &glib::Object) {
         .and_downcast::<glib::BoxedAnyObject>()
         .expect("message item");
     let data = value.borrow::<MessageRowData>();
-    let (speaker_label, row_class, speaker_class) = role_style(&data.message.role);
+    let display_role = if data.message.role == Role::Tool {
+        &Role::Assistant
+    } else {
+        &data.message.role
+    };
+    let (speaker_label, row_class, speaker_class) = role_style(display_role);
     let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
     row.add_css_class("message");
     row.add_css_class(row_class);
@@ -569,7 +590,9 @@ fn bind_message_row(object: &glib::Object) {
     });
     heading.append(&quote);
     row.append(&heading);
-    row.append(&message_body(&data.message));
+    for (_, part) in &data.parts {
+        row.append(&message_body(part));
+    }
     let column = adw::Clamp::builder()
         .maximum_size(860)
         .tightening_threshold(600)
@@ -2380,12 +2403,7 @@ impl Ui {
     }
 
     fn jump_to_message(&self, index: usize) {
-        if (index as u32) >= self.messages.n_items() {
-            return;
-        }
-        self.follow_bottom.set(false);
-        self.message_list
-            .scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
+        self.schedule_scroll_to_message(index);
     }
 
     fn toggle_palette(&self) {
@@ -2700,8 +2718,17 @@ impl Ui {
         let list = self.message_list.clone();
         let store = self.messages.clone();
         glib::idle_add_local_once(move || {
-            if (index as u32) < store.n_items() {
-                list.scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
+            for position in 0..store.n_items() {
+                if let Some(value) = store.item(position).and_downcast::<glib::BoxedAnyObject>()
+                    && value
+                        .borrow::<MessageRowData>()
+                        .parts
+                        .iter()
+                        .any(|(i, _)| *i == index)
+                {
+                    list.scroll_to(position, gtk::ListScrollFlags::FOCUS, None);
+                    break;
+                }
             }
         });
     }
@@ -5026,18 +5053,42 @@ fn role_style(role: &Role) -> (&'static str, &'static str, &'static str) {
     }
 }
 
+fn tool_activity_icon(text: &str) -> &'static str {
+    let full_text = text.to_ascii_lowercase();
+    if full_text.contains("skill") {
+        return "x-office-document-symbolic";
+    }
+    let name = full_text.split(" · ").next().unwrap_or(&full_text);
+    let categories: &[(&[&str], &str)] = &[
+        (&["search", "grep", "find"], "system-search-symbolic"),
+        (
+            &["terminal", "command", "shell", "exec"],
+            "utilities-terminal-symbolic",
+        ),
+        (&["write", "edit", "patch"], "document-edit-symbolic"),
+        (&["read", "file"], "text-x-generic-symbolic"),
+        (&["web", "browser", "fetch"], "web-browser-symbolic"),
+    ];
+    categories
+        .iter()
+        .find(|(words, _)| words.iter().any(|word| name.contains(word)))
+        .map_or("system-run-symbolic", |(_, icon)| *icon)
+}
+
 /// Tool rows are compact single-line chips; every other role renders Markdown.
 fn message_body(message: &ChatMessage) -> gtk::Widget {
     if message.role == Role::Tool {
         let chip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         chip.add_css_class("tool-chip");
-        let icon = gtk::Image::from_icon_name("system-run-symbolic");
+        let icon = gtk::Image::from_icon_name(tool_activity_icon(&message.text));
         icon.add_css_class("tool-icon");
         icon.set_valign(gtk::Align::Center);
         chip.append(&icon);
         let label = gtk::Label::new(Some(&message.text));
         label.set_xalign(0.0);
         label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_hexpand(true);
+        label.set_tooltip_text(Some(&message.text));
         label.add_css_class("tool-label");
         chip.append(&label);
         chip.upcast()
@@ -5358,6 +5409,22 @@ mod tests {
     }
 
     #[test]
+    fn tool_icons_follow_activity_type() {
+        assert_eq!(
+            tool_activity_icon("Using terminal · cargo test"),
+            "utilities-terminal-symbolic"
+        );
+        assert_eq!(
+            tool_activity_icon("Used read_file · /skills/demo/SKILL.md"),
+            "x-office-document-symbolic"
+        );
+        assert_eq!(
+            tool_activity_icon("Using web_search · query"),
+            "system-search-symbolic"
+        );
+    }
+
+    #[test]
     fn message_rows_expose_branch_and_rewind_actions_only_when_idle() {
         let mut chat = Conversation {
             runtime_id: Some("rt-1".into()),
@@ -5392,12 +5459,12 @@ mod tests {
         };
         let no_find = TranscriptFind::default();
         let rows = build_message_rows(Some(&chat), &no_find, true, false);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 4);
         assert!(rows[0].can_branch && !rows[0].can_edit_retry);
-        assert!(!rows[1].can_branch);
-        assert!(rows[2].can_branch && !rows[2].can_regenerate);
-        assert!(rows[3].can_branch && rows[3].can_edit_retry);
-        assert!(rows[4].can_branch && rows[4].can_regenerate);
+        assert!(rows[1].can_branch && !rows[1].can_regenerate);
+        assert_eq!(rows[1].parts.len(), 2);
+        assert!(rows[2].can_branch && rows[2].can_edit_retry);
+        assert!(rows[3].can_branch && rows[3].can_regenerate);
 
         // Busy or read-only gates disable live rewind; read-only still allows branching.
         chat.status = TurnStatus::Streaming;
@@ -5413,8 +5480,8 @@ mod tests {
         chat.read_only_reason = Some("Read-only cron log".into());
         let ro_rows = build_message_rows(Some(&chat), &no_find, true, false);
         assert!(ro_rows[0].can_branch);
-        assert!(!ro_rows[3].can_edit_retry);
-        assert!(!ro_rows[4].can_regenerate);
+        assert!(!ro_rows[2].can_edit_retry);
+        assert!(!ro_rows[3].can_regenerate);
     }
 
     #[test]

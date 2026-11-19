@@ -4861,8 +4861,13 @@ fn tool_name_from(payload: &Value) -> &str {
 
 fn payload_str(payload: &Value, keys: &[&str]) -> String {
     keys.iter()
-        .find_map(|k| payload.get(*k).and_then(Value::as_str).map(str::trim))
-        .filter(|s| !s.is_empty())
+        .find_map(|k| {
+            payload
+                .get(*k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
         .map(str::to_string)
         .unwrap_or_default()
 }
