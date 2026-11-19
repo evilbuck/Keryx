@@ -6526,6 +6526,7 @@ mod tests {
             // message Arc, delta buffer.
             let cold_frame = frame(5, "hello");
             let (_, cold) = measure(link.on_text(&cold_frame)).await;
+            assert_eq!(cold, 5, "cold insert: table + key + 2 id Arcs + tail");
             while incoming.try_recv().is_ok() {}
 
             // Steady keeping-up frames: the entry survives the successful
@@ -6536,9 +6537,11 @@ mod tests {
             // id rewrite).
             let steady_frame = frame(10, " more");
             let (_, steady_one) = measure(link.on_text(&steady_frame)).await;
+            assert_eq!(steady_one, 1, "steady frame: buffer only");
             while incoming.try_recv().is_ok() {}
             let steady_frame = frame(15, " again");
             let (_, steady_two) = measure(link.on_text(&steady_frame)).await;
+            assert_eq!(steady_two, 1, "steady frame: buffer only");
             while incoming.try_recv().is_ok() {}
 
             // A parked frame (channel full) allocates only the tail too:
@@ -6550,6 +6553,7 @@ mod tests {
                 .expect("fill");
             let parked_frame = frame(25, "x");
             let (_, parked) = measure(link.on_text(&parked_frame)).await;
+            assert_eq!(parked, 1, "parked frame: buffer only");
             assert!(link.pending_deltas.contains_key("rt"));
         });
     }
