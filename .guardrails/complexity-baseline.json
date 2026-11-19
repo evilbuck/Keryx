@@ -16,22 +16,7 @@
   },
   {
     "file": "src/ui.rs",
-    "function": "refresh",
-    "complexity": 14
-  },
-  {
-    "file": "src/ui.rs",
     "function": "collect_clarification",
     "complexity": 14
-  },
-  {
-    "file": "examples/remote_smoke.rs",
-    "function": "run",
-    "complexity": 17
-  },
-  {
-    "file": "examples/remote_smoke.rs",
-    "function": "assert_context",
-    "complexity": 12
   }
 ]

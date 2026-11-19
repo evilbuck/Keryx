@@ -904,26 +904,53 @@ fn resume(harness: &mut Harness, stored_id: &str) -> Result<(String, Vec<ChatMes
     Err("resume timed out".into())
 }
 
+/// How one saved message advances (or violates) the expected four-stage
+/// context order.
+enum StageStep {
+    /// The message matched the next expected stage.
+    Advance(u8),
+    /// A stored prompt carried the secret word.
+    Leak,
+    /// The first chat contained the second chat's words.
+    CrossChat,
+    /// Anything else: metadata rows the assertion does not care about.
+    Ignore,
+}
+
+/// Stage transition for one saved message: the two-turn user/assistant
+/// sequence advances, a stored secret word is a leak, second-chat words are
+/// cross-contamination, everything else is ignored.
+fn stage_step(stage: u8, message: &ChatMessage) -> StageStep {
+    let text = message.text.trim();
+    match (stage, &message.role, text) {
+        (0, Role::User, text) if text == TURN_ONE => StageStep::Advance(1),
+        (1, Role::Assistant, text) if text == WORD => StageStep::Advance(2),
+        (2, Role::User, text) if text == TURN_TWO => StageStep::Advance(3),
+        (3, Role::Assistant, text) if text == WORD => StageStep::Advance(4),
+        (_, Role::User, text)
+            if text.to_ascii_lowercase().contains(WORD) && text != TURN_ONE =>
+        {
+            StageStep::Leak
+        }
+        (_, _, text)
+            if text.to_ascii_lowercase().contains(OTHER) || text.contains(TURN_OTHER) =>
+        {
+            StageStep::CrossChat
+        }
+        _ => StageStep::Ignore,
+    }
+}
+
 fn assert_context(messages: &[ChatMessage]) -> Result<(), String> {
     let mut stage = 0u8;
     for message in messages {
-        let text = message.text.trim();
-        match (stage, &message.role, text) {
-            (0, Role::User, text) if text == TURN_ONE => stage = 1,
-            (1, Role::Assistant, text) if text == WORD => stage = 2,
-            (2, Role::User, text) if text == TURN_TWO => stage = 3,
-            (3, Role::Assistant, text) if text == WORD => stage = 4,
-            (_, Role::User, text)
-                if text.to_ascii_lowercase().contains(WORD) && text != TURN_ONE =>
-            {
-                return Err("stored prompt contained the secret word".into());
+        match stage_step(stage, message) {
+            StageStep::Advance(next) => stage = next,
+            StageStep::Leak => return Err("stored prompt contained the secret word".into()),
+            StageStep::CrossChat => {
+                return Err("the first chat contained the second chat's word".into())
             }
-            (_, _, text)
-                if text.to_ascii_lowercase().contains(OTHER) || text.contains(TURN_OTHER) =>
-            {
-                return Err("the first chat contained the second chat's word".into());
-            }
-            _ => {}
+            StageStep::Ignore => {}
         }
     }
     if stage < 4 {
