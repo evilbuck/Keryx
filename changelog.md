@@ -17,6 +17,7 @@
 - Streaming resume latency: parked message tails now hand over on the next inbound frame as soon as the UI catches up, instead of waiting for the 5s maintenance tick; visible text resumes within one frame (typically tens of milliseconds) after a brief UI stall.
 - Wedged writes: socket writes now time out in 5s instead of 30s, so a gateway that stops reading drops the link promptly and the automatic reconnect takes over rather than freezing the network loop.
 
-### Limitations
+- Post-ready stalls: the workspace and skill catalog fetches now run off the network loop, so a slow or stuck gateway cannot freeze frame processing, ping answering, or command handling right after connecting (previously up to 30s of transport-loop blockage on every connect).
 
+### Limitations
 - Up to six files can be attached per message. Each file is limited to 15 MB, and extracted document text is limited to 1 MB per file. Unsupported binary files and PDFs without extractable text are rejected; scanned PDFs require OCR first.

@@ -921,7 +921,7 @@ impl Link {
                 break;
             }
         }
-        self.fetch_studio_catalogs().await;
+        self.fetch_studio_catalogs();
     }
 
     async fn handle(&mut self, command: Command) {
@@ -991,7 +991,7 @@ impl Link {
                 stored_id,
                 mutation,
             } => self.mutate_session(stored_id, mutation).await,
-            Command::FetchStudio => self.fetch_studio_catalogs().await,
+            Command::FetchStudio => self.fetch_studio_catalogs(),
             _ => {}
         }
     }
@@ -1365,25 +1365,18 @@ impl Link {
         }
     }
 
-    async fn fetch_studio_catalogs(&self) {
-        let creds = self.credential_secrets();
-        // Two independent HTTP calls: concurrent halves the wall time and the
-        // worst-case delay before the palette's workspace and skill lists land.
-        let (workspaces, skills) = tokio::join!(
-            fetch_workspaces_http(&self.http, &self.origin, &creds),
-            fetch_skills_http(&self.http, &self.origin, &creds),
-        );
-        let catalog = match workspaces {
-            Ok(catalog) => catalog,
-            Err(err) => WorkspaceCatalog {
-                error: Some(self.clean(err)),
-                ..Default::default()
-            },
-        };
-        self.emit(Event::Workspaces { catalog }).await;
-        if let Ok(skills) = skills {
-            self.emit(Event::Skills { skills }).await;
-        }
+    /// Catalog fetches run off the transport loop: two HTTP round-trips with
+    /// 30s timeouts must not stall frame processing and probe answering right
+    /// after `gateway.ready`. The task emits the same events on the bounded
+    /// channel; a reconnect just spawns a fresh fetch that supersedes it.
+    fn fetch_studio_catalogs(&self) {
+        tokio::spawn(fetch_studio_catalogs_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.credential_secrets(),
+            self.secrets.clone(),
+            self.events.clone(),
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4610,6 +4603,33 @@ async fn upload_chat_image_http(
         .ok_or_else(|| "Gateway did not return an uploaded image path.".into())
 }
 
+/// The catalog fetch body that runs as its own task: two independent HTTP
+/// calls (concurrent halves the wall time), whose results land on the event
+/// channel with the same redaction the inline version used.
+async fn fetch_studio_catalogs_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    creds: Vec<String>,
+    secrets: Vec<String>,
+    events: tokio::sync::mpsc::Sender<Event>,
+) {
+    let (workspaces, skills) = tokio::join!(
+        fetch_workspaces_http(&http, &origin, &creds),
+        fetch_skills_http(&http, &origin, &creds),
+    );
+    let catalog = match workspaces {
+        Ok(catalog) => catalog,
+        Err(err) => WorkspaceCatalog {
+            error: Some(sanitize(&err, &secrets)),
+            ..Default::default()
+        },
+    };
+    let _ = events.send(Event::Workspaces { catalog }).await;
+    if let Ok(skills) = skills {
+        let _ = events.send(Event::Skills { skills }).await;
+    }
+}
+
 fn session_summary(row: &Value) -> Result<SessionSummary, String> {
     let stored_id = optional_trimmed_str(row, "id")
         .ok_or_else(|| "The conversation list was not usable.".to_string())?;
@@ -5855,6 +5875,122 @@ mod tests {
             };
             assert_eq!(delta, "hello");
             assert!(link.pending_deltas.is_empty());
+        });
+    }
+
+    /// A local HTTP server that reads each request and never replies: the
+    /// client's own timeout is the only way out.
+    async fn spawn_stalling_http() -> url::Url {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                std::future::pending::<()>().await;
+            }
+        });
+        url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    /// A local HTTP server serving the workspace and skill catalogs by path.
+    async fn spawn_catalog_http() -> url::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("/api/skills") {
+                    r#"[{"name":"b-plan","description":"Plan","category":"buck-workflow","enabled":true,"usage":3}]"#
+                } else {
+                    r#"{"default_cwd":"/home/alice/.hermes","home":"/home/alice","repos":[{"root":"/home/alice/app","label":"app","sessions":2}]}"#
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    #[test]
+    fn catalog_fetches_run_off_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // With the two catalog HTTP calls hung against a stalling
+            // gateway, the launcher must return immediately and the
+            // transport path must keep processing frames.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                link.fetch_studio_catalogs();
+                link.events
+                    .try_send(Event::Connection(ConnectionState::Connecting))
+                    .expect("fill");
+                link.emit_delta("rt", "m1", "hello").await;
+                assert!(incoming.try_recv().is_ok());
+                link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                    Vec::new().into(),
+                ))))
+                .await;
+                let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                    panic!("frames must process while catalog HTTP hangs");
+                };
+                assert_eq!(delta, "hello");
+            })
+            .await
+            .expect("transport loop must stay responsive");
+
+            // Against a live origin the spawned task still lands both
+            // catalog events on the channel.
+            let origin = spawn_catalog_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            link.fetch_studio_catalogs();
+            let workspaces = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("workspaces within 5s")
+                .expect("sender alive");
+            assert!(matches!(
+                &workspaces,
+                Event::Workspaces { catalog }
+                    if catalog.error.is_none() && catalog.options.len() == 2
+            ));
+            let skills = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("skills within 5s")
+                .expect("sender alive");
+            assert!(matches!(&skills, Event::Skills { skills } if skills.len() == 1));
         });
     }
 
