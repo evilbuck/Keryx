@@ -501,6 +501,9 @@ struct Link {
     last_inbound: Instant,
     /// Whether the last disconnect was transient and worth retrying automatically.
     retryable: bool,
+    /// Absorbs duplicate login-session rejections while one teardown is in
+    /// flight; reset when a fresh sign-in succeeds.
+    auth_reject_seen: bool,
 }
 
 async fn run(
@@ -562,6 +565,9 @@ async fn run(
                     && let Some(work) = link.live_work(stamped)
                 {
                     match work {
+                        LoopWork::AuthRejected => {
+                            link.apply_auth_rejected().await;
+                        }
                         LoopWork::Listed(listed) => {
                             link.apply_listed(*listed).await;
                         }
@@ -737,6 +743,10 @@ enum MidConnect {
 /// the session list (its listing caches live on the link) and attachment
 /// uploads (the submit RPC waits for the uploaded paths).
 enum LoopWork {
+    /// A REST action found the gateway rejecting the login session (an
+    /// expired cookie or a gateway restart). The first one tears the socket
+    /// down so the regular reconnect re-runs password sign-in.
+    AuthRejected,
     Listed(Box<Result<Event, String>>),
     Mutated {
         stored_id: String,
@@ -781,11 +791,31 @@ struct StampedWork {
 /// The work channel together with the connection epoch it was spawned on.
 /// Off-loop tasks deliver through the sink, so every result is stamped with
 /// the live epoch; a task cannot forget the stamp, because the plain sender
-/// type never reaches a task signature.
+/// type never reaches a task signature. The sink also carries the task's
+/// auth trip flag: REST helpers mark it when the gateway rejects the login
+/// session, and the task reports it through the channel once its fetches
+/// return.
 #[derive(Clone)]
 struct WorkSink {
     sender: tokio::sync::mpsc::UnboundedSender<StampedWork>,
     epoch: u64,
+    auth: AuthSignal,
+}
+
+/// A per-task trip flag the REST helpers set on an HTTP 401: the gateway
+/// rejected the login session (expired cookie, gateway restart). Cheap to
+/// share across concurrent fetches; the link reacts once per session.
+#[derive(Clone, Default)]
+struct AuthSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl AuthSignal {
+    fn trip(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn expired(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl WorkSink {
@@ -1039,6 +1069,7 @@ impl Link {
             work,
             work_rx: Some(work_rx),
             retryable: false,
+            auth_reject_seen: false,
         })
     }
 
@@ -1083,6 +1114,8 @@ impl Link {
         self.fail_jobs("The connection closed before the gateway answered.")
             .await;
         self.sign_in().await?;
+        // A fresh login session answers REST again; the next 401 is new.
+        self.auth_reject_seen = false;
         let ticket = self.request_ticket().await?;
         self.secrets.truncate(2);
         self.secrets.push(ticket.clone());
@@ -1750,6 +1783,7 @@ impl Link {
             self.credential_secrets(),
             self.secrets.clone(),
             self.events.clone(),
+            self.work_sink(),
         ));
     }
 
@@ -2071,9 +2105,11 @@ impl Link {
         let http = self.http.clone();
         let origin = self.origin.clone();
         tokio::spawn(async move {
-            work.deliver(LoopWork::Listed(Box::new(
-                fetch_sessions(&http, &origin, offset).await,
-            )));
+            let listed = fetch_sessions(&http, &origin, offset, &work.auth).await;
+            if work.auth.expired() {
+                work.deliver(LoopWork::AuthRejected);
+            }
+            work.deliver(LoopWork::Listed(Box::new(listed)));
         });
     }
 
@@ -2117,8 +2153,8 @@ impl Link {
             self.secrets.clone(),
             self.pinned_sessions.clone(),
             self.events.clone(),
-            query,
-            request_seq,
+            SearchRequest { query, request_seq },
+            self.work_sink(),
         ));
     }
 
@@ -2538,6 +2574,7 @@ impl Link {
             self.events.clone(),
             stored_id,
             before,
+            self.work_sink(),
         ));
     }
 
@@ -5018,12 +5055,34 @@ impl Link {
         (stamped.epoch == self.epoch).then_some(stamped.work)
     }
 
+    /// The gateway rejected a REST login session (expired cookie or a
+    /// gateway restart invalidating sessions). The first rejection emits the
+    /// disconnect and tears the socket down, so the regular reconnect cycle
+    /// re-runs password sign-in and refreshes the cookie; further
+    /// rejections inside the same window are absorbed. Retryable stays
+    /// true: an expired session is not a rejected password.
+    async fn apply_auth_rejected(&mut self) {
+        // Only a live socket tears down: a rejection from an earlier
+        // connection is already stale, and a socket that died on its own is
+        // already reconnecting.
+        if self.auth_reject_seen || self.write.is_none() {
+            return;
+        }
+        self.auth_reject_seen = true;
+        self.emit(Event::Connection(ConnectionState::Disconnected(
+            "Gateway session expired — reconnecting.".into(),
+        )))
+        .await;
+        self.close_socket().await;
+    }
+
     /// The work channel stamped with the current connection epoch; task
     /// launchers hand this to spawned fetches.
     fn work_sink(&self) -> WorkSink {
         WorkSink {
             sender: self.work.clone(),
             epoch: self.epoch,
+            auth: AuthSignal::default(),
         }
     }
 }
@@ -5100,6 +5159,7 @@ async fn fetch_sessions(
     http: &reqwest::Client,
     origin: &url::Url,
     offset: usize,
+    auth: &AuthSignal,
 ) -> Result<Event, String> {
     let mut url = endpoint(origin, "/api/sessions");
     url.query_pairs_mut()
@@ -5112,6 +5172,9 @@ async fn fetch_sessions(
         .send()
         .await
         .map_err(|_| "Could not list conversations.".to_string())?;
+    if response.status().as_u16() == 401 {
+        auth.trip();
+    }
     if !response.status().is_success() {
         return Err(format!(
             "Could not list conversations (HTTP {}).",
@@ -5194,6 +5257,7 @@ async fn fetch_search_hits(
     origin: &url::Url,
     query: &str,
     secrets: &[String],
+    auth: &AuthSignal,
 ) -> Result<Vec<crate::model::SearchHit>, String> {
     let mut url = endpoint(origin, "/api/sessions/search");
     url.query_pairs_mut()
@@ -5204,6 +5268,9 @@ async fn fetch_search_hits(
         .send()
         .await
         .map_err(|_| "Could not search conversations.".to_string())?;
+    if response.status().as_u16() == 401 {
+        auth.trip();
+    }
     if !response.status().is_success() {
         return Err(format!(
             "Could not search conversations (HTTP {}).",
@@ -5270,6 +5337,7 @@ async fn send_fenced_patch(
     origin: &url::Url,
     stored_id: &str,
     body: &Value,
+    auth: &AuthSignal,
 ) -> Result<PatchOutcome, String> {
     let payload = build_fenced_patch_body(http, origin, stored_id, body).await;
     let path = format!("/api/sessions/{stored_id}");
@@ -5280,6 +5348,9 @@ async fn send_fenced_patch(
         .await
         .map_err(|_| "Could not update conversation.".to_string())?;
     let code = response.status().as_u16();
+    if code == 401 {
+        auth.trip();
+    }
     if response.status().is_success() {
         return Ok(PatchOutcome::Applied);
     }
@@ -5297,12 +5368,13 @@ async fn patch_session_http(
     origin: &url::Url,
     stored_id: &str,
     body: &Value,
+    auth: &AuthSignal,
 ) -> Result<PatchOutcome, String> {
-    let first = send_fenced_patch(http, origin, stored_id, body).await?;
+    let first = send_fenced_patch(http, origin, stored_id, body, auth).await?;
     if first != PatchOutcome::Conflict {
         return Ok(first);
     }
-    send_fenced_patch(http, origin, stored_id, body).await
+    send_fenced_patch(http, origin, stored_id, body, auth).await
 }
 
 /// The earlier-visible pages for a branch request, fetched off the transport
@@ -5315,7 +5387,17 @@ async fn branch_seeds_task(
     work: WorkSink,
     request: BranchSeeds,
 ) {
-    let seeds = fetch_earlier_pages(&http, &origin, &request.stored_id, before_loaded).await;
+    let seeds = fetch_earlier_pages(
+        &http,
+        &origin,
+        &request.stored_id,
+        before_loaded,
+        &work.auth,
+    )
+    .await;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Branch(Box::new(BranchSeedsOutcome {
         request,
         seeds,
@@ -5327,12 +5409,13 @@ async fn fetch_earlier_pages(
     origin: &url::Url,
     stored_id: &str,
     before_loaded: usize,
+    auth: &AuthSignal,
 ) -> Result<Vec<SeedMessage>, String> {
     let mut out = Vec::new();
     let mut offset = 0usize;
     while offset < before_loaded {
         let limit = (before_loaded - offset).min(PAGE);
-        let page = fetch_history(http, origin, stored_id, offset, limit).await?;
+        let page = fetch_history(http, origin, stored_id, offset, limit, auth).await?;
         out.extend(seed_messages_through(&page, None));
         offset += limit;
     }
@@ -5350,7 +5433,10 @@ async fn readonly_history_task(
     reason: String,
     cached: Option<usize>,
 ) {
-    let result = readonly_history(&http, &origin, &stored_id, cached).await;
+    let result = readonly_history(&http, &origin, &stored_id, cached, &work.auth).await;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Readonly(Box::new(ReadonlyOutcome {
         stored_id,
         reason,
@@ -5363,6 +5449,7 @@ async fn readonly_history(
     origin: &url::Url,
     stored_id: &str,
     cached: Option<usize>,
+    auth: &AuthSignal,
 ) -> Result<ReadonlyHistory, String> {
     let mut warmed = Vec::new();
     let count = match cached {
@@ -5374,7 +5461,7 @@ async fn readonly_history(
             loop {
                 let Event::Sessions {
                     sessions, has_more, ..
-                } = fetch_sessions(http, origin, offset).await?
+                } = fetch_sessions(http, origin, offset, auth).await?
                 else {
                     return Err("The conversation list was not usable.".into());
                 };
@@ -5398,7 +5485,7 @@ async fn readonly_history(
         }
     };
     let before = count.saturating_sub(PAGE);
-    let messages = fetch_history(http, origin, stored_id, before, count - before).await?;
+    let messages = fetch_history(http, origin, stored_id, before, count - before, auth).await?;
     Ok(ReadonlyHistory {
         before,
         messages,
@@ -5415,8 +5502,19 @@ async fn resumed_history_task(
     mut page: ResumedPage,
     limit: usize,
 ) {
-    let messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
+    let messages = fetch_history(
+        &http,
+        &origin,
+        &page.stored_id,
+        page.before,
+        limit,
+        &work.auth,
+    )
+    .await;
     page.messages = messages;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Resumed(Box::new(page)));
 }
 
@@ -5429,7 +5527,11 @@ async fn synced_page_task(
     mut page: SyncedPage,
     limit: usize,
 ) {
-    page.messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
+    page.messages =
+        fetch_history(&http, &origin, &page.stored_id, page.before, limit, &work.auth).await;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Page(Box::new(page)));
 }
 
@@ -5442,10 +5544,15 @@ async fn branched_page_task(
     mut page: BranchedPage,
     limit: usize,
 ) {
-    page.messages = match fetch_history(&http, &origin, &page.stored_id, page.before, limit).await {
-        Ok(rows) if !rows.is_empty() => rows,
-        _ => std::mem::take(&mut page.fallback_messages),
-    };
+    page.messages =
+        match fetch_history(&http, &origin, &page.stored_id, page.before, limit, &work.auth).await
+        {
+            Ok(rows) if !rows.is_empty() => rows,
+            _ => std::mem::take(&mut page.fallback_messages),
+        };
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Branched(Box::new(page)));
 }
 
@@ -5460,7 +5567,10 @@ async fn archive_patch_task(
     retried: bool,
     body: Value,
 ) {
-    let result = patch_session_http(&http, &origin, &stored_id, &body).await;
+    let result = patch_session_http(&http, &origin, &stored_id, &body, &work.auth).await;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Archived {
         stored_id,
         retried,
@@ -5479,7 +5589,10 @@ async fn patch_session_task(
     mutation: SessionMutation,
     body: Value,
 ) {
-    let result = patch_session_http(&http, &origin, &stored_id, &body).await;
+    let result = patch_session_http(&http, &origin, &stored_id, &body, &work.auth).await;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Mutated {
         stored_id,
         mutation,
@@ -5500,7 +5613,10 @@ async fn deferred_patch_task(
     pinned: Option<bool>,
     body: Value,
 ) {
-    let result = patch_session_http(&http, &origin, &stored_id, &body).await;
+    let result = patch_session_http(&http, &origin, &stored_id, &body, &work.auth).await;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Deferred {
         stored_id,
         title,
@@ -5513,12 +5629,16 @@ async fn fetch_workspaces_http(
     http: &reqwest::Client,
     origin: &url::Url,
     secrets: &[String],
+    auth: &AuthSignal,
 ) -> Result<WorkspaceCatalog, String> {
     let response = http
         .get(endpoint(origin, "/api/chat/workspaces"))
         .send()
         .await
         .map_err(|_| "Could not load remote workspaces.".to_string())?;
+    if response.status().as_u16() == 401 {
+        auth.trip();
+    }
     if !response.status().is_success() {
         return Err(format!(
             "Could not load remote workspaces (HTTP {}).",
@@ -5536,12 +5656,16 @@ async fn fetch_skills_http(
     http: &reqwest::Client,
     origin: &url::Url,
     secrets: &[String],
+    auth: &AuthSignal,
 ) -> Result<Vec<SkillSummary>, String> {
     let response = http
         .get(endpoint(origin, "/api/skills"))
         .send()
         .await
         .map_err(|_| "Could not load remote skills.".to_string())?;
+    if response.status().as_u16() == 401 {
+        auth.trip();
+    }
     if !response.status().is_success() {
         return Err(format!(
             "Could not load remote skills (HTTP {}).",
@@ -5559,6 +5683,7 @@ async fn upload_chat_image_http(
     http: &reqwest::Client,
     origin: &url::Url,
     image: &StagedImage,
+    auth: &AuthSignal,
 ) -> Result<String, String> {
     let response = http
         .post(endpoint(origin, "/api/chat/image-upload"))
@@ -5569,6 +5694,9 @@ async fn upload_chat_image_http(
         .send()
         .await
         .map_err(|_| format!("Could not upload {}.", image.filename))?;
+    if response.status().as_u16() == 401 {
+        auth.trip();
+    }
     if !response.status().is_success() {
         return Err(format!(
             "Image upload failed for {} (HTTP {}).",
@@ -5605,10 +5733,13 @@ async fn upload_images_task(
     let result = futures_util::future::try_join_all(
         images
             .iter()
-            .map(|image| upload_chat_image_http(&http, &origin, image)),
+            .map(|image| upload_chat_image_http(&http, &origin, image, &work.auth)),
     )
     .await
     .map(VecDeque::from);
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     work.deliver(LoopWork::Uploaded {
         runtime_id,
         generation,
@@ -5626,10 +5757,11 @@ async fn fetch_studio_catalogs_task(
     creds: Vec<String>,
     secrets: Vec<String>,
     events: tokio::sync::mpsc::Sender<Event>,
+    work: WorkSink,
 ) {
     let (workspaces, skills) = tokio::join!(
-        fetch_workspaces_http(&http, &origin, &creds),
-        fetch_skills_http(&http, &origin, &creds),
+        fetch_workspaces_http(&http, &origin, &creds, &work.auth),
+        fetch_skills_http(&http, &origin, &creds, &work.auth),
     );
     let catalog = match workspaces {
         Ok(catalog) => catalog,
@@ -5642,6 +5774,9 @@ async fn fetch_studio_catalogs_task(
     if let Ok(skills) = skills {
         let _ = events.send(Event::Skills { skills }).await;
     }
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
 }
 
 /// The history read as its own task: same events, same redaction, emitted
@@ -5653,6 +5788,7 @@ async fn fetch_history_task(
     events: tokio::sync::mpsc::Sender<Event>,
     stored_id: String,
     before: usize,
+    work: WorkSink,
 ) {
     let next_before = before.saturating_sub(PAGE);
     let result = fetch_history(
@@ -5661,8 +5797,12 @@ async fn fetch_history_task(
         &stored_id,
         next_before,
         before - next_before,
+        &work.auth,
     )
     .await;
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
+    }
     match result {
         Ok(messages) => {
             let _ = events
@@ -5686,20 +5826,29 @@ async fn fetch_history_task(
     }
 }
 
+/// One search read: the query and the request sequence the UI matches the
+/// result set against.
+struct SearchRequest {
+    query: String,
+    request_seq: u64,
+}
+
 /// The search read as its own task: pinned marking against the cloned pin
 /// set, and on failure an empty result set followed by the same error event
-/// the inline path emitted.
+/// the inline path emitted. A 401 anywhere in the read reports the rejected
+/// login session through the work channel.
 async fn fetch_search_task(
     http: reqwest::Client,
     origin: url::Url,
     secrets: Vec<String>,
     pinned: std::collections::HashSet<String>,
     events: tokio::sync::mpsc::Sender<Event>,
-    query: String,
-    request_seq: u64,
+    request: SearchRequest,
+    work: WorkSink,
 ) {
+    let SearchRequest { query, request_seq } = request;
     let trimmed = query.trim().to_string();
-    match fetch_search_hits(&http, &origin, &trimmed, &secrets).await {
+    match fetch_search_hits(&http, &origin, &trimmed, &secrets, &work.auth).await {
         Ok(mut hits) => {
             for hit in &mut hits {
                 if pinned.contains(&hit.stored_id) {
@@ -5730,6 +5879,9 @@ async fn fetch_search_task(
                 })
                 .await;
         }
+    }
+    if work.auth.expired() {
+        work.deliver(LoopWork::AuthRejected);
     }
 }
 
@@ -5807,6 +5959,7 @@ async fn fetch_history(
     stored_id: &str,
     offset: usize,
     limit: usize,
+    auth: &AuthSignal,
 ) -> Result<Vec<ChatMessage>, String> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -5825,6 +5978,9 @@ async fn fetch_history(
         .send()
         .await
         .map_err(|_| "Could not load history.".to_string())?;
+    if response.status().as_u16() == 401 {
+        auth.trip();
+    }
     if response.status().as_u16() == 404 {
         return Err("Saved history was not found.".into());
     }
@@ -7436,6 +7592,177 @@ mod tests {
             }
         });
         url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    /// A gateway whose login endpoint works but whose REST surface rejects
+    /// the session with 401 — the expired-cookie shape mid-session.
+    async fn spawn_auth_expired_http() -> url::Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (status, body) = if req.contains("/auth/password-login") {
+                    ("200 OK", "{}")
+                } else {
+                    ("401 Unauthorized", "{}")
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    #[test]
+    fn unauthorized_rest_trips_the_auth_signal() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let origin = spawn_auth_expired_http().await;
+            let http = reqwest::Client::new();
+            let auth = AuthSignal::default();
+            let outcome = fetch_sessions(&http, &origin, 0, &auth).await;
+            assert!(
+                outcome.unwrap_err().contains("HTTP 401"),
+                "the user-facing message keeps the status"
+            );
+            assert!(auth.expired(), "a 401 must trip the auth signal");
+        });
+    }
+
+    #[test]
+    fn expired_login_session_tears_down_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // A gateway whose REST surface 401s everything: the history
+            // task must surface its normal error AND report the rejected
+            // login session, and the first report must tear the live socket
+            // down so the reconnect re-runs password sign-in. Further
+            // reports in the same window are absorbed.
+            let origin = spawn_auth_expired_http().await;
+            let (events, mut events_rx) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin.clone(),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events.clone(),
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work halves");
+            let sink = link.work_sink();
+
+            fetch_history_task(
+                link.http.clone(),
+                origin.clone(),
+                vec!["secret".into()],
+                events.clone(),
+                "s1".into(),
+                20,
+                sink.clone(),
+            )
+            .await;
+
+            let stamped =
+                tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                    .await
+                    .expect("work within timeout")
+                    .expect("work message");
+            assert!(
+                matches!(stamped.work, LoopWork::AuthRejected),
+                "a 401 history page must report the rejected session"
+            );
+
+            // Without a socket the rejection is stale: nothing emits. The
+            // task's own action error is already queued; drain it first.
+            link.apply_auth_rejected().await;
+            let only_action_error = events_rx.try_recv().expect("task error event");
+            assert!(matches!(only_action_error, Event::Error { .. }));
+            assert!(
+                events_rx.try_recv().is_err(),
+                "no socket, no teardown event"
+            );
+
+            // With a live socket the first rejection tears down and the
+            // second in the same window is absorbed.
+            let (write, _read) = fake_socket_halves().await;
+            link.write = Some(write);
+            let stamped = StampedWork {
+                epoch: link.epoch,
+                work: LoopWork::AuthRejected,
+            };
+            let Some(LoopWork::AuthRejected) = link.live_work(stamped) else {
+                unreachable!("test drives AuthRejected on the live epoch");
+            };
+            link.apply_auth_rejected().await;
+            link.apply_auth_rejected().await;
+
+            let mut seen = Vec::new();
+            while let Ok(event) = events_rx.try_recv() {
+                seen.push(event);
+            }
+            let connection_events = seen
+                .iter()
+                .filter(|event| matches!(event, Event::Connection(_)))
+                .count();
+            assert_eq!(
+                connection_events, 1,
+                "exactly one teardown event for repeated rejections: {seen:?}"
+            );
+            let [Event::Connection(ConnectionState::Disconnected(message))] = &seen[..] else {
+                unreachable!("exactly one Connection event remains: {seen:?}");
+            };
+            assert!(message.contains("Gateway session expired"));
+            assert_eq!(link.epoch, 1, "the teardown bumps the epoch");
+            assert!(link.auth_reject_seen);
+            assert!(link.write.is_none());
+        });
+    }
+
+    /// Real socket halves over a loopback pair, so a test can hold a live
+    /// write half without a WebSocket server.
+    async fn fake_socket_halves() -> (
+        futures_util::stream::SplitSink<Socket, Message>,
+        futures_util::stream::SplitStream<Socket>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            // Absorb the connection; the frame bytes are irrelevant here.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut sink = [0u8; 256];
+                    use tokio::io::AsyncReadExt;
+                    while stream.read(&mut sink).await.is_ok() {}
+                });
+            }
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("dial");
+        let socket: Socket = WebSocketStream::from_raw_socket(
+            MaybeTlsStream::Plain(tcp),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        use futures_util::StreamExt;
+        socket.split()
     }
 
     #[test]
@@ -9479,21 +9806,25 @@ mod tests {
             .expect("runtime");
         runtime.block_on(async {
             let http = reqwest::Client::new();
+            let auth = AuthSignal::default();
             let ok_url = spawn_one_http_status("200 OK", "{}").await;
             assert_eq!(
-                patch_session_http(&http, &ok_url, "s1", &json!({"pinned": true})).await,
+                patch_session_http(&http, &ok_url, "s1", &json!({"pinned": true}), &auth).await,
                 Ok(PatchOutcome::Applied)
             );
             let missing_url = spawn_one_http_status("404 Not Found", "{}").await;
             assert_eq!(
-                patch_session_http(&http, &missing_url, "s1", &json!({"pinned": true})).await,
+                patch_session_http(&http, &missing_url, "s1", &json!({"pinned": true}), &auth)
+                    .await,
                 Ok(PatchOutcome::NotFound)
             );
             let conflict_url = spawn_one_http_status("409 Conflict", "{}").await;
             assert_eq!(
-                patch_session_http(&http, &conflict_url, "s1", &json!({"archived": true})).await,
+                patch_session_http(&http, &conflict_url, "s1", &json!({"archived": true}), &auth)
+                    .await,
                 Ok(PatchOutcome::Conflict)
             );
+            assert!(!auth.expired(), "non-401 outcomes must not trip the flag");
 
             let archive_url = spawn_one_http_status("200 OK", "{}").await;
             let (events, mut incoming) = tokio::sync::mpsc::channel(16);
@@ -9585,7 +9916,10 @@ mod tests {
                 r#"{"default_cwd":"/home/alice/.hermes","home":"/home/alice","repos":[{"root":"/home/alice/app","label":"app","sessions":2}]}"#,
             )
             .await;
-            let cat = fetch_workspaces_http(&http, &ws_url, &[]).await.unwrap();
+            let ws_auth = AuthSignal::default();
+            let cat = fetch_workspaces_http(&http, &ws_url, &[], &ws_auth)
+                .await
+                .unwrap();
             assert_eq!(cat.options.len(), 2);
 
             let sk_url = spawn_one_http_status(
@@ -9593,7 +9927,9 @@ mod tests {
                 r#"[{"name":"b-plan","description":"Plan","category":"buck-workflow","enabled":true,"usage":3}]"#,
             )
             .await;
-            let skills = fetch_skills_http(&http, &sk_url, &[]).await.unwrap();
+            let skills = fetch_skills_http(&http, &sk_url, &[], &ws_auth)
+                .await
+                .unwrap();
             assert_eq!(skills.len(), 1);
 
             let up_url = spawn_one_http_status(
@@ -9605,8 +9941,11 @@ mod tests {
                 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
             ];
             let img = StagedImage::from_bytes(1, "p.png", png).unwrap();
-            let uploaded = upload_chat_image_http(&http, &up_url, &img).await.unwrap();
+            let uploaded = upload_chat_image_http(&http, &up_url, &img, &ws_auth)
+                .await
+                .unwrap();
             assert_eq!(uploaded, "/home/alice/.hermes/cache/images/p.png");
+            assert!(!ws_auth.expired());
 
             let base_url = spawn_one_http_status("200 OK", "{}").await;
             let (events, mut incoming) = tokio::sync::mpsc::channel(16);
