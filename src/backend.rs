@@ -25,6 +25,12 @@ const COMPRESS_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const PROBE_SILENCE: Duration = Duration::from_secs(30);
+/// Bound for the two HTTP sign-in steps (password login and ticket request).
+/// A pure auth round-trip against a LAN/tunnel gateway; one that has not
+/// completed in this window is wedged or black-holed, and failing fast lets
+/// the reconnect backoff start its next attempt instead of burning two full
+/// RPC waits per try.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound for the WebSocket handshake (TCP + TLS + upgrade). A pure transport
 /// step against a LAN/tunnel gateway; one that has not completed in this
 /// window is wedged or black-holed, and failing fast lets the reconnect
@@ -1151,6 +1157,7 @@ impl Link {
         let login = self
             .http
             .post(endpoint(&self.origin, "/auth/password-login"))
+            .timeout(SIGN_IN_TIMEOUT)
             .json(&json!({
                 "provider": "basic",
                 "username": self.username,
@@ -1197,6 +1204,7 @@ impl Link {
         let response = match self
             .http
             .post(endpoint(&self.origin, "/api/auth/ws-ticket"))
+            .timeout(SIGN_IN_TIMEOUT)
             .send()
             .await
         {
@@ -8045,6 +8053,55 @@ mod tests {
                 "dial must beat the old RPC-sized bound, took {elapsed:?}"
             );
             assert!(link.write.is_none() && link.read.is_none());
+            let state = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
+                .await
+                .expect("disconnection event");
+            assert!(matches!(
+                state,
+                Some(Event::Connection(ConnectionState::Disconnected(_)))
+            ));
+        });
+    }
+
+    #[test]
+    fn wedged_login_aborts_at_the_sign_in_bound() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // A gateway that accepts the connection but never answers the
+            // login POST: sign-in must fail at SIGN_IN_TIMEOUT (10s) rather
+            // than burning the full 30s RPC wait, so each reconnect attempt
+            // against a wedged endpoint cycles three times faster.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall.clone(),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            // connect() marks the attempt transient before sign-in; a pure
+            // transport failure must not clear that, only credential
+            // rejections (401/404/429) do.
+            link.retryable = true;
+            let started = std::time::Instant::now();
+            let outcome = link.sign_in().await;
+            let elapsed = started.elapsed();
+            assert_eq!(outcome, Err("Could not reach the gateway.".into()));
+            assert!(
+                elapsed >= SIGN_IN_TIMEOUT - std::time::Duration::from_secs(1),
+                "login must wait for the bound, took {elapsed:?}"
+            );
+            assert!(
+                elapsed < RPC_TIMEOUT,
+                "login must beat the old RPC-sized bound, took {elapsed:?}"
+            );
+            assert!(link.retryable);
             let state = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
                 .await
                 .expect("disconnection event");
