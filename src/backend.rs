@@ -25,6 +25,11 @@ const COMPRESS_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const PROBE_SILENCE: Duration = Duration::from_secs(30);
+/// Bound for the WebSocket handshake (TCP + TLS + upgrade). A pure transport
+/// step against a LAN/tunnel gateway; one that has not completed in this
+/// window is wedged or black-holed, and failing fast lets the reconnect
+/// backoff start its next attempt instead of burning a full RPC wait.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound for socket writes. A write that cannot complete in this window means
 /// the gateway stopped reading; dropping the link lets the automatic
 /// reconnect take over instead of stalling the transport loop for a full
@@ -1203,7 +1208,7 @@ impl Link {
     async fn dial_socket(&mut self, url: url::Url) -> Result<(), String> {
         let url_string: String = url.into();
         let connected =
-            tokio::time::timeout(RPC_TIMEOUT, tokio_tungstenite::connect_async(&url_string)).await;
+            tokio::time::timeout(DIAL_TIMEOUT, tokio_tungstenite::connect_async(&url_string)).await;
         drop(url_string);
         let (socket, _) = match connected {
             Ok(Ok(pair)) => pair,
@@ -7431,6 +7436,52 @@ mod tests {
             }
         });
         url::Url::parse(&format!("http://{addr}")).expect("origin")
+    }
+
+    #[test]
+    fn wedged_socket_dial_aborts_at_the_dial_bound() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // A gateway that accepts TCP but never completes the WebSocket
+            // handshake: the dial must fail at DIAL_TIMEOUT (10s) rather
+            // than burning the full 30s RPC wait per attempt, so the
+            // reconnect backoff reaches its next attempt sooner.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall.clone(),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let ws_url = ws_dial_url(&stall, "ticket").expect("ws url");
+            let started = std::time::Instant::now();
+            let outcome = link.dial_socket(ws_url).await;
+            let elapsed = started.elapsed();
+            assert_eq!(outcome, Err("socket".into()));
+            assert!(
+                elapsed >= DIAL_TIMEOUT - std::time::Duration::from_secs(1),
+                "dial must wait for the bound, took {elapsed:?}"
+            );
+            assert!(
+                elapsed < RPC_TIMEOUT,
+                "dial must beat the old RPC-sized bound, took {elapsed:?}"
+            );
+            assert!(link.write.is_none() && link.read.is_none());
+            let state = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
+                .await
+                .expect("disconnection event");
+            assert!(matches!(
+                state,
+                Some(Event::Connection(ConnectionState::Disconnected(_)))
+            ));
+        });
     }
 
     #[test]
