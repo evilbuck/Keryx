@@ -49,6 +49,13 @@ const EVENT_BOUND: usize = 512;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// The loop's write half: an outbound queue to the background writer task
+/// that owns the real socket sink. Enqueueing never blocks, so a wedged
+/// socket cannot stall frame processing; the writer reports a failed or
+/// timed-out write as `LoopWork::WriteDead` and the loop tears the link
+/// down exactly like any other socket loss.
+type WriteTx = tokio::sync::mpsc::UnboundedSender<Message>;
+
 pub struct Backend {
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
     events: std::sync::Mutex<tokio::sync::mpsc::Receiver<Event>>,
@@ -461,7 +468,7 @@ struct Link {
     password: String,
     secrets: Vec<String>,
     read: Option<futures_util::stream::SplitStream<Socket>>,
-    write: Option<futures_util::stream::SplitSink<Socket, Message>>,
+    write: Option<WriteTx>,
     next_id: u64,
     next_turn_generation: u64,
     /// Connection epoch: bumped on every socket teardown, so off-loop work
@@ -567,6 +574,9 @@ async fn run(
                     match work {
                         LoopWork::AuthRejected => {
                             link.apply_auth_rejected().await;
+                        }
+                        LoopWork::WriteDead => {
+                            link.apply_write_dead().await;
                         }
                         LoopWork::Listed(listed) => {
                             link.apply_listed(*listed).await;
@@ -747,6 +757,11 @@ enum LoopWork {
     /// expired cookie or a gateway restart). The first one tears the socket
     /// down so the regular reconnect re-runs password sign-in.
     AuthRejected,
+    /// The background writer could not complete a write inside
+    /// `WRITE_TIMEOUT` (or the sink errored): the socket is wedged or
+    /// dead. The first report tears the link down so the reconnect cycle
+    /// takes over; in-flight jobs fail with the disconnect message.
+    WriteDead,
     Listed(Box<Result<Event, String>>),
     Mutated {
         stored_id: String,
@@ -1254,7 +1269,13 @@ impl Link {
             }
         };
         let (write, read) = socket.split();
-        self.write = Some(write);
+        // The background writer owns the sink: the loop only enqueues, so
+        // socket backpressure never stalls frame processing. A failed or
+        // timed-out write comes back as LoopWork::WriteDead on the live
+        // epoch, and the link tears down like any other socket loss.
+        let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(writer_task(write, write_rx, self.work_sink(), WRITE_TIMEOUT));
+        self.write = Some(write_tx);
         self.read = Some(read);
         self.last_inbound = Instant::now();
         self.heartbeat = false;
@@ -2726,23 +2747,24 @@ impl Link {
         Ok(id)
     }
 
+    /// Enqueues one JSON-RPC frame on the outbound queue. Never blocks: the
+    /// background writer applies the write bound, and a failed write is
+    /// reported as `LoopWork::WriteDead` (failing every in-flight job via
+    /// the disconnect path). `Ambiguous` here means the writer task itself
+    /// is already gone — the frame may or may not have reached the wire.
     async fn send_raw(&mut self, value: &Value) -> Result<(), SendFault> {
-        let Some(write) = self.write.as_mut() else {
+        let Some(write) = self.write.as_ref() else {
             return Err(SendFault::NotSent);
         };
         let text = value.to_string();
-        if matches!(
-            tokio::time::timeout(WRITE_TIMEOUT, write.send(Message::text(text))).await,
-            Ok(Ok(()))
-        ) {
+        if write.send(Message::text(text)).is_ok() {
             Ok(())
         } else {
-            self.close_socket().await;
-            self.emit(Event::Connection(ConnectionState::Disconnected(
-                "The connection failed while sending. Nothing already sent will be replayed."
-                    .into(),
-            )))
-            .await;
+            // The writer task is gone: the socket is dead. Report through
+            // the work channel so the teardown (which fails every
+            // in-flight job) runs on the loop's work arm, not inside this
+            // call.
+            self.work_sink().deliver(LoopWork::WriteDead);
             Err(SendFault::Ambiguous)
         }
     }
@@ -2771,17 +2793,15 @@ impl Link {
         match frame {
             Message::Text(text) => self.on_text(text.as_str()).await,
             Message::Ping(payload) => {
-                let failed = if let Some(write) = self.write.as_mut() {
-                    !matches!(
-                        tokio::time::timeout(WRITE_TIMEOUT, write.send(Message::Pong(payload))).await,
-                        Ok(Ok(()))
-                    )
-                } else {
-                    false
-                };
-                if failed {
-                    self.drop_socket("The connection failed while sending.")
-                        .await;
+                // Pongs go through the same queue as everything else: a
+                // wedged socket cannot stall the frame loop here, and the
+                // writer reports the dead link via WriteDead.
+                if let Some(write) = self.write.as_ref()
+                    && write.send(Message::Pong(payload)).is_err()
+                {
+                    // Writer gone: report through the work channel; the
+                    // work arm tears the link down.
+                    self.work_sink().deliver(LoopWork::WriteDead);
                 }
             }
             Message::Pong(_) => {}
@@ -4991,20 +5011,20 @@ impl Link {
     /// RFC 6455 keepalive: after `PROBE_SILENCE` without any inbound frame, send a
     /// protocol-level Ping. A live gateway answers with Pong, which refreshes
     /// `last_inbound`, so a healthy idle connection is no longer dropped by the
-    /// inbound-silence bound. The socket is dropped only when the probe itself
-    /// cannot be written.
+    /// inbound-silence bound. The socket is dropped only when the writer
+    /// itself reports a dead link (`LoopWork::WriteDead`) or the channel is
+    /// already closed.
     async fn probe_keepalive(&mut self, now: Instant) {
         if self.write.is_none() || !probe_due(self.last_inbound, now) {
             return;
         }
-        let Some(write) = self.write.as_mut() else {
+        let Some(write) = self.write.as_ref() else {
             return;
         };
-        let sent =
-            tokio::time::timeout(Duration::from_secs(5), write.send(Message::Ping(Vec::new().into())))
-                .await;
-        if !matches!(sent, Ok(Ok(()))) {
-            self.drop_socket("The connection failed while probing.").await;
+        if write.send(Message::Ping(Vec::new().into())).is_err() {
+            // Writer gone: report through the work channel; the work arm
+            // tears the link down.
+            self.work_sink().deliver(LoopWork::WriteDead);
         }
     }
 
@@ -5026,9 +5046,11 @@ impl Link {
     }
 
     async fn close_socket(&mut self) {
-        if let Some(mut write) = self.write.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), write.send(Message::Close(None)))
-                .await;
+        // The Close frame rides the queue; the writer applies the write
+        // bound in the background and exits once this sender drops. A
+        // wedged socket therefore costs the loop nothing here either.
+        if let Some(write) = self.write.take() {
+            let _ = write.send(Message::Close(None));
         }
         self.read = None;
         self.ready = false;
@@ -5074,6 +5096,20 @@ impl Link {
         )))
         .await;
         self.close_socket().await;
+    }
+
+    /// The background writer could not complete a write inside the write
+    /// bound: the socket is wedged or dead. Tears the link down exactly
+    /// like any other socket loss — one disconnect event, in-flight jobs
+    /// fail with the disconnect message, the reconnect cycle takes over.
+    /// A report from an earlier connection is stale and absorbed: only a
+    /// live socket reacts.
+    async fn apply_write_dead(&mut self) {
+        if self.write.is_none() {
+            return;
+        }
+        self.drop_socket("The connection failed while sending.")
+            .await;
     }
 
     /// The work channel stamped with the current connection epoch; task
@@ -5822,6 +5858,35 @@ async fn fetch_history_task(
                     message: sanitize(&message, &secrets),
                 })
                 .await;
+        }
+    }
+}
+
+/// The outbound write loop. Owns the real socket sink for the lifetime of
+/// one connection: frames are applied strictly in arrival order, each
+/// inside `write_timeout`. The transport loop only enqueues, so a wedged
+/// socket (TCP backpressure, half-open connection) costs the loop nothing
+/// — a write that cannot complete inside the bound reports
+/// `LoopWork::WriteDead` on the captured epoch and the task exits; the
+/// loop tears the link down like any other socket loss. The task also
+/// exits normally once every sender drops (`close_socket` takes the
+/// link's sender after enqueueing the Close frame, so the close is
+/// flushed before exit).
+async fn writer_task<S>(
+    mut write: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    work: WorkSink,
+    write_timeout: Duration,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(frame) = rx.recv().await {
+        if !matches!(
+            tokio::time::timeout(write_timeout, write.send(frame)).await,
+            Ok(Ok(()))
+        ) {
+            work.deliver(LoopWork::WriteDead);
+            break;
         }
     }
 }
@@ -7700,8 +7765,7 @@ mod tests {
 
             // With a live socket the first rejection tears down and the
             // second in the same window is absorbed.
-            let (write, _read) = fake_socket_halves().await;
-            link.write = Some(write);
+            install_fake_writer(&mut link).await;
             let stamped = StampedWork {
                 epoch: link.epoch,
                 work: LoopWork::AuthRejected,
@@ -7734,18 +7798,15 @@ mod tests {
         });
     }
 
-    /// Real socket halves over a loopback pair, so a test can hold a live
-    /// write half without a WebSocket server.
-    async fn fake_socket_halves() -> (
-        futures_util::stream::SplitSink<Socket, Message>,
-        futures_util::stream::SplitStream<Socket>,
-    ) {
+    /// Spawns the real background writer over a loopback socket, so a test
+    /// can hold a live `write` channel without a WebSocket server. The
+    /// peer absorbs and discards bytes, so writes always complete.
+    async fn install_fake_writer(link: &mut Link) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
-            // Absorb the connection; the frame bytes are irrelevant here.
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     let mut sink = [0u8; 256];
@@ -7762,7 +7823,190 @@ mod tests {
         )
         .await;
         use futures_util::StreamExt;
-        socket.split()
+        let (sink, _read) = socket.split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(writer_task(sink, rx, link.work_sink(), WRITE_TIMEOUT));
+        link.write = Some(tx);
+    }
+
+    /// A WebSocketStream over a fixed-capacity duplex with no reader: the
+    /// first oversized write pends forever, so the writer must report
+    /// `WriteDead` at the (test-shortened) write bound instead of blocking
+    /// its caller.
+    #[test]
+    fn writer_task_reports_write_dead_on_wedged_socket() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (client_io, _server_io) = tokio::io::duplex(16);
+            let socket: WebSocketStream<tokio::io::DuplexStream> =
+                WebSocketStream::from_raw_socket(
+                    client_io,
+                    tokio_tungstenite::tungstenite::protocol::Role::Client,
+                    None,
+                )
+                .await;
+            use futures_util::StreamExt;
+            let (sink, _read) = socket.split();
+            let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel();
+            let work = WorkSink {
+                sender: work_tx,
+                epoch: 7,
+                auth: AuthSignal::default(),
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(writer_task(
+                sink,
+                rx,
+                work,
+                Duration::from_millis(100),
+            ));
+            tx.send(Message::text("x".repeat(512)))
+                .expect("enqueue wedged frame");
+            let stamped =
+                tokio::time::timeout(Duration::from_secs(2), work_rx.recv())
+                    .await
+                    .expect("writer reports in time");
+            let StampedWork { epoch, work } = stamped.expect("report delivered");
+            assert_eq!(epoch, 7, "the report carries the captured epoch");
+            assert!(matches!(work, LoopWork::WriteDead));
+            task.await.expect("writer exits after the dead report");
+            // The queue is gone with the task: a closed writer is the only
+            // thing the loop can observe directly.
+            assert!(tx.is_closed());
+        });
+    }
+
+    /// A writer over a drained socket delivers every queued frame —
+    /// including one larger than the pipe capacity — and exits cleanly
+    /// when the sender drops, without any dead-link report.
+    #[test]
+    fn writer_task_drains_frames_and_exits_when_the_channel_closes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (client_io, mut server_io) = tokio::io::duplex(64);
+            // Drain continuously so writes complete across capacity bounds.
+            let drainer = tokio::spawn(async move {
+                let mut total = 0usize;
+                let mut chunk = [0u8; 512];
+                use tokio::io::AsyncReadExt;
+                while let Ok(n) = server_io.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                total
+            });
+            let socket: WebSocketStream<tokio::io::DuplexStream> =
+                WebSocketStream::from_raw_socket(
+                    client_io,
+                    tokio_tungstenite::tungstenite::protocol::Role::Client,
+                    None,
+                )
+                .await;
+            use futures_util::StreamExt;
+            let (sink, read) = socket.split();
+            let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel();
+            let work = WorkSink {
+                sender: work_tx,
+                epoch: 3,
+                auth: AuthSignal::default(),
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(writer_task(
+                sink,
+                rx,
+                work,
+                Duration::from_millis(100),
+            ));
+            let big = "y".repeat(4096);
+            tx.send(Message::text(big.clone())).expect("enqueue text");
+            tx.send(Message::Ping(Vec::new().into()))
+                .expect("enqueue ping");
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("writer drains and exits in time")
+                .expect("writer task joins cleanly");
+            // Release the socket so the drainer observes EOF.
+            drop(read);
+            assert!(
+                work_rx.try_recv().is_err(),
+                "a healthy drain never reports WriteDead"
+            );
+            let total = drainer.await.expect("drainer joins");
+            assert!(
+                total >= big.len(),
+                "the oversized frame crossed the wire: {total} bytes"
+            );
+        });
+    }
+
+    /// The loop's reaction to a dead writer: the first `WriteDead` on a
+    /// live socket tears down once (one disconnect event, in-flight jobs
+    /// fail with the disconnect message, epoch bumps) and a follow-up is
+    /// absorbed because the socket is already gone.
+    #[test]
+    fn write_dead_tears_down_once_and_fails_in_flight_jobs() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut events_rx) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("http://gateway.invalid").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            install_fake_writer(&mut link).await;
+            // One job in flight: the write death must fail it immediately,
+            // not leave it waiting for its full RPC deadline.
+            link.jobs.insert(
+                41,
+                Job {
+                    kind: JobKind::Ping,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+            );
+            link.apply_write_dead().await;
+            link.apply_write_dead().await;
+
+            let mut seen = Vec::new();
+            while let Ok(event) = events_rx.try_recv() {
+                seen.push(event);
+            }
+            let connection_events = seen
+                .iter()
+                .filter(|event| matches!(event, Event::Connection(_)))
+                .count();
+            assert_eq!(
+                connection_events, 1,
+                "exactly one teardown event for repeated write deaths: {seen:?}"
+            );
+            let [Event::Connection(ConnectionState::Disconnected(message))] =
+                &seen[..]
+            else {
+                unreachable!("exactly one Connection event remains: {seen:?}");
+            };
+            assert!(message.contains("failed while sending"));
+            assert_eq!(link.epoch, 1, "the teardown bumps the epoch");
+            assert!(link.write.is_none());
+            assert!(
+                link.jobs.is_empty(),
+                "the in-flight job failed with the disconnect"
+            );
+        });
     }
 
     #[test]
