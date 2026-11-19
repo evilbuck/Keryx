@@ -86,7 +86,7 @@ Attachment uploads ride the same shape: `begin_submit` hands the staged images t
 
 Branching a conversation fetches its earlier visible pages the same way: `begin_branch` hands the page walk (up to ceil(before_loaded / PAGE) history round trips) to a task and applies the seeds on the loop when they arrive, so a slow history endpoint cannot stall frames while a branch is prepared.
 
-A successful resume loads its saved page the same way: the runtime mapping and message count are recorded on the loop, the page fetch runs in a task carrying the original reply, and the continuation replays on the loop — `Resumed`, live info, turn adoption for still-running sessions, and the gateway's open requests — so a slow history endpoint cannot stall frames on the most common open path.
+A successful resume loads its saved page the same way — runtime mapping and message count recorded on the loop, the page fetched in a task carrying the original reply, and the continuation replayed on the loop — as do the undo and compress sync replies: their post-sync first page loads off the loop and the `Undone`/`Compressed` completion event applies when the rows return, so a slow history endpoint cannot stall frames on the most common open path or on rewind/compress completions.
 
 Socket writes (JSON-RPC frames and Pong replies) are bounded by a 5s `WRITE_TIMEOUT`, far below the 30s RPC response wait: a gateway that stops reading its socket fails the write within 5s, the link drops, and automatic reconnect takes over instead of stalling the transport loop.
 

@@ -556,6 +556,9 @@ async fn run(
                     Some(LoopWork::Resumed(page)) => {
                         link.apply_resumed(*page).await;
                     }
+                    Some(LoopWork::Page(page)) => {
+                        link.apply_synced_page(*page).await;
+                    }
                     None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
@@ -667,6 +670,7 @@ enum LoopWork {
     Branch(Box<BranchSeedsOutcome>),
     Readonly(Box<ReadonlyOutcome>),
     Resumed(Box<ResumedPage>),
+    Page(Box<SyncedPage>),
 }
 
 /// A branch request whose earlier pages are fetched off the transport loop.
@@ -709,6 +713,30 @@ struct ResumedPage {
     before: usize,
     messages: Result<Vec<ChatMessage>, String>,
     result: Value,
+}
+
+/// Which user action a synced history page completes. Undo and compress
+/// replies both reload the conversation's first page before their event.
+enum PageAction {
+    Undo {
+        runtime_id: String,
+        removed: usize,
+        mode: RewindMode,
+        prompt_text: String,
+    },
+    Compress {
+        runtime_id: String,
+        summary: CompressSummary,
+    },
+}
+
+/// A synced history page fetched off the transport loop, plus the action it
+/// completes when the rows return.
+struct SyncedPage {
+    stored_id: String,
+    before: usize,
+    messages: Result<Vec<ChatMessage>, String>,
+    action: PageAction,
 }
 
 fn mid_connect(command: Option<Command>) -> MidConnect {
@@ -3301,23 +3329,90 @@ impl Link {
             .unwrap_or(0) as usize;
         self.message_counts.insert(stored_id.clone(), count);
         let before = count.saturating_sub(PAGE);
-        let messages =
-            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
-            {
-                Ok(rows) => rows,
-                Err(err) => {
-                    self.fail("compress", Some(stored_id), err).await;
-                    return;
-                }
-            };
-        self.emit(Event::Compressed {
+        // The post-sync page loads off the transport loop; the completion
+        // event applies when the rows return.
+        self.load_synced_page(
             stored_id,
-            runtime_id: effective_runtime,
-            messages: Some(messages),
             before,
-            summary,
-        })
-        .await;
+            count - before,
+            PageAction::Compress {
+                runtime_id: effective_runtime,
+                summary,
+            },
+        );
+    }
+
+    /// Spawns the off-loop page fetch for a sync reply, carrying the action
+    /// the rows complete.
+    fn load_synced_page(&self, stored_id: String, before: usize, limit: usize, action: PageAction) {
+        tokio::spawn(synced_page_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work.clone(),
+            SyncedPage {
+                stored_id,
+                before,
+                // The task overwrites this with the fetched rows.
+                messages: Ok(Vec::new()),
+                action,
+            },
+            limit,
+        ));
+    }
+
+    /// Applies a fetched sync page on the loop: the undo or compress
+    /// completion event, or the same per-operation failure the inline path
+    /// produced.
+    async fn apply_synced_page(&mut self, page: SyncedPage) {
+        let SyncedPage {
+            stored_id,
+            before,
+            messages,
+            action,
+        } = page;
+        let operation = match &action {
+            PageAction::Undo { .. } => "undo",
+            PageAction::Compress { .. } => "compress",
+        };
+        let messages = match messages {
+            Ok(rows) => rows,
+            Err(err) => {
+                self.fail(operation, Some(stored_id), err).await;
+                return;
+            }
+        };
+        match action {
+            PageAction::Undo {
+                runtime_id,
+                removed,
+                mode,
+                prompt_text,
+            } => {
+                self.emit(Event::Undone {
+                    stored_id,
+                    runtime_id,
+                    removed,
+                    messages,
+                    before,
+                    mode,
+                    prompt_text,
+                })
+                .await;
+            }
+            PageAction::Compress {
+                runtime_id,
+                summary,
+            } => {
+                self.emit(Event::Compressed {
+                    stored_id,
+                    runtime_id,
+                    messages: Some(messages),
+                    before,
+                    summary,
+                })
+                .await;
+            }
+        }
     }
 
     fn build_pending_branch(
@@ -3622,25 +3717,19 @@ impl Link {
             .unwrap_or(0) as usize;
         self.message_counts.insert(stored_id.clone(), count);
         let before = count.saturating_sub(PAGE);
-        let messages =
-            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
-            {
-                Ok(rows) => rows,
-                Err(err) => {
-                    self.fail("undo", Some(stored_id), err).await;
-                    return;
-                }
-            };
-        self.emit(Event::Undone {
+        // The post-sync page loads off the transport loop; the completion
+        // event applies when the rows return.
+        self.load_synced_page(
             stored_id,
-            runtime_id: effective_runtime,
-            removed,
-            messages,
             before,
-            mode,
-            prompt_text,
-        })
-        .await;
+            count - before,
+            PageAction::Undo {
+                runtime_id: effective_runtime,
+                removed,
+                mode,
+                prompt_text,
+            },
+        );
     }
 
     async fn on_submit_reply(&mut self, runtime_id: String, generation: u64) {
@@ -4859,6 +4948,19 @@ async fn resumed_history_task(
     let messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
     page.messages = messages;
     let _ = work.send(LoopWork::Resumed(Box::new(page)));
+}
+
+/// A post-sync history page (undo or compress), off the transport loop; the
+/// completion event applies on the loop when the rows return.
+async fn synced_page_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    mut page: SyncedPage,
+    limit: usize,
+) {
+    page.messages = fetch_history(&http, &origin, &page.stored_id, page.before, limit).await;
+    let _ = work.send(LoopWork::Page(Box::new(page)));
 }
 
 /// The session patch as its own task: the fenced patch (and its one
@@ -8404,6 +8506,7 @@ mod tests {
                 &json!({"status": "compressed", "removed": 4, "summary": {"noop": false, "headline": "Compacted 4 rows"}}),
                 &[],
             );
+            let mut work_rx = sync_link.work_rx.take().expect("work channel");
             sync_link
                 .on_compress_sync_reply(
                     "st-2".into(),
@@ -8412,6 +8515,14 @@ mod tests {
                     &json!({"session_id": "rt-2b", "message_count": 2}),
                 )
                 .await;
+            let paged = tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                .await
+                .expect("compress page within 5s")
+                .expect("sender alive");
+            let LoopWork::Page(page) = paged else {
+                panic!("expected compress page work");
+            };
+            sync_link.apply_synced_page(*page).await;
             assert!(matches!(
                 incoming.try_recv(),
                 Ok(Event::Compressed { stored_id, runtime_id, messages: Some(rows), .. })
