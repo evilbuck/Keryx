@@ -12,6 +12,7 @@
 ### Fixed
 
 - Idle disconnects: after 30s of inbound silence the client now sends a WebSocket Ping, so healthy idle connections are no longer dropped by the 90s silence rule; only a link that stays silent despite probes is disconnected.
+- Reconnect stampedes: the automatic retry backoff now carries equal jitter (each attempt lands in the second half of its scheduled delay, sampled from the clock), so clients dropped by the same gateway restart retry over a spread instead of all hitting the gateway on the same instant.
 - Post-reconnect delay: queued commands now run before the workspace and skill catalogs are fetched, and the two catalog requests run concurrently instead of serially, so reconnecting no longer blocks user actions behind catalog round-trips (previously up to 60s worst case).
 - Stuck sign-ins: pressing Reconnect during an in-flight connection attempt now aborts it and retries immediately; previously the press was ignored until the 90-second connect bound expired.
 - Streaming resume latency: parked message tails now hand over on the next inbound frame as soon as the UI catches up, instead of waiting for the 5s maintenance tick; visible text resumes within one frame (typically tens of milliseconds) after a brief UI stall.

@@ -521,6 +521,7 @@ async fn run(
             *retry_at,
             attempts,
             tokio::time::Instant::now(),
+            jitter_subsec(),
         );
     };
     loop {
@@ -629,7 +630,9 @@ async fn run(
     link.close_socket().await;
 }
 
-/// Backoff between automatic reconnect attempts: 1s, 2s, 4s, 8s, 16s, then 30s.
+/// Backoff between automatic reconnect attempts: 1s, 2s, 4s, 8s, 16s, then 30s
+/// (the scheduled delay; equal jitter spreads each attempt across its second
+/// half — see `jittered`).
 fn reconnect_delay(attempt: u32) -> Duration {
     match attempt {
         1 => Duration::from_secs(1),
@@ -641,6 +644,24 @@ fn reconnect_delay(attempt: u32) -> Duration {
     }
 }
 
+/// Wall-clock sub-second nanoseconds for backoff jitter: cheap (vDSO), and
+/// it only has to desynchronize clients — this is not a randomness source.
+fn jitter_subsec() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |t| t.subsec_nanos())
+}
+
+/// Equal jitter: half the scheduled delay is fixed, half scales with
+/// `subsec` (wall-clock nanoseconds, 0..1s). Clients dropped by the same
+/// gateway event therefore retry over a spread — for the 30s cap, over a
+/// 15s window — instead of all landing on the same instant.
+fn jittered(delay: Duration, subsec: u32) -> Duration {
+    let half = delay / 2;
+    let offset = (half.as_nanos() as u64) * (subsec as u64) / 1_000_000_000;
+    half + Duration::from_nanos(offset)
+}
+
 /// Reconnect bookkeeping. A live socket resets the backoff; a dropped,
 /// still-retryable socket schedules the next attempt. Authentication
 /// failures are never rescheduled.
@@ -650,6 +671,7 @@ fn reconnect_deadline(
     pending: Option<tokio::time::Instant>,
     attempts: &mut u32,
     now: tokio::time::Instant,
+    subsec: u32,
 ) -> Option<tokio::time::Instant> {
     if connected {
         *attempts = 0;
@@ -659,7 +681,7 @@ fn reconnect_deadline(
         return pending;
     }
     *attempts = attempts.saturating_add(1);
-    Some(now + reconnect_delay(*attempts))
+    Some(now + jittered(reconnect_delay(*attempts), subsec))
 }
 
 async fn retry_wait(retry_at: Option<tokio::time::Instant>) {
@@ -6445,6 +6467,9 @@ mod tests {
     fn reconnect_deadline_resets_on_connect_and_never_retries_auth_failures() {
         let now = tokio::time::Instant::now();
         let mut attempts = 0;
+        // Fixed jitter sample: half the 1s schedule is fixed, the scaled
+        // half is 500ms * 0.5 = 250ms, so attempt 1 lands at exactly 750ms.
+        let subsec = 500_000_000;
 
         // Live socket clears any pending retry and resets the backoff.
         assert_eq!(
@@ -6453,35 +6478,67 @@ mod tests {
                 false,
                 Some(now + Duration::from_secs(9)),
                 &mut attempts,
-                now
+                now,
+                subsec
             ),
             None
         );
         assert_eq!(attempts, 0);
 
-        // A dropped, retryable socket schedules attempt 1 after 1s.
-        let first = reconnect_deadline(false, true, None, &mut attempts, now).unwrap();
-        assert_eq!(first, now + Duration::from_secs(1));
+        // A dropped, retryable socket schedules attempt 1 with jitter applied.
+        let first = reconnect_deadline(false, true, None, &mut attempts, now, subsec).unwrap();
+        assert_eq!(first, now + Duration::from_millis(750));
         assert_eq!(attempts, 1);
 
         // A pending retry is not rescheduled or shortened.
         assert_eq!(
-            reconnect_deadline(false, true, Some(first), &mut attempts, now),
+            reconnect_deadline(false, true, Some(first), &mut attempts, now, subsec),
             Some(first)
         );
         assert_eq!(attempts, 1);
 
         // Authentication failure never schedules and does not grow attempts.
         assert_eq!(
-            reconnect_deadline(false, false, None, &mut attempts, now),
+            reconnect_deadline(false, false, None, &mut attempts, now, subsec),
             None
         );
         assert_eq!(attempts, 1);
 
-        // After a successful reconnect the backoff starts over at 1s.
-        reconnect_deadline(true, true, None, &mut attempts, now);
-        let second = reconnect_deadline(false, true, None, &mut attempts, now).unwrap();
-        assert_eq!(second, now + Duration::from_secs(1));
+        // After a successful reconnect the backoff starts over (jittered).
+        reconnect_deadline(true, true, None, &mut attempts, now, subsec);
+        let second = reconnect_deadline(false, true, None, &mut attempts, now, subsec).unwrap();
+        assert_eq!(second, now + Duration::from_millis(750));
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_between_half_and_full_schedule() {
+        // Bounds: zero nanos lands on half the schedule; nearly a full second
+        // of nanos approaches the scheduled delay without exceeding it.
+        assert_eq!(jittered(Duration::from_secs(1), 0), Duration::from_millis(500));
+        assert_eq!(
+            jittered(Duration::from_secs(1), 999_999_999),
+            Duration::from_nanos(999_999_999)
+        );
+        // Monotonic in the sample, and never past the schedule.
+        let mut previous = Duration::ZERO;
+        for subsec in [0, 100_000_000, 500_000_000, 900_000_000, 999_999_999] {
+            let delay = jittered(Duration::from_secs(30), subsec);
+            assert!(delay >= previous);
+            assert!(delay >= Duration::from_secs(15));
+            assert!(delay <= Duration::from_secs(30));
+            previous = delay;
+        }
+        // The lockstep case quantified: two clients that lost the same
+        // connection, one sampling at each extreme, retry attempt 3 (4s)
+        // 2s apart instead of on the same instant.
+        assert_eq!(
+            jittered(Duration::from_secs(4), 0),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            jittered(Duration::from_secs(4), 999_999_999),
+            Duration::from_nanos(3_999_999_998)
+        );
     }
 
     #[test]
