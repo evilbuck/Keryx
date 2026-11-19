@@ -24,6 +24,7 @@
 - Session-read and mutation stalls: the conversation list, saved-history, session-search, and pin/rename patch requests now run off the network loop, so a slow gateway cannot freeze frame processing while you list, open, search, pin, or rename conversations — including the automatic refresh right after reconnecting (previously up to 30s of transport-loop blockage per request).
 
 - Upload stalls: attached images now upload concurrently and off the network loop, so sending a message with attachments no longer freezes frame processing while the gateway accepts the files (previously up to 30s per image, serially). Stale uploads after a retry or reconnect are discarded by the turn guard.
+- Branch stalls: forking a conversation now fetches its earlier messages off the network loop, so a slow gateway cannot freeze frame processing while the branch is prepared (previously up to 30s per history page, serially).
 
 ### Limitations
 - Up to six files can be attached per message. Each file is limited to 15 MB, and extracted document text is limited to 1 MB per file. Unsupported binary files and PDFs without extractable text are rejected; scanned PDFs require OCR first.

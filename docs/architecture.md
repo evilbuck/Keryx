@@ -84,6 +84,8 @@ Session reads (conversation list, saved history, session search) and session mut
 
 Attachment uploads ride the same shape: `begin_submit` hands the staged images to a task that uploads them **concurrently** (`try_join_all`, so N images cost one wall-clock window instead of N serial round trips) and hands the paths back through the work channel, where the turn's generation guard discards results that arrive after the turn rolled, stopped, or the link reconnected. A slow or stuck upload therefore cannot stall frame processing on the message-send path.
 
+Branching a conversation fetches its earlier visible pages the same way: `begin_branch` hands the page walk (up to ceil(before_loaded / PAGE) history round trips) to a task and applies the seeds on the loop when they arrive, so a slow history endpoint cannot stall frames while a branch is prepared.
+
 Socket writes (JSON-RPC frames and Pong replies) are bounded by a 5s `WRITE_TIMEOUT`, far below the 30s RPC response wait: a gateway that stops reading its socket fails the write within 5s, the link drops, and automatic reconnect takes over instead of stalling the transport loop.
 
 ## Configuration

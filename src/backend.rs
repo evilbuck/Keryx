@@ -547,6 +547,9 @@ async fn run(
                     }) => {
                         link.apply_mutated(stored_id, mutation, result).await;
                     }
+                    Some(LoopWork::Branch(outcome)) => {
+                        link.apply_branch(outcome.request, outcome.seeds).await;
+                    }
                     None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
@@ -655,6 +658,23 @@ enum LoopWork {
         result: Result<VecDeque<String>, String>,
         prompt_text: String,
     },
+    Branch(Box<BranchSeedsOutcome>),
+}
+
+/// A branch request whose earlier pages are fetched off the transport loop.
+struct BranchSeeds {
+    stored_id: String,
+    runtime_id: Option<String>,
+    parent_title: String,
+    visible_count: Option<usize>,
+    custom_title: Option<String>,
+    seed_fallback: Vec<SeedMessage>,
+}
+
+/// The fetched outcome for a [`BranchSeeds`] request.
+struct BranchSeedsOutcome {
+    request: BranchSeeds,
+    seeds: Result<Vec<SeedMessage>, String>,
 }
 
 fn mid_connect(command: Option<Command>) -> MidConnect {
@@ -1397,13 +1417,15 @@ impl Link {
                 seed_fallback,
             } => {
                 self.begin_branch(
-                    stored_id,
-                    runtime_id,
-                    parent_title,
+                    BranchSeeds {
+                        stored_id,
+                        runtime_id,
+                        parent_title,
+                        visible_count,
+                        custom_title,
+                        seed_fallback,
+                    },
                     before_loaded,
-                    visible_count,
-                    custom_title,
-                    seed_fallback,
                 )
                 .await;
             }
@@ -1462,43 +1484,56 @@ impl Link {
         ));
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn begin_branch(
+    async fn begin_branch(&mut self, request: BranchSeeds, before_loaded: usize) {
+        if before_loaded > 0
+            && (request.visible_count.is_some() || request.runtime_id.is_none())
+        {
+            // Earlier pages are fetched off the transport loop — a slow or
+            // stuck history endpoint must not stall frames — and the branch
+            // RPC applies when the seeds arrive.
+            tokio::spawn(branch_seeds_task(
+                self.http.clone(),
+                self.origin.clone(),
+                before_loaded,
+                self.work.clone(),
+                request,
+            ));
+            return;
+        }
+        self.apply_branch(request, Ok(Vec::new())).await;
+    }
+
+    /// Sends the branch RPC with fetched earlier pages (empty when none were
+    /// needed) — the same shape, seeds, and failure messages the inline
+    /// path produced.
+    async fn apply_branch(
         &mut self,
-        stored_id: String,
-        runtime_id: Option<String>,
-        parent_title: String,
-        before_loaded: usize,
-        visible_count: Option<usize>,
-        custom_title: Option<String>,
-        seed_fallback: Vec<SeedMessage>,
+        request: BranchSeeds,
+        seeds: Result<Vec<SeedMessage>, String>,
     ) {
-        let fallback_title = default_branch_title(&parent_title, custom_title.as_deref());
-        let (total_visible, full_seed) =
-            if before_loaded > 0 && (visible_count.is_some() || runtime_id.is_none()) {
-                match self.fetch_earlier_visible(&stored_id, before_loaded).await {
-                    Ok(mut earlier) => {
-                        let prefix_len = earlier.len();
-                        earlier.extend(seed_fallback);
-                        (visible_count.map(|v| prefix_len + v), earlier)
-                    }
-                    Err(err) => {
-                        self.fail("branch", Some(stored_id), err).await;
-                        return;
-                    }
-                }
-            } else {
-                (visible_count, seed_fallback)
-            };
-        if let Some(rt) = runtime_id {
-            let params = branch_rpc_params(&rt, custom_title.as_deref(), total_visible);
+        let (total_visible, full_seed) = match seeds {
+            Ok(mut earlier) => {
+                let prefix_len = earlier.len();
+                earlier.extend(request.seed_fallback);
+                (request.visible_count.map(|v| prefix_len + v), earlier)
+            }
+            Err(err) => {
+                self.fail("branch", Some(request.stored_id.clone()), err)
+                    .await;
+                return;
+            }
+        };
+        let fallback_title =
+            default_branch_title(&request.parent_title, request.custom_title.as_deref());
+        if let Some(rt) = request.runtime_id {
+            let params = branch_rpc_params(&rt, request.custom_title.as_deref(), total_visible);
             if let Err(fault) = self
                 .send_rpc(
                     "session.branch",
                     params,
                     JobKind::Branch {
-                        parent_stored_id: stored_id.clone(),
-                        parent_title,
+                        parent_stored_id: request.stored_id.clone(),
+                        parent_title: request.parent_title,
                         fallback_title,
                         fallback_seed: full_seed,
                     },
@@ -1508,17 +1543,27 @@ impl Link {
             {
                 self.fail(
                     "branch",
-                    Some(stored_id),
+                    Some(request.stored_id),
                     send_fault_message("branch", fault),
                 )
                 .await;
             }
-        } else if total_visible.is_none() && custom_title.is_none() {
-            self.begin_stored_branch(stored_id, parent_title, fallback_title, full_seed)
-                .await;
+        } else if total_visible.is_none() && request.custom_title.is_none() {
+            self.begin_stored_branch(
+                request.stored_id,
+                request.parent_title,
+                fallback_title,
+                full_seed,
+            )
+            .await;
         } else {
-            self.begin_seeded_branch(stored_id, parent_title, fallback_title, full_seed)
-                .await;
+            self.begin_seeded_branch(
+                request.stored_id,
+                request.parent_title,
+                fallback_title,
+                full_seed,
+            )
+            .await;
         }
     }
 
@@ -1591,22 +1636,6 @@ impl Link {
             )
             .await;
         }
-    }
-
-    async fn fetch_earlier_visible(
-        &self,
-        stored_id: &str,
-        before_loaded: usize,
-    ) -> Result<Vec<SeedMessage>, String> {
-        let mut out = Vec::new();
-        let mut offset = 0usize;
-        while offset < before_loaded {
-            let limit = (before_loaded - offset).min(PAGE);
-            let page = fetch_history(&self.http, &self.origin, stored_id, offset, limit).await?;
-            out.extend(seed_messages_through(&page, None));
-            offset += limit;
-        }
-        Ok(out)
     }
 
     async fn begin_undo(
@@ -4665,6 +4694,40 @@ async fn patch_session_http(
     send_fenced_patch(http, origin, stored_id, body).await
 }
 
+/// The earlier-visible pages for a branch request, fetched off the transport
+/// loop: up to ceil(before_loaded / PAGE) history round trips that must not
+/// stall frames while a conversation is branched.
+async fn branch_seeds_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    before_loaded: usize,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    request: BranchSeeds,
+) {
+    let seeds = fetch_earlier_pages(&http, &origin, &request.stored_id, before_loaded).await;
+    let _ = work.send(LoopWork::Branch(Box::new(BranchSeedsOutcome {
+        request,
+        seeds,
+    })));
+}
+
+async fn fetch_earlier_pages(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    before_loaded: usize,
+) -> Result<Vec<SeedMessage>, String> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset < before_loaded {
+        let limit = (before_loaded - offset).min(PAGE);
+        let page = fetch_history(http, origin, stored_id, offset, limit).await?;
+        out.extend(seed_messages_through(&page, None));
+        offset += limit;
+    }
+    Ok(out)
+}
+
 /// The session patch as its own task: the fenced patch (and its one
 /// conflict retry) runs off the transport loop, and the outcome re-enters
 /// via the work channel where curation state applies it.
@@ -6647,6 +6710,107 @@ mod tests {
                 Event::SessionMutated { stored_id, .. } if stored_id == "st-new"
             ));
             assert!(link.deferred_mutations.contains_key("st-new"));
+        });
+    }
+
+    #[test]
+    fn branch_seeds_fetch_off_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let branch = BranchSeeds {
+                stored_id: "st-1".into(),
+                runtime_id: Some("rt".into()),
+                parent_title: "Parent".into(),
+                visible_count: Some(2),
+                custom_title: None,
+                seed_fallback: Vec::new(),
+            };
+
+            // With the earlier pages hung against a stalling gateway, the
+            // branch launcher must return and frames must keep processing.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                link.begin_branch(
+                    BranchSeeds {
+                        stored_id: "st-1".into(),
+                        runtime_id: Some("rt".into()),
+                        parent_title: "Parent".into(),
+                        visible_count: Some(2),
+                        custom_title: None,
+                        seed_fallback: Vec::new(),
+                    },
+                    40,
+                )
+                .await;
+                link.events
+                    .try_send(Event::Connection(ConnectionState::Connecting))
+                    .expect("fill");
+                link.emit_delta("rt", "m1", "hello").await;
+                assert!(incoming.try_recv().is_ok());
+                link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                    Vec::new().into(),
+                ))))
+                .await;
+                let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                    panic!("frames must process while branch pages hang");
+                };
+                assert_eq!(delta, "hello");
+            })
+            .await
+            .expect("transport loop must stay responsive");
+
+            // Against a live origin the fetched seeds re-enter the loop via
+            // the work channel; without a socket the branch RPC fails with
+            // the same branch error the inline path produced.
+            let origin = spawn_sessions_http(
+                r#"{"total":0,"sessions":[]}"#,
+            )
+            .await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+            link.begin_branch(branch, 2).await;
+            let branched =
+                tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                    .await
+                    .expect("branch work within 5s")
+                    .expect("sender alive");
+            let LoopWork::Branch(outcome) = branched else {
+                panic!("expected branch work");
+            };
+            let BranchSeedsOutcome { request, seeds } = *outcome;
+            let earlier = seeds.expect("seeds must load from the serving origin");
+            assert!(!earlier.is_empty());
+            link.apply_branch(request, Ok(earlier)).await;
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("branch error within 5s")
+                .expect("sender alive");
+            assert!(matches!(
+                &error,
+                Event::Error { operation, .. } if operation == "branch"
+            ));
         });
     }
 
