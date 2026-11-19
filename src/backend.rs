@@ -22,6 +22,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPRESS_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
+const PROBE_SILENCE: Duration = Duration::from_secs(30);
 const EVENT_BOUND: usize = 512;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -4039,6 +4040,7 @@ impl Link {
             self.drop_socket("The gateway did not become ready.").await;
             return;
         }
+        self.probe_keepalive(now).await;
         if self.write.is_some() && self.last_inbound.elapsed() > Duration::from_secs(90) {
             self.drop_socket("The gateway stopped responding.").await;
             return;
@@ -4050,6 +4052,26 @@ impl Link {
             let _ = self
                 .send_rpc("gateway.ping", json!({}), JobKind::Ping, RPC_TIMEOUT)
                 .await;
+        }
+    }
+
+    /// RFC 6455 keepalive: after `PROBE_SILENCE` without any inbound frame, send a
+    /// protocol-level Ping. A live gateway answers with Pong, which refreshes
+    /// `last_inbound`, so a healthy idle connection is no longer dropped by the
+    /// inbound-silence bound. The socket is dropped only when the probe itself
+    /// cannot be written.
+    async fn probe_keepalive(&mut self, now: Instant) {
+        if self.write.is_none() || !probe_due(self.last_inbound, now) {
+            return;
+        }
+        let Some(write) = self.write.as_mut() else {
+            return;
+        };
+        let sent =
+            tokio::time::timeout(Duration::from_secs(5), write.send(Message::Ping(Vec::new().into())))
+                .await;
+        if !matches!(sent, Ok(Ok(()))) {
+            self.drop_socket("The connection failed while probing.").await;
         }
     }
 
@@ -4083,6 +4105,14 @@ impl Link {
         self.activity.clear();
         self.runtime_of.clear();
     }
+}
+
+
+/// True when the socket has been silent long enough to warrant a keepalive
+/// probe. The maintenance loop runs every 5s, so a live peer answers long
+/// before `maintain` treats the link as dead.
+fn probe_due(last_inbound: Instant, now: Instant) -> bool {
+    now.duration_since(last_inbound) > PROBE_SILENCE
 }
 
 fn http_client(origin: &url::Url) -> Result<reqwest::Client, String> {
@@ -5149,6 +5179,17 @@ mod tests {
         assert!(running.finish());
         assert_eq!(running.phase, TurnPhase::Terminal);
         assert!(!running.accept_interrupt(4));
+    }
+
+    #[test]
+    fn keepalive_probe_fires_only_after_30s_of_silence() {
+        let now = Instant::now();
+        // Boundary: exactly PROBE_SILENCE is not yet due.
+        assert!(!probe_due(now - Duration::from_secs(30), now));
+        assert!(!probe_due(now - Duration::from_secs(29), now));
+        assert!(!probe_due(now, now));
+        assert!(probe_due(now - Duration::from_secs(31), now));
+        assert!(probe_due(now - Duration::from_secs(90), now));
     }
 
 
