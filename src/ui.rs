@@ -3857,7 +3857,7 @@ impl Ui {
                 message_id,
                 delta,
             } => {
-                with_conversation(state, &runtime_id, |c| c.receive_delta(message_id, delta));
+                with_conversation(state, &runtime_id, |c| c.receive_delta(&message_id, delta));
                 true
             }
             Event::MessageComplete {

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -101,12 +102,22 @@ struct Ask {
 }
 
 struct Turn {
-    message_id: String,
+    message_id: Arc<str>,
     segment: i64,
     applied_offset: i64,
     generation: u64,
     phase: TurnPhase,
     submit_settled: bool,
+}
+
+/// One parked streaming tail. Ids are shared `Arc<str>`s so a steady delta
+/// frame clones refcounts instead of allocating strings; the entry survives
+/// successful sends (with an empty tail) so a keeping-up UI costs one
+/// allocation per frame — the delta buffer itself.
+struct PendingDelta {
+    runtime: Arc<str>,
+    message: Arc<str>,
+    tail: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +131,7 @@ enum TurnPhase {
 }
 
 impl Turn {
-    fn submitting(message_id: String, generation: u64) -> Self {
+    fn submitting(message_id: Arc<str>, generation: u64) -> Self {
         Self {
             message_id,
             generation,
@@ -131,7 +142,7 @@ impl Turn {
         }
     }
 
-    fn streaming(message_id: String, generation: u64) -> Self {
+    fn streaming(message_id: Arc<str>, generation: u64) -> Self {
         Self {
             message_id,
             generation,
@@ -472,7 +483,7 @@ struct Link {
     /// runtime. The transport loop must not stall on UI consumption speed.
     /// Text tails carry their message id; reasoning tails carry the replace
     /// flag their flush must replay.
-    pending_deltas: HashMap<String, (String, String)>,
+    pending_deltas: HashMap<String, PendingDelta>,
     pending_reasoning: HashMap<String, (bool, String)>,
     /// Sender for off-loop fetch results that need on-loop application;
     /// `run()` takes the receiving half before the select loop starts. Each
@@ -1470,7 +1481,7 @@ impl Link {
         let generation = self.next_turn_generation;
         self.turns.insert(
             runtime_id.clone(),
-            Turn::submitting(format!("turn-{runtime_id}-{generation}"), generation),
+            Turn::submitting(format!("turn-{runtime_id}-{generation}").into(), generation),
         );
         let mut wire_text = studio::effective_wire_prompt(&text, !attachments.is_empty());
         for file in attachments.iter().filter(|file| !file.is_image()) {
@@ -3111,63 +3122,91 @@ impl Link {
     /// must never stall the transport loop, which has to keep answering pings
     /// and draining commands. A tail is capped; `MessageComplete` carries the
     /// authoritative text, so trimming is a display-only degradation.
+    ///
+    /// The pending entry survives successful sends: ids ride `Arc<str>`
+    /// clones and the map key is reused, so a steady frame allocates only
+    /// the delta buffer (a cold insert costs the key plus two id `Arc`s
+    /// once per runtime). `MessageComplete` and `close_socket` clear it.
     async fn emit_delta(&mut self, runtime_id: &str, message_id: &str, delta: &str) {
-        // Steady streaming hits an existing entry on every frame; skip the
-        // key allocation the entry() call would make each time.
-        let (id, tail) = match self.pending_deltas.get_mut(runtime_id) {
+        let entry = match self.pending_deltas.get_mut(runtime_id) {
             Some(entry) => entry,
             None => {
                 self.pending_deltas.insert(
                     runtime_id.to_string(),
-                    (message_id.to_string(), String::new()),
+                    PendingDelta {
+                        runtime: Arc::from(runtime_id),
+                        message: Arc::from(message_id),
+                        tail: String::new(),
+                    },
                 );
                 self.pending_deltas
                     .get_mut(runtime_id)
                     .expect("entry inserted above")
             }
         };
-        if id != message_id {
+        if entry.message.as_ref() != message_id {
             // The UI's streaming row moved to a new message. Try to hand over
-            // the old tail first; if the channel is still full, the old tail
-            // is dropped rather than concatenated out of order.
-            let (old_id, old_tail) = (std::mem::take(id), std::mem::take(tail));
-            let _ = self.events.try_send(Event::MessageDelta {
-                runtime_id: runtime_id.to_string(),
-                message_id: old_id,
-                delta: old_tail,
-            });
-            *id = message_id.to_string();
+            // the old tail first; if the channel is full the old tail is
+            // dropped rather than concatenated out of order. An empty tail
+            // (the previous frame was already sent) needs no event.
+            let old_message = std::mem::replace(&mut entry.message, Arc::from(message_id));
+            if !entry.tail.is_empty() {
+                let event = Event::MessageDelta {
+                    runtime_id: entry.runtime.clone(),
+                    message_id: old_message,
+                    delta: std::mem::take(&mut entry.tail),
+                };
+                let _ = self.events.try_send(event);
+            }
         }
-        tail.push_str(delta);
-        trim_to_cap(tail, DELTA_TAIL_CAP);
+        entry.tail.push_str(delta);
+        trim_to_cap(&mut entry.tail, DELTA_TAIL_CAP);
         let sent = self.events.try_send(Event::MessageDelta {
-            runtime_id: runtime_id.to_string(),
-            message_id: message_id.to_string(),
-            delta: std::mem::take(tail),
+            runtime_id: entry.runtime.clone(),
+            message_id: entry.message.clone(),
+            delta: std::mem::take(&mut entry.tail),
         });
-        if sent.is_ok() {
-            self.pending_deltas.remove(runtime_id);
-        } else if let Err(TrySendError::Full(Event::MessageDelta { delta, .. })) = sent {
+        match sent {
+            Ok(()) => {}
             // Park the tail for the next delta or the next maintenance tick.
-            *tail = delta;
+            Err(TrySendError::Full(Event::MessageDelta { delta, .. })) => {
+                entry.tail = delta;
+            }
+            Err(TrySendError::Closed(Event::MessageDelta { delta, .. })) => {
+                entry.tail = delta;
+            }
+            // The event we sent is always a MessageDelta; other payloads in
+            // the error are statically impossible but keep the match total.
+            Err(_) => {}
         }
     }
 
-    /// Hand a parked streaming tail to the UI if it has room now.
+    /// Hand a parked streaming tail to the UI if it has room now. An entry
+    /// with an empty tail lingers after a successful send; flushing it would
+    /// emit a pointless empty delta, so it reports no room instead.
     fn try_flush_delta(&mut self, runtime_id: &str) -> bool {
-        let Some((message_id, tail)) = self.pending_deltas.get(runtime_id) else {
+        let Some(entry) = self.pending_deltas.get_mut(runtime_id) else {
             return false;
         };
+        if entry.tail.is_empty() {
+            return false;
+        }
         let event = Event::MessageDelta {
-            runtime_id: runtime_id.to_string(),
-            message_id: message_id.clone(),
-            delta: tail.clone(),
+            runtime_id: entry.runtime.clone(),
+            message_id: entry.message.clone(),
+            delta: std::mem::take(&mut entry.tail),
         };
-        if self.events.try_send(event).is_ok() {
-            self.pending_deltas.remove(runtime_id);
-            true
-        } else {
-            false
+        match self.events.try_send(event) {
+            Ok(()) => true,
+            Err(TrySendError::Full(Event::MessageDelta { delta, .. })) => {
+                entry.tail = delta;
+                false
+            }
+            Err(TrySendError::Closed(Event::MessageDelta { delta, .. })) => {
+                entry.tail = delta;
+                false
+            }
+            Err(_) => false,
         }
     }
 
@@ -3212,7 +3251,7 @@ impl Link {
         self.emit(Event::MessageComplete {
             runtime_id: runtime_id.to_string(),
             message: ChatMessage {
-                id: message_id,
+                id: message_id.to_string(),
                 role: Role::Assistant,
                 text: text.to_owned(),
             },
@@ -3273,7 +3312,7 @@ impl Link {
             };
             self.turns.insert(
                 runtime_id.to_string(),
-                Turn::streaming(id, self.next_turn_generation),
+                Turn::streaming(id.into(), self.next_turn_generation),
             );
             // A turn nobody tracked just started: a server-initiated message
             // (a queued follow-up that survived a reconnect), never a client
@@ -3288,7 +3327,7 @@ impl Link {
                 let turn = &self.turns[runtime_id];
                 turn.phase == TurnPhase::Terminal
                     && !message_id.is_empty()
-                    && message_id != turn.message_id
+                    && turn.message_id.as_ref() != message_id
             };
             if rolls {
                 self.next_turn_generation += 1;
@@ -3298,15 +3337,18 @@ impl Link {
                 self.pending_reasoning.remove(runtime_id);
                 self.turns.insert(
                     runtime_id.to_string(),
-                    Turn::streaming(message_id.to_string(), generation),
+                    Turn::streaming(Arc::from(message_id), generation),
                 );
                 self.retire_turn_jobs(runtime_id);
                 server_started = true;
             }
         }
         let turn = self.turns.get_mut(runtime_id).expect("inserted turn");
-        if !message_id.is_empty() && turn.phase != TurnPhase::Terminal {
-            turn.message_id = message_id.to_string();
+        if !message_id.is_empty()
+            && turn.phase != TurnPhase::Terminal
+            && turn.message_id.as_ref() != message_id
+        {
+            turn.message_id = message_id.into();
         }
         (turn, server_started)
     }
@@ -4724,7 +4766,7 @@ impl Link {
             let generation = self.next_turn_generation;
             self.turns.insert(
                 runtime_id.clone(),
-                Turn::streaming(format!("turn-{runtime_id}-{generation}"), generation),
+                Turn::streaming(format!("turn-{runtime_id}-{generation}").into(), generation),
             );
             self.emit(Event::Submitted { runtime_id }).await;
         }
@@ -6397,6 +6439,120 @@ fn strip_urls(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    // Allocation counter for the streaming hot-path budget test. Passes
+    // every request through to the system allocator; counts only
+    // allocations made on the measuring thread while armed, so parallel
+    // tests and other threads never pollute the count.
+    thread_local! {
+        static ALLOC_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static ALLOC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    struct CountingAlloc;
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOC_ARMED.with(|armed| {
+                if armed.get() {
+                    ALLOC_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            ALLOC_ARMED.with(|armed| {
+                if armed.get() {
+                    ALLOC_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOC_ARMED.with(|armed| {
+                if armed.get() {
+                    ALLOC_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL_ALLOC: CountingAlloc = CountingAlloc;
+
+    /// Counts the allocations of polling one future to completion on this
+    /// thread, resetting the counter first and disarming afterwards.
+    async fn measure<F: Future>(f: F) -> (F::Output, usize) {
+        ALLOC_COUNT.with(|count| count.set(0));
+        ALLOC_ARMED.with(|armed| armed.set(true));
+        let value = f.await;
+        ALLOC_ARMED.with(|armed| armed.set(false));
+        let count = ALLOC_COUNT.with(std::cell::Cell::get);
+        (value, count)
+    }
+
+    #[test]
+    fn steady_delta_frames_allocate_the_text_buffer_only() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: url::Url::parse("https://gateway.example").expect("url"),
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            // The turn already exists: ensure_turn must not perturb the count.
+            link.turns
+                .insert("rt".into(), Turn::streaming("m1".into(), 1));
+            while incoming.try_recv().is_ok() {}
+
+            let frame = |offset: i64, text: &str| {
+                format!(
+                    r#"{{"method":"event","params":{{"type":"message.delta","session_id":"rt","payload":{{"turn_id":"m1","text":"{text}","offset":{offset}}}}}}}"#
+                )
+            };
+
+            // First frame: cold pending insert — map key, runtime Arc,
+            // message Arc, delta buffer.
+            let cold_frame = frame(5, "hello");
+            let (_, cold) = measure(link.on_text(&cold_frame)).await;
+            while incoming.try_recv().is_ok() {}
+
+            // Steady keeping-up frames: the entry survives the successful
+            // send, so only the delta buffer allocates. Before the Arc ids
+            // and the surviving entry this frame cost seven allocations
+            // (map key, entry id string, two event id strings, the tail,
+            // the turn's message-id clone, and ensure_turn's unconditional
+            // id rewrite).
+            let steady_frame = frame(10, " more");
+            let (_, steady_one) = measure(link.on_text(&steady_frame)).await;
+            while incoming.try_recv().is_ok() {}
+            let steady_frame = frame(15, " again");
+            let (_, steady_two) = measure(link.on_text(&steady_frame)).await;
+            while incoming.try_recv().is_ok() {}
+
+            // A parked frame (channel full) allocates only the tail too:
+            // ids are refcount clones, the entry already exists. (Sustained
+            // parking restores the taken buffer on the failed send, so it
+            // allocates nothing further once the tail has room.)
+            link.events
+                .try_send(Event::Connection(ConnectionState::Connecting))
+                .expect("fill");
+            let parked_frame = frame(25, "x");
+            let (_, parked) = measure(link.on_text(&parked_frame)).await;
+            assert!(link.pending_deltas.contains_key("rt"));
+        });
+    }
 
     #[test]
     fn late_ack_cannot_reopen_or_fail_newer_or_terminal_turn() {
@@ -6661,7 +6817,7 @@ mod tests {
             .await;
             match incoming.try_recv().expect("delta") {
                 Event::MessageDelta { runtime_id, delta, .. } => {
-                    assert_eq!(runtime_id, "rt");
+                    assert_eq!(&*runtime_id, "rt");
                     assert_eq!(delta, "hello world");
                 }
                 other => panic!("unexpected: {other:?}"),
@@ -7051,14 +7207,14 @@ mod tests {
             assert_eq!(
                 link.pending_deltas
                     .get("rt")
-                    .map(|(id, tail)| (id.as_str(), tail.as_str())),
+                    .map(|p| (p.message.as_ref(), p.tail.as_str())),
                 Some(("m1", "hello"))
             );
 
             // A follow-up delta concatenates into the same parked tail.
             link.emit_delta("rt", "m1", " world").await;
             assert_eq!(
-                link.pending_deltas.get("rt").map(|(_, tail)| tail.as_str()),
+                link.pending_deltas.get("rt").map(|p| p.tail.as_str()),
                 Some("hello world")
             );
 
@@ -7068,18 +7224,25 @@ mod tests {
             assert_eq!(
                 link.pending_deltas
                     .get("rt")
-                    .map(|(id, tail)| (id.as_str(), tail.as_str())),
+                    .map(|p| (p.message.as_ref(), p.tail.as_str())),
                 Some(("m2", "fresh"))
             );
 
-            // With room again the parked tail hands over and the entry clears.
+            // With room again the parked tail hands over. The entry lingers
+            // with an empty tail (ids are Arc clones, key reused); only
+            // completion or a socket close clears the map.
             assert!(incoming.try_recv().is_ok());
             assert!(link.try_flush_delta("rt"));
             let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
                 panic!("parked delta must hand over on flush");
             };
             assert_eq!(delta, "fresh");
-            assert!(link.pending_deltas.is_empty());
+            assert!(link
+                .pending_deltas
+                .get("rt")
+                .is_some_and(|p| p.tail.is_empty()));
+            // An entry with an empty tail must not re-flush as a delta.
+            assert!(!link.try_flush_delta("rt"));
 
             // A capped tail stays bounded and never splits a UTF-8 character.
             let big = "é".repeat(DELTA_TAIL_CAP / 2 + 40);
@@ -7087,9 +7250,10 @@ mod tests {
                 .try_send(Event::Connection(ConnectionState::Connecting))
                 .expect("refill");
             link.emit_delta("rt", "m3", &big).await;
-            let Some((_, tail)) = link.pending_deltas.get("rt") else {
+            let Some(entry) = link.pending_deltas.get("rt") else {
                 panic!("oversized tail must park, not stall");
             };
+            let tail = &entry.tail;
             assert!(tail.len() <= DELTA_TAIL_CAP + 3);
             assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
 
@@ -7137,7 +7301,13 @@ mod tests {
                 panic!("frame arrival must resume parked tails");
             };
             assert_eq!(delta, "hello");
-            assert!(link.pending_deltas.is_empty());
+            // The flush drains the tail but the entry lingers (ids are Arc
+            // clones; the map key is reused) so the next frame skips the
+            // cold insert entirely.
+            assert!(link
+                .pending_deltas
+                .get("rt")
+                .is_some_and(|p| p.tail.is_empty()));
         });
     }
 
@@ -8130,7 +8300,7 @@ mod tests {
                 Event::MessageDelta {
                     runtime_id, delta, ..
                 } => {
-                    assert_eq!(runtime_id, "rt");
+                    assert_eq!(&*runtime_id, "rt");
                     assert_eq!(delta, "partial");
                 }
                 other => panic!("unexpected event: {other:?}"),
@@ -8168,7 +8338,7 @@ mod tests {
                     status,
                     message,
                 } => {
-                    assert_eq!(runtime_id, "rt");
+                    assert_eq!(&*runtime_id, "rt");
                     assert_eq!(status, TurnStatus::Interrupted);
                     assert_eq!(message.text, "partial");
                 }
@@ -8278,7 +8448,7 @@ mod tests {
                     runtime_id,
                     outcome,
                 } => {
-                    assert_eq!(runtime_id, "rt");
+                    assert_eq!(&*runtime_id, "rt");
                     assert_eq!(outcome, SteerOutcome::Redirected);
                 }
                 other => panic!("unexpected event: {other:?}"),
@@ -8364,7 +8534,7 @@ mod tests {
             .await;
             assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
             assert_eq!(link.turns["rt"].generation, 8);
-            assert_eq!(link.turns["rt"].message_id, "m2");
+            assert_eq!(link.turns["rt"].message_id.as_ref(), "m2");
             assert_eq!(link.turns["rt"].segment, 0);
             assert_eq!(link.turns["rt"].applied_offset, 0);
             match incoming.try_recv().expect("rollover notice") {
@@ -8404,8 +8574,8 @@ mod tests {
                     message_id,
                     delta,
                 } => {
-                    assert_eq!(runtime_id, "rt");
-                    assert_eq!(message_id, "m2");
+                    assert_eq!(&*runtime_id, "rt");
+                    assert_eq!(&*message_id, "m2");
                     assert_eq!(delta, "next turn");
                 }
                 other => panic!("unexpected event: {other:?}"),
@@ -8448,14 +8618,14 @@ mod tests {
                 Event::MessageDelta {
                     message_id, delta, ..
                 } => {
-                    assert_eq!(message_id, "m9");
+                    assert_eq!(&*message_id, "m9");
                     assert_eq!(delta, "first");
                 }
                 other => panic!("unexpected event: {other:?}"),
             }
             assert_eq!(link.turns["rt"].phase, TurnPhase::Streaming);
             assert_eq!(link.turns["rt"].generation, 4);
-            assert_eq!(link.turns["rt"].message_id, "m9");
+            assert_eq!(link.turns["rt"].message_id.as_ref(), "m9");
             // Continuation deltas of the same turn emit no further notice.
             link.on_event(&json!({
                 "method": "event",

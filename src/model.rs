@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 pub use crate::studio::{
     CompressSummary, MAX_IMAGE_BYTES, MAX_STAGED_IMAGES, SkillSummary, SlashCandidate, StagedImage,
@@ -1562,8 +1563,8 @@ pub enum Event {
         runtime_id: String,
     },
     MessageDelta {
-        runtime_id: String,
-        message_id: String,
+        runtime_id: Arc<str>,
+        message_id: Arc<str>,
         delta: String,
     },
     MessageComplete {
@@ -1791,7 +1792,7 @@ impl Conversation {
         self.inspector_revision += 1;
     }
 
-    pub fn append_delta(&mut self, message_id: String, delta: String) {
+    pub fn append_delta(&mut self, message_id: &str, delta: String) {
         if let Some(message) = self
             .messages
             .last_mut()
@@ -1804,7 +1805,7 @@ impl Conversation {
                 id: if self.messages.iter().any(|m| m.id == message_id) {
                     format!("{message_id}:segment:{}", self.messages.len())
                 } else {
-                    message_id
+                    message_id.to_owned()
                 },
                 role: Role::Assistant,
                 text: delta,
@@ -1813,7 +1814,7 @@ impl Conversation {
     }
 
     /// Append streamed text without reopening a stop that has already been acknowledged.
-    pub fn receive_delta(&mut self, message_id: String, delta: String) {
+    pub fn receive_delta(&mut self, message_id: &str, delta: String) {
         self.append_delta(message_id, delta);
         if self.status == TurnStatus::Stopping {
             return;
@@ -1836,7 +1837,7 @@ impl Conversation {
             self.revision += 1;
             self.inspector_revision += 1;
         } else if !message.text.is_empty() {
-            self.append_delta(message.id, message.text);
+            self.append_delta(&message.id, message.text);
         }
     }
 
@@ -3707,7 +3708,7 @@ mod tests {
     #[test]
     fn tool_activity_preserves_stream_order_and_final_text() {
         let mut chat = Conversation::default();
-        chat.receive_delta("turn".into(), "Before".into());
+        chat.receive_delta("turn", "Before".into());
         chat.apply_tool_event(ToolEventUpdate::Started {
             tool_id: "call".into(),
             name: "search".into(),
@@ -3719,7 +3720,7 @@ mod tests {
             duration_s: None,
             summary: String::new(),
         });
-        chat.receive_delta("turn".into(), "After".into());
+        chat.receive_delta("turn", "After".into());
         chat.finish_message(ChatMessage {
             id: "turn".into(),
             role: Role::Assistant,
@@ -3737,8 +3738,8 @@ mod tests {
     #[test]
     fn final_response_replaces_streamed_text_without_duplicate_rows() {
         let mut conversation = Conversation::default();
-        conversation.append_delta("reply".into(), "Part".into());
-        conversation.append_delta("reply".into(), "ial".into());
+        conversation.append_delta("reply", "Part".into());
+        conversation.append_delta("reply", "ial".into());
         conversation.finish_message(ChatMessage {
             id: "reply".into(),
             role: Role::Assistant,
@@ -3901,7 +3902,7 @@ mod tests {
     #[test]
     fn stopping_stays_busy_through_late_ack_and_delta_until_disconnect() {
         let mut live = Conversation::default();
-        live.receive_delta("reply".into(), "Hi".into());
+        live.receive_delta("reply", "Hi".into());
         assert_eq!(live.status, TurnStatus::Streaming);
         assert_eq!(live.activity, "Receiving response…");
         assert_eq!(live.messages[0].text, "Hi");
@@ -3949,7 +3950,7 @@ mod tests {
             assert_eq!(conversation.activity, "Stopping response…");
             assert!(conversation.status.busy());
 
-            conversation.receive_delta("reply".into(), "ial".into());
+            conversation.receive_delta("reply", "ial".into());
             assert_eq!(conversation.messages[0].text, "Partial");
             assert_eq!(conversation.status, TurnStatus::Stopping);
             assert_eq!(conversation.activity, "Stopping response…");
