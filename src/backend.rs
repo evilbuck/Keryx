@@ -550,6 +550,9 @@ async fn run(
                     Some(LoopWork::Branch(outcome)) => {
                         link.apply_branch(outcome.request, outcome.seeds).await;
                     }
+                    Some(LoopWork::Readonly(outcome)) => {
+                        link.apply_readonly(*outcome).await;
+                    }
                     None => {}
                 }
                 track(&link, &mut attempts, &mut retry_at);
@@ -659,6 +662,7 @@ enum LoopWork {
         prompt_text: String,
     },
     Branch(Box<BranchSeedsOutcome>),
+    Readonly(Box<ReadonlyOutcome>),
 }
 
 /// A branch request whose earlier pages are fetched off the transport loop.
@@ -675,6 +679,21 @@ struct BranchSeeds {
 struct BranchSeedsOutcome {
     request: BranchSeeds,
     seeds: Result<Vec<SeedMessage>, String>,
+}
+
+/// The saved transcript for a refused resume, with the session rows walked
+/// during count discovery (the loop warms its listing caches from them).
+struct ReadonlyHistory {
+    before: usize,
+    messages: Vec<ChatMessage>,
+    warmed: Vec<SessionSummary>,
+}
+
+/// The fetched outcome for a refused-resume transcript load.
+struct ReadonlyOutcome {
+    stored_id: String,
+    reason: String,
+    result: Result<ReadonlyHistory, String>,
 }
 
 fn mid_connect(command: Option<Command>) -> MidConnect {
@@ -4214,11 +4233,58 @@ impl Link {
         }
     }
 
+    /// A refused resume loads the saved transcript off the transport loop:
+    /// count discovery (a session-list walk when the count is uncached) and
+    /// the saved page must not stall frames. The outcome re-enters via the
+    /// work channel, where the listing caches warm from the walked rows.
     async fn show_readonly(&mut self, stored_id: String, message: &str) {
         self.refused.insert(stored_id.clone());
         let reason = self.clean(message.to_string());
-        let count = match self.history_count(&stored_id).await {
-            Ok(count) => count,
+        let cached = self.message_counts.get(&stored_id).copied();
+        tokio::spawn(readonly_history_task(
+            self.http.clone(),
+            self.origin.clone(),
+            self.work.clone(),
+            stored_id,
+            reason,
+            cached,
+        ));
+    }
+
+    /// Applies a finished refused-resume load on the loop: the walked rows
+    /// warm the listing caches exactly as the inline pagination did, then
+    /// the same `Resumed` (or resume failure) the inline path emitted.
+    async fn apply_readonly(&mut self, outcome: ReadonlyOutcome) {
+        let ReadonlyOutcome {
+            stored_id,
+            reason,
+            result,
+        } = outcome;
+        match result {
+            Ok(readonly) => {
+                let ReadonlyHistory {
+                    before,
+                    messages,
+                    warmed,
+                } = readonly;
+                for session in &warmed {
+                    self.note_listed(session);
+                }
+                self.emit(Event::Resumed {
+                    stored_id,
+                    runtime_id: None,
+                    messages,
+                    before,
+                    read_only_reason: Some(if reason.is_empty() {
+                        "This conversation cannot be continued. Showing the saved transcript."
+                            .into()
+                    } else {
+                        reason
+                    }),
+                    model: None,
+                })
+                .await;
+            }
             Err(error) => {
                 self.fail(
                     "resume",
@@ -4226,67 +4292,10 @@ impl Link {
                     format!("{reason} Saved history could not be loaded: {error}"),
                 )
                 .await;
-                return;
             }
-        };
-        let before = count.saturating_sub(PAGE);
-        let messages =
-            match fetch_history(&self.http, &self.origin, &stored_id, before, count - before).await
-            {
-                Ok(messages) => messages,
-                Err(error) => {
-                    self.fail(
-                        "resume",
-                        Some(stored_id),
-                        format!("{reason} Saved history could not be loaded: {error}"),
-                    )
-                    .await;
-                    return;
-                }
-            };
-        self.emit(Event::Resumed {
-            stored_id,
-            runtime_id: None,
-            messages,
-            before,
-            read_only_reason: Some(if reason.is_empty() {
-                "This conversation cannot be continued. Showing the saved transcript.".into()
-            } else {
-                reason
-            }),
-            model: None,
-        })
-        .await;
+        }
     }
 
-    async fn history_count(&mut self, stored_id: &str) -> Result<usize, String> {
-        if let Some(count) = self.message_counts.get(stored_id) {
-            return Ok(*count);
-        }
-        let mut offset = 0;
-        loop {
-            let Event::Sessions {
-                sessions, has_more, ..
-            } = fetch_sessions(&self.http, &self.origin, offset).await?
-            else {
-                return Err("The conversation list was not usable.".into());
-            };
-            for session in &sessions {
-                self.note_listed(session);
-            }
-            if let Some(count) = self.message_counts.get(stored_id) {
-                return Ok(*count);
-            }
-            if sessions.is_empty() || !has_more {
-                return Err("Session metadata was not found.".into());
-            }
-            let next = offset.saturating_add(sessions.len());
-            if next == offset {
-                return Err("Session metadata was not found.".into());
-            }
-            offset = next;
-        }
-    }
 
     async fn maintain(&mut self) {
         // Parked streaming tails get a retry on every tick; a slow UI must not
@@ -4726,6 +4735,73 @@ async fn fetch_earlier_pages(
         offset += limit;
     }
     Ok(out)
+}
+
+/// The saved-transcript load for a refused resume, off the transport loop:
+/// count discovery (skipped when the count was cached) plus the history
+/// page. The loop warms its listing caches from the walked rows.
+async fn readonly_history_task(
+    http: reqwest::Client,
+    origin: url::Url,
+    work: tokio::sync::mpsc::UnboundedSender<LoopWork>,
+    stored_id: String,
+    reason: String,
+    cached: Option<usize>,
+) {
+    let result = readonly_history(&http, &origin, &stored_id, cached).await;
+    let _ = work.send(LoopWork::Readonly(Box::new(ReadonlyOutcome {
+        stored_id,
+        reason,
+        result,
+    })));
+}
+
+async fn readonly_history(
+    http: &reqwest::Client,
+    origin: &url::Url,
+    stored_id: &str,
+    cached: Option<usize>,
+) -> Result<ReadonlyHistory, String> {
+    let mut warmed = Vec::new();
+    let count = match cached {
+        Some(count) => count,
+        None => {
+            // Same walk the inline pagination did, minus the cache writes:
+            // the rows travel back and the loop warms from them.
+            let mut offset = 0;
+            loop {
+                let Event::Sessions {
+                    sessions, has_more, ..
+                } = fetch_sessions(http, origin, offset).await?
+                else {
+                    return Err("The conversation list was not usable.".into());
+                };
+                warmed.extend(sessions.iter().cloned());
+                if let Some(count) = sessions
+                    .iter()
+                    .find(|session| session.stored_id == stored_id)
+                    .map(|session| session.message_count)
+                {
+                    break count;
+                }
+                if sessions.is_empty() || !has_more {
+                    return Err("Session metadata was not found.".into());
+                }
+                let next = offset.saturating_add(sessions.len());
+                if next == offset {
+                    return Err("Session metadata was not found.".into());
+                }
+                offset = next;
+            }
+        }
+    };
+    let before = count.saturating_sub(PAGE);
+    let messages = fetch_history(http, origin, stored_id, before, count - before).await?;
+    Ok(ReadonlyHistory {
+        before,
+        messages,
+        warmed,
+    })
 }
 
 /// The session patch as its own task: the fenced patch (and its one
@@ -6811,6 +6887,97 @@ mod tests {
                 &error,
                 Event::Error { operation, .. } if operation == "branch"
             ));
+        });
+    }
+
+    #[test]
+    fn readonly_resume_loads_off_the_transport_loop() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            // With the count walk and saved page hung against a stalling
+            // gateway, the refused-resume launcher must return and frames
+            // must keep processing.
+            let stall = spawn_stalling_http().await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(1);
+            let mut link = Link::new(
+                Config {
+                    url: stall,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                link.show_readonly("st-1".into(), "The gateway refused it.")
+                    .await;
+                link.events
+                    .try_send(Event::Connection(ConnectionState::Connecting))
+                    .expect("fill");
+                link.emit_delta("rt", "m1", "hello").await;
+                assert!(incoming.try_recv().is_ok());
+                link.on_socket(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(
+                    Vec::new().into(),
+                ))))
+                .await;
+                let Ok(Event::MessageDelta { delta, .. }) = incoming.try_recv() else {
+                    panic!("frames must process while the transcript load hangs");
+                };
+                assert_eq!(delta, "hello");
+            })
+            .await
+            .expect("transport loop must stay responsive");
+
+            // Against a live origin the transcript re-enters via the work
+            // channel: the walked rows warm the listing caches, and the
+            // same read-only Resumed event the inline path emitted lands.
+            let origin = spawn_sessions_http(
+                r#"{"total":1,"sessions":[{"id":"st-1","title":"Chat","source":"tui","message_count":2,"started_at":1794452594}]}"#,
+            )
+            .await;
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: origin,
+                    username: "user".into(),
+                    password: "secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            let mut work_rx = link.work_rx.take().expect("work channel");
+            assert!(link.refused.is_empty());
+            link.show_readonly("st-1".into(), "The gateway refused it.")
+                .await;
+            assert!(link.refused.contains("st-1"));
+            let readonly =
+                tokio::time::timeout(std::time::Duration::from_secs(5), work_rx.recv())
+                    .await
+                    .expect("readonly work within 5s")
+                    .expect("sender alive");
+            let LoopWork::Readonly(outcome) = readonly else {
+                panic!("expected readonly work");
+            };
+            link.apply_readonly(*outcome).await;
+            let resumed = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+                .await
+                .expect("resumed within 5s")
+                .expect("sender alive");
+            assert!(matches!(
+                &resumed,
+                Event::Resumed {
+                    stored_id,
+                    messages,
+                    read_only_reason,
+                    ..
+                } if stored_id == "st-1"
+                    && messages.len() == 2
+                    && read_only_reason.as_deref() == Some("The gateway refused it.")
+            ));
+            assert_eq!(link.message_counts.get("st-1"), Some(&2));
         });
     }
 
