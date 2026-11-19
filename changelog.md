@@ -12,6 +12,7 @@
 ### Fixed
 
 - Idle disconnects: after 30s of inbound silence the client now sends a WebSocket Ping, so healthy idle connections are no longer dropped by the 90s silence rule; only a link that stays silent despite probes is disconnected.
+- Post-reconnect delay: queued commands now run before the workspace and skill catalogs are fetched, and the two catalog requests run concurrently instead of serially, so reconnecting no longer blocks user actions behind catalog round-trips (previously up to 60s worst case).
 
 ### Limitations
 

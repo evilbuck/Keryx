@@ -849,7 +849,8 @@ impl Link {
         self.emit(Event::Connection(ConnectionState::Connected))
             .await;
         self.fetch_models().await;
-        self.fetch_studio_catalogs().await;
+        // Drained commands run before the studio catalogs: after a reconnect the
+        // user's queued actions must not wait on two HTTP round-trips.
         while self.ready && self.write.is_some() {
             let Some(command) = self.queued.pop_front() else {
                 break;
@@ -859,6 +860,7 @@ impl Link {
                 break;
             }
         }
+        self.fetch_studio_catalogs().await;
     }
 
     async fn handle(&mut self, command: Command) {
@@ -1304,7 +1306,13 @@ impl Link {
 
     async fn fetch_studio_catalogs(&self) {
         let creds = self.credential_secrets();
-        let catalog = match fetch_workspaces_http(&self.http, &self.origin, &creds).await {
+        // Two independent HTTP calls: concurrent halves the wall time and the
+        // worst-case delay before the palette's workspace and skill lists land.
+        let (workspaces, skills) = tokio::join!(
+            fetch_workspaces_http(&self.http, &self.origin, &creds),
+            fetch_skills_http(&self.http, &self.origin, &creds),
+        );
+        let catalog = match workspaces {
             Ok(catalog) => catalog,
             Err(err) => WorkspaceCatalog {
                 error: Some(self.clean(err)),
@@ -1312,7 +1320,7 @@ impl Link {
             },
         };
         self.emit(Event::Workspaces { catalog }).await;
-        if let Ok(skills) = fetch_skills_http(&self.http, &self.origin, &creds).await {
+        if let Ok(skills) = skills {
             self.emit(Event::Skills { skills }).await;
         }
     }

@@ -76,6 +76,8 @@ An unintentional drop is retried automatically with exponential backoff: the fir
 
 Idle keepalive is protocol-level: after 30s without any inbound frame the client sends a WebSocket Ping (RFC 6455). A live gateway answers Pong, refreshing the liveness clock, so a healthy idle connection stays up instead of being dropped by the 90s inbound-silence bound. The socket is dropped only when a probe cannot be written or the gateway stays silent for 90s despite probes.
 
+On `gateway.ready` the queued commands drain first, then the studio workspace and skill catalogs are fetched over HTTP concurrently. Queued user actions never wait on catalog round-trips, and the two catalog requests share one wall-clock window.
+
 ## Configuration
 
 `main` loads `./.env` from the process working directory only. There is no parent-directory walk. Variables already set in the process are left as they are. Client configuration consumes only `HERMES_GATEWAY_URL`, `HERMES_USER`, and `HERMES_PASSWORD`. The URL must be an origin: no userinfo, path, query, or fragment. `HERMES_BASIC_AUTH_SECRET` is not consumed as client configuration, sent, or bundled.
