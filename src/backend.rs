@@ -664,8 +664,16 @@ enum OpenStop {
 
 /// How a command that arrives mid-connect affects the attempt.
 enum MidConnect {
-    /// Park the command; it drains once the gateway reports ready.
+    /// Park the command; it drains once the gateway reports ready. Only the
+    /// same allowlist the not-ready path enforces (`List`, `Create`,
+    /// `Resume`, `SearchSessions`, `FetchStudio`) may wait: these replay
+    /// against fresh state.
     Queue(Command),
+    /// Fail the command immediately — it carries a runtime id or session
+    /// action that belongs to the torn-down connection, so replaying it on
+    /// the new connection would target dead state. The message matches the
+    /// not-ready path exactly.
+    Reject(Command),
     /// Abort the attempt and retry immediately.
     Restart,
     /// Stop connecting.
@@ -814,7 +822,8 @@ fn mid_connect(command: Option<Command>) -> MidConnect {
     match command {
         None | Some(Command::Shutdown) => MidConnect::Shutdown,
         Some(Command::Reconnect) => MidConnect::Restart,
-        Some(command) => MidConnect::Queue(command),
+        Some(command) if is_queueable_while_connecting(&command) => MidConnect::Queue(command),
+        Some(command) => MidConnect::Reject(command),
     }
 }
 
@@ -823,6 +832,7 @@ async fn open_link(
     incoming: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
 ) -> bool {
     let mut waiting = VecDeque::new();
+    let mut rejected = VecDeque::new();
     loop {
         let stop = {
             let connection = link.connect();
@@ -836,6 +846,7 @@ async fn open_link(
                         MidConnect::Shutdown => break OpenStop::Shutdown,
                         MidConnect::Restart => break OpenStop::Restart,
                         MidConnect::Queue(command) => waiting.push_back(command),
+                        MidConnect::Reject(command) => rejected.push_back(command),
                     },
                     result = &mut connection => break match result {
                         Ok(()) => OpenStop::Ready,
@@ -846,7 +857,11 @@ async fn open_link(
             }
         };
         // Leaving the block drops the in-flight attempt, cancelling its
-        // HTTP requests and socket dial.
+        // HTTP requests and socket dial. The rejects can now reach the
+        // link; they fail with the same message the not-ready path emits.
+        while let Some(command) = rejected.pop_front() {
+            link.reject_unready(command).await;
+        }
         if matches!(stop, OpenStop::Shutdown) {
             link.queued.extend(waiting);
             return false;
@@ -1216,6 +1231,14 @@ impl Link {
             self.queued.push_back(command);
             return;
         }
+        self.reject_unready(command).await;
+    }
+
+    /// Emits the immediate failure for a command that cannot wait for a
+    /// connection. The not-ready and mid-connect paths share it, so a
+    /// Submit or Steer issued while disconnected gets the same answer in
+    /// both states instead of replaying against a dead runtime.
+    async fn reject_unready(&mut self, command: Command) {
         if let Command::AskSide {
             runtime_id,
             client_id,
@@ -6139,6 +6162,79 @@ mod tests {
             mid_connect(Some(Command::List { offset: 0 })),
             MidConnect::Queue(_)
         ));
+        // The mid-dial queue must enforce the same allowlist the not-ready
+        // path enforces: a Submit or Steer carries a runtime id from the
+        // torn-down connection, so replaying it after the dial would target
+        // dead state. It fails immediately instead.
+        assert!(matches!(
+            mid_connect(Some(Command::Submit {
+                runtime_id: "rt-dead".into(),
+                text: "hello".into(),
+                attachments: Vec::new(),
+            })),
+            MidConnect::Reject(_)
+        ));
+        assert!(matches!(
+            mid_connect(Some(Command::Steer {
+                runtime_id: "rt-dead".into(),
+                text: "redirect".into(),
+            })),
+            MidConnect::Reject(_)
+        ));
+        // Allowlisted commands still queue: they replay against fresh
+        // state once the gateway reports ready.
+        assert!(matches!(
+            mid_connect(Some(Command::Resume {
+                stored_id: "st-1".into()
+            })),
+            MidConnect::Queue(_)
+        ));
+    }
+
+    #[test]
+    fn mid_connect_rejects_emit_the_not_connected_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (events, mut incoming) = tokio::sync::mpsc::channel(16);
+            let mut link = Link::new(
+                Config {
+                    url: "https://gateway.example".parse().expect("url"),
+                    username: "user".into(),
+                    password: "top-secret".into(),
+                },
+                events,
+            )
+            .expect("link");
+            // No socket and not ready: a Submit is rejected the same way
+            // open_link rejects one that arrives mid-dial.
+            link.reject_unready(Command::Submit {
+                runtime_id: "rt-dead".into(),
+                text: "hello".into(),
+                attachments: Vec::new(),
+            })
+            .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Error { message, .. })
+                    if message.contains("Not connected. Reconnect to try again.")
+            ));
+            // A timeline command maps to its operation and stored id.
+            link.reject_unready(Command::Undo {
+                stored_id: "st-1".into(),
+                runtime_id: "rt-dead".into(),
+                mode: RewindMode::Undo,
+                prompt_text: String::new(),
+            })
+            .await;
+            assert!(matches!(
+                incoming.try_recv(),
+                Ok(Event::Error { operation, session_id, .. })
+                    if operation == "timeline" && session_id == Some("st-1".into())
+            ));
+        });
     }
 
     #[test]
