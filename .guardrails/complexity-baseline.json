@@ -1,10 +1,5 @@
 [
   {
-    "file": "src/model.rs",
-    "function": "validate_url",
-    "complexity": 11
-  },
-  {
     "file": "src/markdown.rs",
     "function": "nested_lists_quotes_and_tables_keep_boundaries",
     "complexity": 17

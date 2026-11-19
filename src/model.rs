@@ -40,6 +40,18 @@ impl Config {
     }
 
     pub fn validate_url(url: &url::Url, trusted_tunnel: bool) -> Result<(), String> {
+        Self::check_origin_shape(url)?;
+        match url.scheme() {
+            "https" => Ok(()),
+            "http" if trusted_tunnel && tunnel_host(url.host_str().unwrap_or_default()) => Ok(()),
+            "http" => Err("Plain HTTP requires --trusted-tunnel and a loopback or Tailscale address. Use HTTPS otherwise.".into()),
+            _ => Err("Gateway URL must use HTTPS (or HTTP inside an explicitly trusted encrypted tunnel).".into()),
+        }
+    }
+
+    /// The gateway URL must be a bare origin: a host, and no credentials,
+    /// query, fragment, or path.
+    fn check_origin_shape(url: &url::Url) -> Result<(), String> {
         if url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -54,12 +66,7 @@ impl Config {
         if url.path() != "/" && !url.path().is_empty() {
             return Err("Gateway URL must be the dashboard origin, without a path.".into());
         }
-        match url.scheme() {
-            "https" => Ok(()),
-            "http" if trusted_tunnel && tunnel_host(url.host_str().unwrap_or_default()) => Ok(()),
-            "http" => Err("Plain HTTP requires --trusted-tunnel and a loopback or Tailscale address. Use HTTPS otherwise.".into()),
-            _ => Err("Gateway URL must use HTTPS (or HTTP inside an explicitly trusted encrypted tunnel).".into()),
-        }
+        Ok(())
     }
 }
 
