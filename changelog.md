@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Automatic reconnect with exponential backoff. After an unintentional socket loss the client retries in 1s, doubling to a 30s cap, and drains queued commands once the gateway is ready again. Bad-password and rate-limited logins are not retried automatically.
 
 - Attach UTF-8 text files and text-bearing PDFs to chat messages. Their extracted text is included in conversation context alongside existing image attachments. Files can be selected with **Attach** or Ctrl+U, or dragged into the composer.
 

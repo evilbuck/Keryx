@@ -445,6 +445,8 @@ struct Link {
     ready: bool,
     opened_at: Option<Instant>,
     last_inbound: Instant,
+    /// Whether the last disconnect was transient and worth retrying automatically.
+    retryable: bool,
 }
 
 async fn run(
@@ -466,16 +468,37 @@ async fn run(
         return;
     }
     let mut maintenance = tokio::time::interval(Duration::from_secs(5));
+    let mut attempts: u32 = 0;
+    let mut retry_at: Option<tokio::time::Instant> = None;
+    let track = |link: &Link, attempts: &mut u32, retry_at: &mut Option<tokio::time::Instant>| {
+        *retry_at = reconnect_deadline(
+            link.write.is_some(),
+            link.retryable,
+            *retry_at,
+            attempts,
+            tokio::time::Instant::now(),
+        );
+    };
     loop {
         let command = tokio::select! {
             biased;
             command = incoming.recv() => command,
             frame = next_frame(&mut link.read) => {
                 link.on_socket(frame).await;
+                track(&link, &mut attempts, &mut retry_at);
                 continue;
             }
             _ = maintenance.tick() => {
                 link.maintain().await;
+                track(&link, &mut attempts, &mut retry_at);
+                continue;
+            }
+            _ = retry_wait(retry_at) => {
+                retry_at = None;
+                if !open_link(&mut link, &mut incoming).await {
+                    break;
+                }
+                track(&link, &mut attempts, &mut retry_at);
                 continue;
             }
         };
@@ -485,14 +508,58 @@ async fn run(
             break;
         }
         if matches!(command, Command::Reconnect) {
+            attempts = 0;
+            retry_at = None;
             if !open_link(&mut link, &mut incoming).await {
                 break;
             }
+            track(&link, &mut attempts, &mut retry_at);
             continue;
         }
         link.handle(command).await;
+        track(&link, &mut attempts, &mut retry_at);
     }
     link.close_socket().await;
+}
+
+/// Backoff between automatic reconnect attempts: 1s, 2s, 4s, 8s, 16s, then 30s.
+fn reconnect_delay(attempt: u32) -> Duration {
+    match attempt {
+        1 => Duration::from_secs(1),
+        2 => Duration::from_secs(2),
+        3 => Duration::from_secs(4),
+        4 => Duration::from_secs(8),
+        5 => Duration::from_secs(16),
+        _ => Duration::from_secs(30),
+    }
+}
+
+/// Reconnect bookkeeping. A live socket resets the backoff; a dropped,
+/// still-retryable socket schedules the next attempt. Authentication
+/// failures are never rescheduled.
+fn reconnect_deadline(
+    connected: bool,
+    retryable: bool,
+    pending: Option<tokio::time::Instant>,
+    attempts: &mut u32,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    if connected {
+        *attempts = 0;
+        return None;
+    }
+    if pending.is_some() || !retryable {
+        return pending;
+    }
+    *attempts = attempts.saturating_add(1);
+    Some(now + reconnect_delay(*attempts))
+}
+
+async fn retry_wait(retry_at: Option<tokio::time::Instant>) {
+    match retry_at {
+        Some(when) => tokio::time::sleep_until(when).await,
+        None => std::future::pending().await,
+    }
 }
 
 enum OpenStop {
@@ -577,6 +644,7 @@ impl Link {
             ready: false,
             opened_at: None,
             last_inbound: Instant::now(),
+            retryable: false,
         })
     }
 
@@ -615,6 +683,8 @@ impl Link {
             .await;
         self.ready = false;
         self.opened_at = None;
+        // Transient by default; permanent refusals opt out below.
+        self.retryable = true;
         self.close_socket().await;
         self.fail_jobs("The connection closed before the gateway answered.")
             .await;
@@ -640,10 +710,12 @@ impl Link {
         };
         if !login.status().is_success() {
             let state = if login.status().as_u16() == 401 || login.status().as_u16() == 404 {
+                self.retryable = false;
                 ConnectionState::AuthenticationFailed(
                     "The gateway rejected the username or password.".into(),
                 )
             } else if login.status().as_u16() == 429 {
+                self.retryable = false;
                 ConnectionState::AuthenticationFailed(
                     "Too many login attempts. Try again shortly.".into(),
                 )
@@ -672,6 +744,7 @@ impl Link {
             }
         };
         if ticket_response.status().as_u16() == 401 {
+            self.retryable = false;
             self.emit(Event::Connection(ConnectionState::AuthenticationFailed(
                 "The gateway did not accept the login session.".into(),
             )))
@@ -717,6 +790,7 @@ impl Link {
             "ws"
         };
         if ws_url.set_scheme(scheme).is_err() {
+            self.retryable = false;
             self.emit(Event::Connection(ConnectionState::Disconnected(
                 "Could not open the gateway socket.".into(),
             )))
@@ -748,6 +822,7 @@ impl Link {
         self.last_inbound = Instant::now();
         self.heartbeat = false;
         self.ready = false;
+        self.retryable = true;
         self.opened_at = Some(Instant::now());
         Ok(())
     }
@@ -5074,6 +5149,68 @@ mod tests {
         assert!(running.finish());
         assert_eq!(running.phase, TurnPhase::Terminal);
         assert!(!running.accept_interrupt(4));
+    }
+
+
+    #[test]
+    fn reconnect_backoff_doubles_then_caps_at_30s() {
+        let schedule: Vec<Duration> = (1..=8).map(reconnect_delay).collect();
+        assert_eq!(
+            schedule,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconnect_deadline_resets_on_connect_and_never_retries_auth_failures() {
+        let now = tokio::time::Instant::now();
+        let mut attempts = 0;
+
+        // Live socket clears any pending retry and resets the backoff.
+        assert_eq!(
+            reconnect_deadline(
+                true,
+                false,
+                Some(now + Duration::from_secs(9)),
+                &mut attempts,
+                now
+            ),
+            None
+        );
+        assert_eq!(attempts, 0);
+
+        // A dropped, retryable socket schedules attempt 1 after 1s.
+        let first = reconnect_deadline(false, true, None, &mut attempts, now).unwrap();
+        assert_eq!(first, now + Duration::from_secs(1));
+        assert_eq!(attempts, 1);
+
+        // A pending retry is not rescheduled or shortened.
+        assert_eq!(
+            reconnect_deadline(false, true, Some(first), &mut attempts, now),
+            Some(first)
+        );
+        assert_eq!(attempts, 1);
+
+        // Authentication failure never schedules and does not grow attempts.
+        assert_eq!(
+            reconnect_deadline(false, false, None, &mut attempts, now),
+            None
+        );
+        assert_eq!(attempts, 1);
+
+        // After a successful reconnect the backoff starts over at 1s.
+        reconnect_deadline(true, true, None, &mut attempts, now);
+        let second = reconnect_deadline(false, true, None, &mut attempts, now).unwrap();
+        assert_eq!(second, now + Duration::from_secs(1));
     }
 
     #[test]
