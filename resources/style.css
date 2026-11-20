@@ -154,9 +154,10 @@
 .slash-deck { background: @view_bg_color; border: 1px solid alpha(@accent_color, 0.30); border-radius: 12px; padding: 8px 10px; }
 .slash-row { padding: 6px 8px; border-radius: 8px; }
 .slash-row-active { background: alpha(@accent_bg_color, 0.18); }
-.slash-token { font-family: monospace; font-size: 12.5px; font-weight: 800; color: @accent_color; min-width: 110px; }
-.slash-skill-badge { background: alpha(@purple_3, 0.20); color: @purple_3; }
-.slash-desc { font-size: 12px; opacity: 0.78; }
+.slash-token { font-family: monospace; font-size: 12.5px; font-weight: 800; color: @window_fg_color; min-width: 110px; }
+.slash-row .source-badge { background: alpha(@accent_color, 0.28); color: @window_fg_color; }
+.slash-row .slash-skill-badge { background: alpha(@purple_3, 0.32); }
+.slash-desc { font-size: 12px; opacity: 1; }
 .attach-trigger { padding: 4px 10px; border-radius: 8px; background: alpha(@window_fg_color, 0.045); }
 .attach-trigger:hover { background: alpha(@accent_bg_color, 0.16); color: @accent_color; }
 .attachment-strip { padding-bottom: 4px; border-bottom: 1px solid alpha(@window_fg_color, 0.08); }
