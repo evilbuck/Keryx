@@ -1780,6 +1780,11 @@ pub struct Conversation {
     /// instead of diffing the whole conversation on every streamed chunk.
     pub stream_revision: u64,
     pub inspector_revision: u64,
+    /// Bumped only when the side-question list changes. Lets the inspector
+    /// skip rebuilding Side-Ask cards on streaming-only revision bumps
+    /// (reasoning/tool/telemetry), which would otherwise reset selection
+    /// and scroll position on every refresh.
+    pub side_questions_revision: u64,
     pub model: ModelState,
     pub reasoning: String,
     pub tools: Vec<ToolTrace>,
@@ -2145,6 +2150,7 @@ impl Conversation {
             self.side_questions.drain(0..overflow);
         }
         self.inspector_revision += 1;
+        self.side_questions_revision += 1;
     }
 
     pub fn bind_side_task(&mut self, client_id: u64, task_id: String) {
@@ -2155,6 +2161,7 @@ impl Conversation {
         {
             entry.task_id = Some(task_id);
             self.inspector_revision += 1;
+            self.side_questions_revision += 1;
         }
     }
 
@@ -2171,6 +2178,7 @@ impl Conversation {
             self.push_unsolicited_side(task_id, question, text, status);
         }
         self.inspector_revision += 1;
+        self.side_questions_revision += 1;
     }
 
     fn push_unsolicited_side(
@@ -2205,6 +2213,7 @@ impl Conversation {
             entry.answer = message;
             entry.status = SideQuestionStatus::Failed;
             self.inspector_revision += 1;
+            self.side_questions_revision += 1;
         }
     }
 
@@ -2219,6 +2228,7 @@ impl Conversation {
         }
         if changed {
             self.inspector_revision += 1;
+            self.side_questions_revision += 1;
         }
     }
 }

@@ -58,6 +58,7 @@ pub struct InspectorPanel {
     outline_list: gtk::Box,
     callback: ActionCallback,
     stamp: Rc<RefCell<Option<RenderStamp>>>,
+    side_stamp: Rc<RefCell<Option<(String, u64, usize)>>>,
 }
 
 impl InspectorPanel {
@@ -124,6 +125,7 @@ impl InspectorPanel {
             outline_list,
             callback,
             stamp: Rc::new(RefCell::new(None)),
+            side_stamp: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -160,7 +162,7 @@ impl InspectorPanel {
             return;
         }
         *self.stamp.borrow_mut() = Some(next);
-        self.render_contents(conversation);
+        self.render_contents(session_id, conversation);
     }
 
     fn sync_active_tab(&self, tab: InspectorTab) {
@@ -192,13 +194,17 @@ impl InspectorPanel {
         }));
     }
 
-    fn render_contents(&self, conversation: Option<&Conversation>) {
+    fn render_contents(&self, session_id: Option<&str>, conversation: Option<&Conversation>) {
         let empty = Conversation::default();
         let chat = conversation.unwrap_or(&empty);
         let outline = build_outline(&chat.messages);
         self.update_tab_labels(chat, outline.len());
         self.update_workspace_header(&chat.telemetry);
-        self.render_side_questions(&chat.side_questions);
+        self.render_side_questions(
+            session_id.unwrap_or(""),
+            &chat.side_questions,
+            chat.side_questions_revision,
+        );
         self.render_telemetry(&chat.telemetry);
         self.render_reasoning(&chat.reasoning);
         self.render_tools(&chat.tools);
@@ -219,7 +225,20 @@ impl InspectorPanel {
         self.workspace_badge.set_label(&badge);
     }
 
-    fn render_side_questions(&self, items: &[SideQuestion]) {
+    fn render_side_questions(&self, session_id: &str, items: &[SideQuestion], revision: u64) {
+        let stamp = (session_id.to_string(), revision, items.len());
+        let previous = self.side_stamp.borrow().clone();
+        if previous.as_ref() == Some(&stamp) {
+            return;
+        }
+        let grew = previous
+            .as_ref()
+            .map_or(true, |(_, _, len)| items.len() > *len);
+        let was_at_bottom = {
+            let adj = self.side_scroll.vadjustment();
+            adj.value() + adj.page_size() >= adj.upper() - 1.0
+        };
+        *self.side_stamp.borrow_mut() = Some(stamp);
         clear_box(&self.side_list);
         if items.is_empty() {
             self.side_list
@@ -230,10 +249,12 @@ impl InspectorPanel {
             self.side_list
                 .append(&build_side_card(item, &self.callback));
         }
-        let adj = self.side_scroll.vadjustment();
-        gtk::glib::idle_add_local_once(move || {
-            adj.set_value(adj.upper() - adj.page_size());
-        });
+        if grew && was_at_bottom {
+            let adj = self.side_scroll.vadjustment();
+            gtk::glib::idle_add_local_once(move || {
+                adj.set_value(adj.upper() - adj.page_size());
+            });
+        }
     }
 
     fn render_telemetry(&self, telemetry: &SessionTelemetry) {
