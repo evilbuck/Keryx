@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -231,13 +231,14 @@ impl InspectorPanel {
         if previous.as_ref() == Some(&stamp) {
             return;
         }
-        let grew = previous
-            .as_ref()
-            .map_or(true, |(_, _, len)| items.len() > *len);
-        let was_at_bottom = {
-            let adj = self.side_scroll.vadjustment();
-            adj.value() + adj.page_size() >= adj.upper() - 1.0
-        };
+        let session_changed = previous.as_ref().is_some_and(|(id, _, _)| id != session_id);
+        let adj = self.side_scroll.vadjustment();
+        let pinned = adj.value() + adj.page_size() >= adj.upper() - 1.0;
+        let plan = side_scroll_plan(
+            session_changed,
+            pinned,
+            first_visible_anchor(&self.side_list, adj.value()),
+        );
         *self.side_stamp.borrow_mut() = Some(stamp);
         clear_box(&self.side_list);
         if items.is_empty() {
@@ -249,12 +250,7 @@ impl InspectorPanel {
             self.side_list
                 .append(&build_side_card(item, &self.callback));
         }
-        if grew && was_at_bottom {
-            let adj = self.side_scroll.vadjustment();
-            gtk::glib::idle_add_local_once(move || {
-                adj.set_value(adj.upper() - adj.page_size());
-            });
-        }
+        queue_side_scroll(&self.side_list, &self.side_scroll.vadjustment(), plan);
     }
 
     fn render_telemetry(&self, telemetry: &SessionTelemetry) {
@@ -1105,6 +1101,98 @@ fn clear_box(container: &gtk::Box) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SideScrollPlan {
+    Bottom,
+    Card { index: usize, offset: f64 },
+}
+
+fn side_scroll_plan(
+    session_changed: bool,
+    pinned: bool,
+    anchor: Option<(usize, f64)>,
+) -> SideScrollPlan {
+    match (session_changed || pinned, anchor) {
+        (false, Some((index, offset))) => SideScrollPlan::Card { index, offset },
+        _ => SideScrollPlan::Bottom,
+    }
+}
+
+fn first_visible_anchor(list: &gtk::Box, value: f64) -> Option<(usize, f64)> {
+    let mut index = 0usize;
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        if let Some((top, height)) = child_bounds(list, &widget)
+            && height > 0.0
+            && top + height > value + 1.0
+        {
+            return Some((index, value - top));
+        }
+        index += 1;
+        child = widget.next_sibling();
+    }
+    None
+}
+
+fn child_bounds(list: &gtk::Box, widget: &gtk::Widget) -> Option<(f64, f64)> {
+    let bounds = widget.compute_bounds(list)?;
+    Some((f64::from(bounds.y()), f64::from(bounds.height())))
+}
+
+fn nth_child(list: &gtk::Box, index: usize) -> Option<gtk::Widget> {
+    let mut child = list.first_child();
+    for _ in 0..index {
+        child = child.and_then(|widget| widget.next_sibling());
+    }
+    child
+}
+
+fn apply_side_scroll(list: &gtk::Box, adj: &gtk::Adjustment, plan: SideScrollPlan) -> bool {
+    let max = (adj.upper() - adj.page_size()).max(0.0);
+    let target = match plan {
+        SideScrollPlan::Bottom => {
+            if adj.upper() <= adj.page_size() + 1.0 {
+                return false;
+            }
+            max
+        }
+        SideScrollPlan::Card { index, offset } => {
+            let Some(child) = nth_child(list, index) else {
+                return false;
+            };
+            let Some((top, height)) = child_bounds(list, &child) else {
+                return false;
+            };
+            if height <= 1.0 {
+                return false;
+            }
+            (top + offset).clamp(0.0, max)
+        }
+    };
+    adj.set_value(target);
+    true
+}
+
+fn queue_side_scroll(list: &gtk::Box, adj: &gtk::Adjustment, plan: SideScrollPlan) {
+    let list = list.clone();
+    let adj = adj.clone();
+    gtk::glib::idle_add_local_once(move || {
+        if apply_side_scroll(&list, &adj, plan) {
+            return;
+        }
+        let pending = list.clone();
+        let gate = Rc::new(Cell::new(true));
+        adj.connect_changed(move |adj| {
+            if !gate.get() {
+                return;
+            }
+            if apply_side_scroll(&pending, adj, plan) {
+                gate.set(false);
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1224,5 +1312,119 @@ mod tests {
             assert_eq!(panel.trace_tab.label().as_deref(), Some("Trace · 2"));
             assert_eq!(panel.outline_tab.label().as_deref(), Some("Map · 1"));
         });
+    }
+
+    fn drain_gtk() {
+        let context = gtk::glib::MainContext::default();
+        while context.iteration(false) {}
+    }
+
+    fn allocate_window(window: &gtk::Window) {
+        let width = window.width().max(320);
+        let height = window.height().max(160);
+        window.allocate(width, height, -1, None);
+        drain_gtk();
+    }
+
+    fn show_side_ask(panel: &InspectorPanel, conv: &Conversation) -> gtk::Window {
+        let window = gtk::Window::builder()
+            .default_width(320)
+            .default_height(160)
+            .child(&panel.root)
+            .build();
+        window.present();
+        panel.sync(true, InspectorTab::SideAsk, Some("s1"), Some(conv), true);
+        drain_gtk();
+        window
+    }
+
+    fn scrollable_side_questions() -> Conversation {
+        let mut conv = Conversation::default();
+        for id in 0..8 {
+            conv.begin_side_question(id, format!("Question {id}: {}", "detail ".repeat(30)));
+        }
+        conv
+    }
+
+    fn visible_card_index(panel: &InspectorPanel) -> Option<usize> {
+        let value = panel.side_scroll.vadjustment().value();
+        first_visible_anchor(&panel.side_list, value).map(|(index, _)| index)
+    }
+
+    #[test]
+    fn side_ask_rebuild_keeps_the_card_the_reader_was_on() {
+        crate::with_gtk_test_thread(|| {
+            let panel = InspectorPanel::default();
+            let mut conv = scrollable_side_questions();
+            let window = show_side_ask(&panel, &conv);
+            allocate_window(&window);
+
+            let adj = panel.side_scroll.vadjustment();
+            let max = (adj.upper() - adj.page_size()).max(0.0);
+            assert!(max > 40.0, "upper={} page={}", adj.upper(), adj.page_size());
+            adj.set_value(max * 0.45);
+            allocate_window(&window);
+            let before = visible_card_index(&panel).expect("visible card");
+            assert!(before > 0, "reader should be below the card that grows");
+
+            let question = conv.side_questions[0].question.clone();
+            conv.complete_side_question("", &question, "Grown answer. ".repeat(80));
+            panel.sync(true, InspectorTab::SideAsk, Some("s1"), Some(&conv), true);
+            allocate_window(&window);
+
+            let after = visible_card_index(&panel).expect("visible card after rebuild");
+            assert_eq!(
+                after, before,
+                "arriving answer moved the viewport from card {before} to {after}"
+            );
+        });
+    }
+
+    #[test]
+    fn side_ask_rebuild_stays_at_the_bottom_when_the_reader_was_pinned() {
+        crate::with_gtk_test_thread(|| {
+            let panel = InspectorPanel::default();
+            let mut conv = scrollable_side_questions();
+            let window = show_side_ask(&panel, &conv);
+            allocate_window(&window);
+
+            let question = conv
+                .side_questions
+                .last()
+                .expect("question")
+                .question
+                .clone();
+            conv.complete_side_question("", &question, "Grown answer. ".repeat(40));
+            panel.sync(true, InspectorTab::SideAsk, Some("s1"), Some(&conv), true);
+            allocate_window(&window);
+
+            let adj = panel.side_scroll.vadjustment();
+            let gap = adj.upper() - adj.page_size() - adj.value();
+            assert!(
+                gap < 2.0,
+                "pinned reader left the bottom by {gap} (value {} upper {})",
+                adj.value(),
+                adj.upper()
+            );
+        });
+    }
+
+    #[test]
+    fn side_scroll_plan_keeps_a_mid_list_anchor() {
+        assert!(matches!(
+            side_scroll_plan(false, false, Some((3, 12.0))),
+            SideScrollPlan::Card {
+                index: 3,
+                offset: 12.0
+            }
+        ));
+        assert!(matches!(
+            side_scroll_plan(false, true, Some((3, 12.0))),
+            SideScrollPlan::Bottom
+        ));
+        assert!(matches!(
+            side_scroll_plan(true, false, Some((3, 12.0))),
+            SideScrollPlan::Bottom
+        ));
     }
 }
