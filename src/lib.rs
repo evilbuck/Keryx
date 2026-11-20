@@ -40,7 +40,9 @@ pub(crate) fn with_gtk_test_thread(run: impl FnOnce() + Send + 'static) {
             let _ = done_tx.send(outcome);
         }))
         .expect("gtk test thread alive");
-    if let Ok(Err(payload)) = done_rx.recv() {
-        std::panic::resume_unwind(payload);
+    match done_rx.recv() {
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Ok(Ok(())) => {}
+        Err(_) => panic!("GTK test job was dropped without running (GTK failed to initialize)"),
     }
 }
