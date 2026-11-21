@@ -264,8 +264,9 @@ impl Root {
     fn on_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if key == "enter" {
-            self.desk.commit_picker();
-            self.pending_focus = Some(Focus::Composer);
+            if self.desk.commit_picker() {
+                self.pending_focus = Some(Focus::Composer);
+            }
             cx.notify();
             return;
         }
@@ -415,6 +416,9 @@ impl Root {
     }
 
     fn backspace(&mut self) {
+        if !self.desk.controls().editable {
+            return;
+        }
         let draft = self.desk.draft();
         let (start, end) = selection_of(&draft, self.anchor, self.cursor);
         if start != end {
@@ -426,6 +430,9 @@ impl Root {
     }
 
     fn delete_forward(&mut self) {
+        if !self.desk.controls().editable {
+            return;
+        }
         let draft = self.desk.draft();
         let (start, end) = selection_of(&draft, self.anchor, self.cursor);
         if start != end {
@@ -1360,10 +1367,10 @@ fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpu
         ))
 }
 
-fn overlay(root: &mut Root, cx: &mut Context<Root>) -> Vec<gpui::Div> {
+fn overlay(root: &mut Root, cx: &mut Context<Root>) -> Vec<gpui::AnyElement> {
     let mut layers = Vec::new();
     if root.desk.picker_open {
-        layers.push(picker(root, cx));
+        layers.push(picker(root, cx).into_any_element());
     }
     if root.desk.confirm.is_some() {
         layers.push(confirm_dialog(root, cx));
@@ -1514,13 +1521,25 @@ fn model_row(
     row
 }
 
-fn confirm_dialog(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+fn confirm_dialog(root: &mut Root, cx: &mut Context<Root>) -> gpui::AnyElement {
     let message = root
         .desk
         .confirm
         .as_ref()
         .map(|prompt| prompt.message.clone())
         .unwrap_or_default();
+    div()
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .on_mouse_down(MouseButton::Left, |_, _, _| {})
+        .child(confirm_card(message, cx))
+        .into_any_element()
+}
+
+fn confirm_card(message: String, cx: &mut Context<Root>) -> gpui::Div {
     div()
         .absolute()
         .top(px(80.))

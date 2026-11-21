@@ -371,8 +371,8 @@ impl Run {
         }
     }
 
-    fn code(text: &str) -> Self {
-        let mut style = Style::plain();
+    fn code(text: &str, style: &Style) -> Self {
+        let mut style = style.clone();
         style.code = true;
         Self {
             text: text.to_string(),
@@ -406,7 +406,7 @@ fn push_leaf(out: &mut Vec<Run>, inline: &Inline, style: &Style) -> bool {
         Inline::Text(text) => out.push(Run::text(text, style.clone())),
         Inline::SoftBreak => out.push(Run::text(" ", style.clone())),
         Inline::HardBreak => out.push(Run::hard()),
-        Inline::Code(text) => out.push(Run::code(text)),
+        Inline::Code(text) => out.push(Run::code(text, style)),
         Inline::Html(text) => out.push(Run::text(text, style.clone())),
         Inline::Image { alt } => out.push(Run::text(alt, style.clone().italic_on())),
         Inline::Strong(_) | Inline::Emphasis(_) | Inline::Strike(_) | Inline::Link { .. } => {
@@ -441,4 +441,21 @@ fn pieces(text: &str) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_code_keeps_a_parent_link() {
+        let blocks = parse("[`docs`](https://example.com)");
+        let Block::Paragraph(inlines) = &blocks[0] else {
+            panic!("paragraph");
+        };
+        let runs = flatten(inlines);
+        assert!(runs.iter().any(|run| {
+            run.style.code && run.style.href.as_deref() == Some("https://example.com/")
+        }));
+    }
 }

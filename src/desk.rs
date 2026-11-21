@@ -10,6 +10,7 @@ use crate::present::{self, Controls, QuestionDraft};
 
 #[derive(Clone)]
 struct PendingModel {
+    stored_id: String,
     runtime_id: String,
     target: ModelIdentity,
     prime: Option<ModelIdentity>,
@@ -17,7 +18,8 @@ struct PendingModel {
 
 pub struct ConfirmPrompt {
     pub message: String,
-    pub(crate) target: ModelIdentity,
+    stored_id: String,
+    target: ModelIdentity,
 }
 
 struct SwitchPlan {
@@ -313,7 +315,7 @@ impl Desk {
             return;
         };
         if accept {
-            self.choose_model(confirm.target, true);
+            self.choose_for(&confirm.stored_id, confirm.target, true);
         }
     }
 
@@ -505,7 +507,14 @@ impl Desk {
     }
 
     fn choose_model(&mut self, target: ModelIdentity, confirm: bool) {
-        let Some(plan) = self.plan_switch() else {
+        let Some(stored) = self.state.selected.clone() else {
+            return;
+        };
+        self.choose_for(&stored, target, confirm);
+    }
+
+    fn choose_for(&mut self, stored: &str, target: ModelIdentity, confirm: bool) {
+        let Some(plan) = self.plan_for(stored) else {
             return;
         };
         if !self.command(Command::SetModel {
@@ -520,15 +529,15 @@ impl Desk {
             chat.begin_model_switch(target.clone());
         }
         self.model_pending = Some(PendingModel {
+            stored_id: plan.stored,
             runtime_id: plan.runtime,
             target,
             prime: plan.prime,
         });
     }
 
-    fn plan_switch(&self) -> Option<SwitchPlan> {
-        let stored = self.state.selected.clone()?;
-        let chat = self.state.conversations.get(&stored)?;
+    fn plan_for(&self, stored: &str) -> Option<SwitchPlan> {
+        let chat = self.state.conversations.get(stored)?;
         if chat.read_only_reason.is_some() || chat.model.switching() {
             return None;
         }
@@ -539,7 +548,7 @@ impl Desk {
             None
         };
         Some(SwitchPlan {
-            stored,
+            stored: stored.to_string(),
             runtime,
             prime,
         })
@@ -660,6 +669,7 @@ impl Desk {
         if let Some(pending) = pending {
             self.confirm = Some(ConfirmPrompt {
                 message,
+                stored_id: pending.stored_id,
                 target: pending.target,
             });
         }
@@ -674,7 +684,9 @@ impl Desk {
         let Some(identity) = self.state.catalog.identity_for_model(model) else {
             return;
         };
-        self.settle_model(runtime_id, |chat| chat.observe_model(identity));
+        if let Some(chat) = self.state.conversation_for_runtime_mut(runtime_id) {
+            chat.observe_model(identity);
+        }
     }
 
     fn settle_model(&mut self, runtime_id: &str, update: impl FnOnce(&mut Conversation)) {
@@ -792,7 +804,31 @@ impl Desk {
         model: Option<ModelIdentity>,
     ) {
         self.pending_resumes.remove(&stored_id);
-        let chat = self.state.conversations.entry(stored_id).or_default();
+        self.fill_resumed(
+            &stored_id,
+            runtime_id,
+            messages,
+            before,
+            read_only_reason,
+            model,
+        );
+        self.drop_switch(&stored_id);
+    }
+
+    fn fill_resumed(
+        &mut self,
+        stored_id: &str,
+        runtime_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        before: usize,
+        read_only_reason: Option<String>,
+        model: Option<ModelIdentity>,
+    ) {
+        let chat = self
+            .state
+            .conversations
+            .entry(stored_id.to_string())
+            .or_default();
         chat.runtime_id = runtime_id;
         chat.messages = messages;
         chat.history_before = before;
@@ -804,8 +840,23 @@ impl Desk {
         chat.interaction = None;
         chat.model = model.map_or(ModelState::Unknown, ModelState::Confirmed);
         chat.revision = chat.revision.saturating_add(1);
-        self.model_pending = None;
-        self.confirm = None;
+    }
+
+    fn drop_switch(&mut self, stored_id: &str) {
+        if self
+            .model_pending
+            .as_ref()
+            .is_some_and(|pending| pending.stored_id == stored_id)
+        {
+            self.model_pending = None;
+        }
+        if self
+            .confirm
+            .as_ref()
+            .is_some_and(|prompt| prompt.stored_id == stored_id)
+        {
+            self.confirm = None;
+        }
     }
 
     fn on_history(
@@ -1071,6 +1122,7 @@ mod tests {
             .expect("chat")
             .begin_model_switch(target.clone());
         desk.model_pending = Some(PendingModel {
+            stored_id: "chat".into(),
             runtime_id: "rt".into(),
             target: target.clone(),
             prime: None,
@@ -1088,5 +1140,82 @@ mod tests {
             desk.confirm.as_ref().map(|prompt| prompt.message.as_str()),
             Some("This model is expensive.")
         );
+        assert_eq!(
+            desk.confirm
+                .as_ref()
+                .map(|prompt| prompt.stored_id.as_str()),
+            Some("chat")
+        );
+    }
+
+    #[test]
+    fn observed_usage_does_not_drop_a_pending_confirmation() {
+        let mut desk = Desk::offline("");
+        desk.apply(created(Some(ModelIdentity {
+            provider: "custom:acme".into(),
+            model: "one".into(),
+        })));
+        desk.state.catalog = Catalog::parse(&serde_json::json!({"providers": [
+            {"slug": "acme", "name": "Acme", "is_user_defined": true, "models": ["one", "two"]}
+        ]}))
+        .expect("catalog");
+        desk.model_pending = Some(PendingModel {
+            stored_id: "chat".into(),
+            runtime_id: "rt".into(),
+            target: ModelIdentity {
+                provider: "custom:acme".into(),
+                model: "two".into(),
+            },
+            prime: None,
+        });
+        desk.apply(Event::ModelObserved {
+            runtime_id: "rt".into(),
+            model: "one".into(),
+        });
+        assert!(desk.model_pending.is_some());
+        desk.apply(Event::ModelConfirmation {
+            runtime_id: "rt".into(),
+            target: ModelIdentity {
+                provider: "custom:acme".into(),
+                model: "two".into(),
+            },
+            message: "Confirm.".into(),
+        });
+        assert_eq!(
+            desk.confirm.as_ref().map(|prompt| prompt.message.as_str()),
+            Some("Confirm.")
+        );
+    }
+
+    #[test]
+    fn resuming_another_chat_keeps_the_open_confirmation() {
+        let mut desk = Desk::offline("");
+        desk.apply(created(None));
+        desk.confirm = Some(ConfirmPrompt {
+            message: "Confirm.".into(),
+            stored_id: "chat".into(),
+            target: ModelIdentity {
+                provider: "custom:acme".into(),
+                model: "two".into(),
+            },
+        });
+        desk.apply(Event::Resumed {
+            stored_id: "other".into(),
+            runtime_id: Some("rt-other".into()),
+            messages: Vec::new(),
+            before: 0,
+            read_only_reason: None,
+            model: None,
+        });
+        assert!(desk.confirm.is_some());
+        desk.apply(Event::Resumed {
+            stored_id: "chat".into(),
+            runtime_id: Some("rt".into()),
+            messages: Vec::new(),
+            before: 0,
+            read_only_reason: None,
+            model: None,
+        });
+        assert!(desk.confirm.is_none());
     }
 }
