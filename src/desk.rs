@@ -53,7 +53,20 @@ pub struct Desk {
     question_key: Option<String>,
     pub form_note: String,
     pub draft_generation: u64,
+    pub composer_follow: Option<ComposerFollow>,
     recall: PromptRecall,
+    held_files: Option<HeldFiles>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComposerFollow {
+    Attach,
+    Workspace(Option<String>),
+}
+
+struct HeldFiles {
+    stored_id: String,
+    files: Vec<StagedImage>,
 }
 
 impl Desk {
@@ -89,7 +102,9 @@ impl Desk {
             question_key: None,
             form_note: String::new(),
             draft_generation: 0,
+            composer_follow: None,
             recall: PromptRecall::default(),
+            held_files: None,
         }
     }
 
@@ -210,12 +225,16 @@ impl Desk {
     }
 
     pub fn select(&mut self, id: &str) {
+        let switching = self.state.selected.as_deref() != Some(id);
         self.state.selected = Some(id.to_string());
         self.state.notice.clear();
         self.follow_bottom = true;
         self.recall = PromptRecall::default();
         self.draft_generation = self.draft_generation.saturating_add(1);
         self.state.conversations.entry(id.to_string()).or_default();
+        if switching {
+            self.rebind_find(id);
+        }
         if self.needs_resume(id) {
             self.resume(id);
         }
@@ -515,12 +534,13 @@ impl Desk {
         let attachments = self.state.take_conversation_attachments(&outgoing.id);
         let display = crate::studio::format_optimistic_prompt(&outgoing.text, &attachments);
         let activity = submit_activity(!attachments.is_empty());
+        self.hold_files(&outgoing.id, attachments.clone());
         if !self.command(Command::Submit {
             runtime_id: outgoing.runtime_id,
             text: outgoing.text.clone(),
-            attachments: attachments.clone(),
+            attachments,
         }) {
-            self.restore_attachments(&outgoing.id, attachments);
+            self.give_back_held();
             return false;
         }
         self.record_outgoing(&outgoing.id, display, activity, true);
@@ -530,6 +550,42 @@ impl Desk {
     fn restore_attachments(&mut self, id: &str, attachments: Vec<StagedImage>) {
         if let Some(chat) = self.state.conversations.get_mut(id) {
             chat.attachments = attachments;
+        }
+    }
+
+    fn hold_files(&mut self, stored_id: &str, files: Vec<StagedImage>) {
+        if files.is_empty() {
+            return;
+        }
+        self.held_files = Some(HeldFiles {
+            stored_id: stored_id.to_string(),
+            files,
+        });
+    }
+
+    fn give_back_held(&mut self) {
+        self.give_back_if(None);
+    }
+
+    fn give_back_if(&mut self, session_id: Option<&str>) {
+        let Some(held) = self.held_files.take() else {
+            return;
+        };
+        if !held_matches(&self.state, &held, session_id) {
+            self.held_files = Some(held);
+            return;
+        }
+        self.restore_attachments(&held.stored_id, held.files);
+    }
+
+    fn release_held(&mut self, runtime_id: &str) {
+        let stored = self.stored_for(runtime_id);
+        let matches = self
+            .held_files
+            .as_ref()
+            .is_some_and(|held| stored.as_deref() == Some(held.stored_id.as_str()));
+        if matches {
+            self.held_files = None;
         }
     }
 
@@ -872,12 +928,14 @@ impl Desk {
     ) {
         let display = crate::studio::format_optimistic_prompt(&prompt, &attachments);
         let activity = submit_activity(!attachments.is_empty());
+        self.hold_files(id, attachments.clone());
         if !self.command(Command::Submit {
             runtime_id,
             text: prompt.clone(),
-            attachments: attachments.clone(),
+            attachments,
         }) {
-            self.restore_initial(id, prompt, attachments);
+            self.restore_initial(id, prompt, Vec::new());
+            self.give_back_held();
             return;
         }
         self.record_outgoing(id, display, activity, true);
@@ -973,6 +1031,7 @@ impl Desk {
     fn apply_text(&mut self, event: Event) {
         match event {
             Event::Submitted { runtime_id } => {
+                self.release_held(&runtime_id);
                 self.with_runtime(&runtime_id, Conversation::submit_acknowledged);
             }
             Event::MessageDelta {
@@ -1071,6 +1130,9 @@ impl Desk {
             self.state.cancel_pending_launch();
             self.select_created = false;
         }
+        if matches!(operation.as_str(), "submit" | "gateway") {
+            self.give_back_if(session_id.as_deref());
+        }
         self.state.creating = false;
         self.state.list_loading = false;
         let Some(id) = session_id else {
@@ -1098,7 +1160,7 @@ impl Desk {
 impl Desk {
     fn dispatch_intent(&mut self, intent: ComposerIntent) -> bool {
         match intent {
-            ComposerIntent::Empty => false,
+            ComposerIntent::Empty => self.submit_staged_only(),
             ComposerIntent::Prompt(_) => self.submit_prompt(),
             ComposerIntent::SideQuestion(question) => self.ask_side(question),
             ComposerIntent::Branch(title) => self.branch_from(None, title),
@@ -1114,13 +1176,44 @@ impl Desk {
             ComposerIntent::Rename(title) => self.rename_to(title),
             ComposerIntent::Archive => self.archive_current(),
             ComposerIntent::Compress => self.compress_current(),
-            ComposerIntent::AttachImage | ComposerIntent::PickWorkspace(_) => false,
+            ComposerIntent::AttachImage => self.follow_attach(),
+            ComposerIntent::PickWorkspace(query) => self.follow_workspace(query),
             ComposerIntent::Empty
             | ComposerIntent::Prompt(_)
             | ComposerIntent::SideQuestion(_)
             | ComposerIntent::Branch(_)
             | ComposerIntent::Rewind(_) => false,
         }
+    }
+
+    fn submit_staged_only(&mut self) -> bool {
+        if !self.has_staged_files() {
+            return false;
+        }
+        self.submit_prompt()
+    }
+
+    fn has_staged_files(&self) -> bool {
+        if self.state.selected.is_none() {
+            return !self.state.launch_attachments.is_empty();
+        }
+        self.open_chat()
+            .is_some_and(|chat| !chat.attachments.is_empty())
+    }
+
+    fn follow_attach(&mut self) -> bool {
+        self.clear_selected_draft();
+        self.composer_follow = Some(ComposerFollow::Attach);
+        true
+    }
+
+    fn follow_workspace(&mut self, query: Option<String>) -> bool {
+        self.clear_selected_draft();
+        if let Some(chosen) = unique_workspace(&self.state, query.as_deref()) {
+            return self.choose_workspace(chosen);
+        }
+        self.composer_follow = Some(ComposerFollow::Workspace(query));
+        true
     }
 
     fn submit_prompt(&mut self) -> bool {
@@ -1228,18 +1321,42 @@ impl Desk {
             .unwrap_or_default()
     }
 
+    fn rebind_find(&mut self, id: &str) {
+        if self.state.pending_find_session.as_deref() != Some(id) {
+            self.state.pending_find_query = None;
+            self.state.pending_find_session = None;
+        }
+        if !self.state.transcript_find.open {
+            return;
+        }
+        let messages = self
+            .state
+            .conversations
+            .get(id)
+            .map(|chat| chat.messages.clone())
+            .unwrap_or_default();
+        self.state.transcript_find.recompute(&messages);
+    }
+
     fn sync_find(&mut self, stored_id: &str) {
         if self.state.selected.as_deref() != Some(stored_id) {
             return;
         }
         let messages = self.selected_messages();
-        if let Some(query) = self.state.pending_find_query.take() {
+        if self.parked_find(stored_id) {
+            let query = self.state.pending_find_query.take().unwrap_or_default();
+            self.state.pending_find_session = None;
             self.state.transcript_find.open_with(&query, &messages);
             return;
         }
         if self.state.transcript_find.open {
             self.state.transcript_find.recompute(&messages);
         }
+    }
+
+    fn parked_find(&self, stored_id: &str) -> bool {
+        self.state.pending_find_query.is_some()
+            && self.state.pending_find_session.as_deref() == Some(stored_id)
     }
 
     pub fn set_session_query(&mut self, query: String) {
@@ -1565,6 +1682,7 @@ impl Desk {
         }
         if self.needs_resume(stored_id) {
             self.state.pending_find_query = Some(clean.to_string());
+            self.state.pending_find_session = Some(stored_id.to_string());
             return;
         }
         let _ = self.open_find(Some(clean));
@@ -1778,6 +1896,22 @@ fn is_studio_event(event: &Event) -> bool {
 
 fn is_timeline_event(event: &Event) -> bool {
     matches!(event, Event::Branched { .. } | Event::Undone { .. })
+}
+
+fn held_matches(state: &AppState, held: &HeldFiles, session_id: Option<&str>) -> bool {
+    let Some(session_id) = session_id else {
+        return true;
+    };
+    session_id == held.stored_id
+        || state.stored_for_runtime(session_id).as_deref() == Some(held.stored_id.as_str())
+}
+
+fn unique_workspace(state: &AppState, query: Option<&str>) -> Option<Option<String>> {
+    let query = query.filter(|text| !text.trim().is_empty())?;
+    if state.workspaces.search(query).len() != 1 {
+        return None;
+    }
+    state.workspaces.resolve_query(query)
 }
 
 fn outgoing_ready(chat: &Conversation, text: &str) -> bool {
@@ -2357,5 +2491,153 @@ mod tests {
             model: None,
         });
         assert!(desk.confirm.is_none());
+    }
+
+    fn staged_file() -> StagedImage {
+        StagedImage {
+            id: 1,
+            filename: "shot.png".into(),
+            mime_type: "image/png".into(),
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn blank_composer_still_sends_staged_files() {
+        let mut desk = Desk::offline("");
+        desk.select_created = true;
+        desk.apply(created(None));
+        desk.state
+            .conversations
+            .get_mut("chat")
+            .expect("chat")
+            .attachments = vec![staged_file()];
+        assert!(!desk.submit());
+        assert!(desk.state.notice.contains("Connection configuration"));
+        assert_eq!(
+            desk.state.conversations["chat"].attachments.len(),
+            1,
+            "a failed enqueue puts the files back"
+        );
+    }
+
+    #[test]
+    fn submit_error_returns_files_and_acceptance_drops_them() {
+        let mut desk = Desk::offline("");
+        desk.select_created = true;
+        desk.apply(created(None));
+        desk.held_files = Some(HeldFiles {
+            stored_id: "chat".into(),
+            files: vec![staged_file()],
+        });
+        desk.apply(Event::Error {
+            operation: "submit".into(),
+            session_id: Some("other".into()),
+            message: "unrelated".into(),
+        });
+        assert!(desk.held_files.is_some());
+        assert!(desk.state.conversations["chat"].attachments.is_empty());
+
+        desk.apply(Event::Error {
+            operation: "submit".into(),
+            session_id: Some("rt".into()),
+            message: "upload failed".into(),
+        });
+        assert!(desk.held_files.is_none());
+        assert_eq!(desk.state.conversations["chat"].attachments.len(), 1);
+
+        desk.held_files = Some(HeldFiles {
+            stored_id: "chat".into(),
+            files: vec![staged_file()],
+        });
+        desk.state
+            .conversations
+            .get_mut("chat")
+            .unwrap()
+            .attachments
+            .clear();
+        desk.apply(Event::Submitted {
+            runtime_id: "rt".into(),
+        });
+        desk.apply(Event::Error {
+            operation: "submit".into(),
+            session_id: Some("rt".into()),
+            message: "too late".into(),
+        });
+        assert!(desk.held_files.is_none());
+        assert!(desk.state.conversations["chat"].attachments.is_empty());
+    }
+
+    #[test]
+    fn slash_attach_and_workspace_request_a_follow_up() {
+        let mut desk = Desk::offline("");
+        desk.select_created = true;
+        desk.apply(created(None));
+        desk.set_draft("/attach".into());
+        assert!(desk.submit());
+        assert_eq!(desk.composer_follow, Some(ComposerFollow::Attach));
+        assert!(desk.draft().is_empty());
+
+        desk.set_draft("/workspace native".into());
+        assert!(desk.submit());
+        assert_eq!(
+            desk.composer_follow,
+            Some(ComposerFollow::Workspace(Some("native".into())))
+        );
+    }
+
+    #[test]
+    fn switching_chats_rebinds_find_and_keeps_a_parked_query_on_its_session() {
+        let mut desk = Desk::offline("");
+        desk.select_created = true;
+        desk.apply(created(None));
+        desk.state.conversations.get_mut("chat").unwrap().messages = vec![ChatMessage {
+            id: "c".into(),
+            role: Role::User,
+            text: "markdown reply".into(),
+        }];
+        assert!(desk.open_find(Some("markdown")));
+        assert_eq!(desk.state.transcript_find.active_message_index(), Some(0));
+
+        desk.state.sessions.push(SessionSummary {
+            stored_id: "other".into(),
+            title: "Other".into(),
+            ..Default::default()
+        });
+        desk.state.pending_find_query = Some("markdown".into());
+        desk.state.pending_find_session = Some("chat".into());
+        desk.select("other");
+        assert!(desk.state.pending_find_query.is_none());
+        assert!(desk.state.transcript_find.matches.is_empty());
+
+        desk.run_palette(PaletteAction::OpenSearchHit {
+            stored_id: "late".into(),
+            query: "needle".into(),
+        });
+        assert_eq!(desk.state.pending_find_query.as_deref(), Some("needle"));
+        assert_eq!(desk.state.pending_find_session.as_deref(), Some("late"));
+        desk.select("other");
+        assert!(desk.state.pending_find_query.is_none());
+
+        desk.run_palette(PaletteAction::OpenSearchHit {
+            stored_id: "late".into(),
+            query: "needle".into(),
+        });
+        desk.apply(Event::Resumed {
+            stored_id: "late".into(),
+            runtime_id: Some("rt-late".into()),
+            messages: vec![ChatMessage {
+                id: "n".into(),
+                role: Role::Assistant,
+                text: "the needle is here".into(),
+            }],
+            before: 0,
+            read_only_reason: None,
+            model: None,
+        });
+        assert!(desk.state.transcript_find.open);
+        assert_eq!(desk.state.transcript_find.query, "needle");
+        assert_eq!(desk.state.transcript_find.active_message_index(), Some(0));
+        assert!(desk.state.pending_find_query.is_none());
     }
 }

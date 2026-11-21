@@ -739,6 +739,7 @@ impl Root {
         if execute {
             self.desk.replace_draft(insert.trim().to_string());
             self.desk.submit();
+            self.take_composer_follow();
             return;
         }
         self.desk.replace_draft(insert.to_string());

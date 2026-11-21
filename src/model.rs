@@ -2649,6 +2649,7 @@ pub struct AppState {
     pub remote_search_hits: Vec<SearchHit>,
     pub transcript_find: TranscriptFind,
     pub pending_find_query: Option<String>,
+    pub pending_find_session: Option<String>,
 }
 
 impl AppState {
@@ -2860,6 +2861,7 @@ impl AppState {
                 if self.remove_session(stored_id) {
                     self.transcript_find.close();
                     self.pending_find_query = None;
+                    self.pending_find_session = None;
                     MutationOutcome::ArchivedSelected
                 } else {
                     MutationOutcome::ArchivedOther

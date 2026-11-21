@@ -484,6 +484,20 @@ impl Root {
             self.insert_text("\n");
         } else {
             self.desk.submit();
+            self.take_composer_follow();
+        }
+    }
+
+    fn take_composer_follow(&mut self) {
+        match self.desk.composer_follow.take() {
+            Some(crate::desk::ComposerFollow::Attach) => self.open_sheet(chrome::Sheet::Attach),
+            Some(crate::desk::ComposerFollow::Workspace(query)) => {
+                self.open_sheet(chrome::Sheet::Workspace);
+                if let Some(query) = query {
+                    self.sheet_text = query;
+                }
+            }
+            None => {}
         }
     }
 
@@ -1600,6 +1614,7 @@ fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpu
             true,
             cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
                 root.desk.submit();
+                root.take_composer_follow();
                 cx.notify();
             }),
         ))
