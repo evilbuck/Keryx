@@ -152,35 +152,64 @@ fn route(request: &str) -> (u16, &'static str, String, bool) {
     let Some(line) = request.lines().next() else {
         return (400, "Bad Request", json_error("bad request"), false);
     };
+    let (method, path, query) = request_target(line);
+    post_route(method, path)
+        .or_else(|| get_route(method, path, query))
+        .unwrap_or((404, "Not Found", json_error("not found"), false))
+}
+
+fn request_target(line: &str) -> (&str, &str, &str) {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    if method == "POST" && path == "/auth/password-login" {
-        return (200, "OK", "{}".into(), true);
+    (method, path, query)
+}
+
+fn post_route(method: &str, path: &str) -> Option<(u16, &'static str, String, bool)> {
+    if method != "POST" {
+        return None;
     }
-    if method == "POST" && path == "/api/auth/ws-ticket" {
-        return (200, "OK", "{\"ticket\":\"preview\"}".into(), false);
+    match path {
+        "/auth/password-login" => Some((200, "OK", "{}".into(), true)),
+        "/api/auth/ws-ticket" => Some((200, "OK", "{\"ticket\":\"preview\"}".into(), false)),
+        _ => None,
     }
-    if method == "GET" && path == "/api/sessions" {
-        return (
+}
+
+fn get_route(method: &str, path: &str, query: &str) -> Option<(u16, &'static str, String, bool)> {
+    if method != "GET" {
+        return None;
+    }
+    catalog_route(path, query).or_else(|| session_route(path, query))
+}
+
+fn catalog_route(path: &str, query: &str) -> Option<(u16, &'static str, String, bool)> {
+    let body = match path {
+        "/api/chat/workspaces" => workspaces_body(),
+        "/api/skills" => skills_body(),
+        "/api/sessions/search" => search_body(query),
+        _ => return None,
+    };
+    Some((200, "OK", body, false))
+}
+
+fn session_route(path: &str, query: &str) -> Option<(u16, &'static str, String, bool)> {
+    if path == "/api/sessions" {
+        return Some((
             200,
             "OK",
             sessions_body(query_usize(query, "offset")),
             false,
-        );
+        ));
     }
-    if method == "GET"
-        && let Some(id) = message_id(path)
-    {
-        let body = messages_body(
-            &id,
-            query_usize(query, "offset"),
-            query_usize(query, "limit"),
-        );
-        return (200, "OK", body, false);
-    }
-    (404, "Not Found", json_error("not found"), false)
+    let id = message_id(path)?;
+    let body = messages_body(
+        &id,
+        query_usize(query, "offset"),
+        query_usize(query, "limit"),
+    );
+    Some((200, "OK", body, false))
 }
 
 fn message_id(path: &str) -> Option<String> {
@@ -219,6 +248,55 @@ fn response(status: u16, reason: &str, body: &str, cookie: bool) -> String {
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{cookie_line}\r\n{body}",
         body.len()
     )
+}
+
+fn workspaces_body() -> String {
+    json!({
+        "default_cwd": "/home/alice/.hermes",
+        "home": "/home/alice",
+        "repos": [
+            {"root": "/home/alice/projects/hermes-native", "label": "hermes-native", "sessions": 4}
+        ]
+    })
+    .to_string()
+}
+
+fn skills_body() -> String {
+    json!([
+        {"name": "b-plan", "description": "Plan the next change", "category": "workflow", "enabled": true, "usage": 3}
+    ])
+    .to_string()
+}
+
+fn search_body(query: &str) -> String {
+    let q = query_text(query, "q");
+    json!({
+        "results": [{
+            "id": "notes",
+            "title": "Design notes",
+            "source": "cli",
+            "model": "demo",
+            "role": "assistant",
+            "snippet": format!(">>>{}<<< in the notes", q),
+            "last_active": 1776000100.0,
+            "message_count": 3,
+            "pinned": false,
+            "archived": false
+        }]
+    })
+    .to_string()
+}
+
+fn query_text(query: &str, key: &str) -> String {
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name == key {
+            return value.replace('+', " ");
+        }
+    }
+    String::new()
 }
 
 fn sessions_body(offset: usize) -> String {

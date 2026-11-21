@@ -19,6 +19,8 @@ use crate::markdown::render_markdown;
 use crate::model::{ChatMessage, Config, ConnectionState, InteractionKind, ModelState, Role};
 use crate::present::{self, QuestionDraft, Tone};
 
+mod chrome;
+
 actions!(hermes, [NewConversation]);
 
 pub struct Launch {
@@ -78,6 +80,9 @@ fn watch_close(window: &mut Window, root: &gpui::Entity<Root>, cx: &mut App) {
 enum Focus {
     Composer,
     Search,
+    Find,
+    Sheet,
+    Session,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,6 +90,11 @@ enum PreviewStep {
     Sidebar,
     Transcript,
     Reply,
+    Quote,
+    Slash,
+    Palette,
+    Deck,
+    Find,
     Picker,
     Approval,
     Readonly,
@@ -127,6 +137,17 @@ pub struct Root {
     composer_focus: FocusHandle,
     search_focus: FocusHandle,
     clarify_focus: FocusHandle,
+    session_focus: FocusHandle,
+    find_focus: FocusHandle,
+    sheet_focus: FocusHandle,
+    side_focus: FocusHandle,
+    sheet: chrome::Sheet,
+    sheet_text: String,
+    sheet_index: usize,
+    slash_index: usize,
+    slash_hidden: bool,
+    side_text: String,
+    jump_to: Option<usize>,
     answer_qid: Option<String>,
     transcript: ScrollHandle,
     cursor: usize,
@@ -151,6 +172,17 @@ impl Root {
             composer_focus: cx.focus_handle(),
             search_focus: cx.focus_handle(),
             clarify_focus: cx.focus_handle(),
+            session_focus: cx.focus_handle(),
+            find_focus: cx.focus_handle(),
+            sheet_focus: cx.focus_handle(),
+            side_focus: cx.focus_handle(),
+            sheet: chrome::Sheet::None,
+            sheet_text: String::new(),
+            sheet_index: 0,
+            slash_index: 0,
+            slash_hidden: false,
+            side_text: String::new(),
+            jump_to: None,
             answer_qid: None,
             transcript: ScrollHandle::new(),
             cursor: 0,
@@ -216,6 +248,9 @@ impl Root {
         match target {
             Focus::Composer => self.composer_focus.focus(window),
             Focus::Search => self.search_focus.focus(window),
+            Focus::Find => self.find_focus.focus(window),
+            Focus::Sheet => self.sheet_focus.focus(window),
+            Focus::Session => self.session_focus.focus(window),
         }
     }
 
@@ -235,10 +270,42 @@ impl Root {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key == "escape" && self.escape() {
+        if self.global_chord(event) || self.surface_key(event, window, cx) {
             cx.notify();
             return;
         }
+        self.focus_key(event, window, cx);
+    }
+
+    fn surface_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.keystroke.key == "escape" && self.escape() {
+            return true;
+        }
+        if self.sheet != chrome::Sheet::None {
+            return self.on_sheet_key(event, cx);
+        }
+        self.focused_field(event, window)
+    }
+
+    fn focused_field(&mut self, event: &KeyDownEvent, window: &Window) -> bool {
+        if self.find_focus.is_focused(window) {
+            return self.on_find_key(event);
+        }
+        if self.session_focus.is_focused(window) {
+            return self.on_session_key(event);
+        }
+        if self.side_focus.is_focused(window) {
+            return self.on_side_key(event);
+        }
+        false
+    }
+
+    fn focus_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_focus.is_focused(window) {
             self.on_search_key(event, cx);
         } else if self.clarify_focus.is_focused(window) {
@@ -249,6 +316,14 @@ impl Root {
     }
 
     fn escape(&mut self) -> bool {
+        if self.sheet != chrome::Sheet::None {
+            self.sheet = chrome::Sheet::None;
+            return true;
+        }
+        if self.desk.state.transcript_find.open {
+            self.desk.close_find();
+            return true;
+        }
         if self.desk.confirm.is_some() {
             self.desk.answer_confirm(false);
             return true;
@@ -355,6 +430,12 @@ impl Root {
         mods: &gpui::Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.slash_key(key, mods) {
+            return true;
+        }
+        if self.try_recall(key, mods) {
+            return true;
+        }
         if self.move_caret(key, mods.shift) {
             return true;
         }
@@ -413,6 +494,8 @@ impl Root {
         let draft = self.desk.draft();
         let (start, end) = selection_of(&draft, self.anchor, self.cursor);
         self.replace(&draft, start, end, extra);
+        self.slash_hidden = false;
+        self.slash_index = 0;
     }
 
     fn backspace(&mut self) {
@@ -528,7 +611,7 @@ fn header(
         .items_center()
         .justify_between()
         .px(px(16.))
-        .h(px(52.))
+        .min_h(px(56.))
         .bg(rgb(0x1e1e24))
         .border_b_1()
         .border_color(rgb(0x34343c))
@@ -536,8 +619,22 @@ fn header(
         .child(connection_label(connection, controls.reconnect, cx))
 }
 
+fn lineage_caption(desk: &Desk) -> gpui::Div {
+    let text = desk
+        .state
+        .selected
+        .as_deref()
+        .and_then(|id| desk.state.parent_for(id))
+        .map(|(_, title)| format!("Branched from {title}"))
+        .unwrap_or_default();
+    div()
+        .text_size(px(11.))
+        .text_color(rgb(0x9a9aa3))
+        .child(text)
+}
+
 fn header_start(
-    _root: &mut Root,
+    root: &mut Root,
     controls: &present::Controls,
     cx: &mut Context<Root>,
 ) -> gpui::Div {
@@ -557,10 +654,17 @@ fn header_start(
         ))
         .child(
             div()
-                .text_size(px(16.))
-                .font_weight(FontWeight(700.))
-                .child(controls.title.clone()),
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight(700.))
+                        .child(controls.title.clone()),
+                )
+                .child(lineage_caption(&root.desk)),
         )
+        .child(chrome::header_tools(root, cx))
 }
 
 fn connection_label(
@@ -608,6 +712,9 @@ fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -
             row.child(sidebar(root, controls, cx))
         })
         .child(main_column(root, controls, cx).flex_1().min_w(px(0.)))
+        .when(root.desk.state.inspector_open, |row| {
+            row.child(chrome::inspector(root, cx))
+        })
 }
 
 fn sidebar(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
@@ -629,6 +736,8 @@ fn sidebar(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>
             true,
             cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| root.on_new(window, cx)),
         ))
+        .child(chrome::filter_row(root, cx))
+        .child(chrome::session_search(root, cx))
         .child(session_scroll(root, cx).flex_1())
         .when(controls.more_visible, |column| {
             column.child(text_button(
@@ -673,8 +782,9 @@ fn session_scroll(root: &mut Root, cx: &mut Context<Root>) -> gpui::Stateful<gpu
 
 fn session_list(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let selected = root.desk.state.selected.clone();
+    let sessions = visible_session_rows(&root.desk);
     let mut list = div().flex().flex_col().gap(px(6.));
-    for session in root.desk.state.sessions.clone() {
+    for session in sessions {
         let id = session.stored_id.clone();
         let active = selected.as_deref() == Some(id.as_str());
         let read_only = session_read_only(&root.desk, &id);
@@ -689,7 +799,52 @@ fn session_list(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
             }),
         ));
     }
+    for hit in root.desk.state.remote_only_sidebar_hits() {
+        list = list.child(hit_row(hit, &root.desk.state.session_query, cx));
+    }
     list
+}
+
+fn visible_session_rows(desk: &Desk) -> Vec<crate::model::SessionSummary> {
+    desk.state
+        .visible_sessions()
+        .into_iter()
+        .filter_map(|index| desk.state.sessions.get(index).cloned())
+        .collect()
+}
+
+fn hit_row(
+    hit: &crate::model::SearchHit,
+    query: &str,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    let id = hit.stored_id.clone();
+    let find = query.to_string();
+    div()
+        .id(gpui::SharedString::new(format!("hit-{id}")))
+        .p(px(12.))
+        .rounded(px(10.))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |root, _: &gpui::MouseDownEvent, window, cx| {
+                root.desk
+                    .run_palette(crate::model::PaletteAction::OpenSearchHit {
+                        stored_id: id.clone(),
+                        query: find.clone(),
+                    });
+                root.pending_focus = Some(Focus::Find);
+                root.composer_focus.focus(window);
+                cx.notify();
+            }),
+        )
+        .child(hit.title.clone())
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(0x9a9aa3))
+                .child(hit.snippet_plain.clone()),
+        )
 }
 
 fn session_read_only(desk: &Desk, id: &str) -> bool {
@@ -734,7 +889,7 @@ fn session_row(
             div()
                 .text_size(px(11.))
                 .text_color(rgb(0x9a9aa3))
-                .child(present::session_meta(&session.source, read_only)),
+                .child(chrome::session_caption(session, read_only)),
         );
     if active {
         row = row.bg(rgb(0x2a3348));
@@ -751,6 +906,9 @@ fn main_column(root: &mut Root, controls: &present::Controls, cx: &mut Context<R
         .bg(rgb(0x16161a))
         .child(notice(&root.desk.state.notice))
         .child(readonly_banner(controls))
+        .when(root.desk.state.transcript_find.open, |column| {
+            column.child(chrome::find_bar(root, cx))
+        })
         .child(history_bar(controls, cx))
         .child(transcript(root, controls, cx).flex_1())
         .child(footer(root, controls, cx))
@@ -889,24 +1047,37 @@ fn message_column(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
         .w_full()
         .max_w(px(860.))
         .mx_auto();
-    for message in messages {
-        column = column.child(message_card(&message, cx));
+    let active = root
+        .jump_to
+        .or_else(|| root.desk.state.transcript_find.active_message_index());
+    for (index, message) in messages.into_iter().enumerate() {
+        column = column.child(message_card(&message, index, active == Some(index), cx));
     }
     column
 }
 
-fn message_card(message: &ChatMessage, cx: &mut Context<Root>) -> gpui::Div {
+fn message_card(
+    message: &ChatMessage,
+    index: usize,
+    active: bool,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
     let text = message.text.clone();
     let id = message.id.clone();
-    div()
+    let role = message.role.clone();
+    let mut card = div()
         .flex()
         .flex_col()
         .gap(px(8.))
         .p(px(14.))
         .rounded(px(12.))
         .bg(message_bg(&message.role))
-        .child(message_heading(&message.role, id, text, cx))
-        .child(message_body(message))
+        .child(message_heading(role, index, id, text, cx))
+        .child(message_body(message));
+    if active {
+        card = card.border_1().border_color(rgb(0x3d7eff));
+    }
+    card
 }
 
 fn message_bg(role: &Role) -> gpui::Rgba {
@@ -918,7 +1089,14 @@ fn message_bg(role: &Role) -> gpui::Rgba {
     }
 }
 
-fn message_heading(role: &Role, id: String, text: String, cx: &mut Context<Root>) -> gpui::Div {
+fn message_heading(
+    role: Role,
+    index: usize,
+    id: String,
+    text: String,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
+    let quotable = matches!(role, Role::User | Role::Assistant);
     div()
         .flex()
         .justify_between()
@@ -927,9 +1105,46 @@ fn message_heading(role: &Role, id: String, text: String, cx: &mut Context<Root>
             div()
                 .text_size(px(11.))
                 .font_weight(FontWeight(800.))
-                .text_color(role_color(role))
-                .child(present::role_label(role)),
+                .text_color(role_color(&role))
+                .child(present::role_label(&role)),
         )
+        .child(message_actions(quotable, index, id, text, cx))
+}
+
+fn message_actions(
+    quotable: bool,
+    index: usize,
+    id: String,
+    text: String,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .gap(px(6.))
+        .when(quotable, |row| {
+            row.child(text_button(
+                format!("quote-{index}"),
+                "Quote",
+                true,
+                false,
+                cx.listener(move |root, _: &gpui::MouseDownEvent, window, cx| {
+                    if root.desk.quote_into_draft(index) {
+                        root.composer_focus.focus(window);
+                    }
+                    cx.notify();
+                }),
+            ))
+            .child(text_button(
+                format!("branch-{index}"),
+                "Branch",
+                true,
+                false,
+                cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
+                    root.desk.branch_from(Some(index), None);
+                    cx.notify();
+                }),
+            ))
+        })
         .child(text_button(
             format!("copy-{id}"),
             "Copy",
@@ -973,6 +1188,10 @@ fn footer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>)
         .max_w(px(900.))
         .mx_auto()
         .child(interaction(root, cx))
+        .when(chrome::slash_open(root), |column| {
+            column.child(chrome::slash_row(root, cx))
+        })
+        .child(chrome::attachment_row(root, cx))
         .child(activity_row(controls, root.spin))
         .child(composer(root, controls, cx))
 }
@@ -1227,7 +1446,26 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
         .border_color(rgb(0x3a3a42))
         .bg(rgb(0x1c1c22))
         .child(composer_input(root, controls, cx))
-        .child(model_trigger(root, controls, cx))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(model_trigger(root, controls, cx))
+                .child(chrome::workspace_button(root, cx))
+                .child(rewind_button(
+                    "undo-turn",
+                    "Undo",
+                    crate::model::RewindMode::Undo,
+                    cx,
+                ))
+                .child(rewind_button(
+                    "regen-turn",
+                    "Regenerate",
+                    crate::model::RewindMode::Regenerate,
+                    cx,
+                )),
+        )
         .child(composer_actions(controls, cx))
 }
 
@@ -1367,8 +1605,40 @@ fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpu
         ))
 }
 
+fn rewind_button(
+    id: &'static str,
+    label: &'static str,
+    mode: crate::model::RewindMode,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    text_button(
+        id,
+        label,
+        true,
+        false,
+        cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
+            root.desk.rewind(mode);
+            cx.notify();
+        }),
+    )
+}
+
 fn overlay(root: &mut Root, cx: &mut Context<Root>) -> Vec<gpui::AnyElement> {
     let mut layers = Vec::new();
+    match root.sheet {
+        chrome::Sheet::Palette => layers.push(chrome::palette(root, cx).into_any_element()),
+        chrome::Sheet::Rename => layers.push(
+            chrome::text_sheet(root, "Rename conversation", "New title", cx).into_any_element(),
+        ),
+        chrome::Sheet::Attach => layers.push(
+            chrome::text_sheet(root, "Attach a file", "Path to an image or text file", cx)
+                .into_any_element(),
+        ),
+        chrome::Sheet::Workspace => {
+            layers.push(chrome::workspace_sheet(root, cx).into_any_element())
+        }
+        chrome::Sheet::None => {}
+    }
     if root.desk.picker_open {
         layers.push(picker(root, cx).into_any_element());
     }
@@ -1727,15 +1997,31 @@ impl Root {
         if self.preview_holding() || self.preview_finished() {
             return false;
         }
-        match self.preview.as_ref().map(|preview| preview.step) {
+        let step = self.preview.as_ref().map(|preview| preview.step);
+        self.preview_early(step) || self.preview_late(step)
+    }
+
+    fn preview_early(&mut self, step: Option<PreviewStep>) -> bool {
+        match step {
             Some(PreviewStep::Sidebar) => self.step_sidebar(),
             Some(PreviewStep::Transcript) => self.step_transcript(),
             Some(PreviewStep::Reply) => self.step_reply(),
+            Some(PreviewStep::Quote) => self.step_quote(),
+            Some(PreviewStep::Slash) => self.step_slash(),
+            Some(PreviewStep::Palette) => self.step_palette(),
+            _ => false,
+        }
+    }
+
+    fn preview_late(&mut self, step: Option<PreviewStep>) -> bool {
+        match step {
+            Some(PreviewStep::Deck) => self.step_deck(),
+            Some(PreviewStep::Find) => self.step_find(),
             Some(PreviewStep::Picker) => self.step_picker(),
             Some(PreviewStep::Approval) => self.step_approval(),
             Some(PreviewStep::Readonly) => self.step_readonly(),
             Some(PreviewStep::Done) => self.step_done(),
-            None => false,
+            _ => false,
         }
     }
 
@@ -1781,7 +2067,7 @@ impl Root {
 
     fn step_reply(&mut self) -> bool {
         if self.phase_done("reply") {
-            self.begin_step(PreviewStep::Picker);
+            self.begin_step(PreviewStep::Quote);
             return true;
         }
         if !self.preview_flag(|preview| preview.asked_create) {
@@ -1800,6 +2086,81 @@ impl Root {
             return true;
         }
         self.fail_late()
+    }
+
+    fn step_quote(&mut self) -> bool {
+        if self.phase_done("quote") {
+            self.begin_step(PreviewStep::Slash);
+            return true;
+        }
+        if self.phase_published("quote") {
+            return false;
+        }
+        if self.desk.messages().len() < 2 {
+            return self.fail_late();
+        }
+        let _ = self.desk.quote_into_draft(1);
+        self.publish("quote");
+        true
+    }
+
+    fn step_slash(&mut self) -> bool {
+        if self.phase_done("slash") {
+            self.desk.replace_draft(String::new());
+            self.begin_step(PreviewStep::Palette);
+            return true;
+        }
+        if self.phase_published("slash") {
+            return false;
+        }
+        self.desk.replace_draft("/b".into());
+        self.slash_hidden = false;
+        self.publish("slash");
+        true
+    }
+
+    fn step_palette(&mut self) -> bool {
+        if self.phase_done("palette") {
+            self.sheet = chrome::Sheet::None;
+            self.begin_step(PreviewStep::Deck);
+            return true;
+        }
+        self.sheet = chrome::Sheet::Palette;
+        self.pending_focus = Some(Focus::Sheet);
+        self.publish("palette");
+        true
+    }
+
+    fn step_deck(&mut self) -> bool {
+        if self.phase_done("deck") {
+            self.desk.state.inspector_open = false;
+            self.begin_step(PreviewStep::Find);
+            return true;
+        }
+        self.desk.open_inspector(crate::model::InspectorTab::Trace);
+        self.publish("deck");
+        true
+    }
+
+    fn step_find(&mut self) -> bool {
+        if self.phase_done("find") {
+            self.desk.close_find();
+            self.begin_step(PreviewStep::Picker);
+            return true;
+        }
+        if self.phase_published("find") {
+            return false;
+        }
+        self.desk.open_find(Some("markdown"));
+        self.pending_focus = Some(Focus::Find);
+        self.publish("find");
+        true
+    }
+
+    fn phase_published(&self, phase: &str) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| preview.published.as_deref() == Some(phase))
     }
 
     fn step_picker(&mut self) -> bool {

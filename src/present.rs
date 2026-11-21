@@ -98,10 +98,10 @@ pub fn controls(state: &AppState, pending: &HashSet<String>, configured: bool) -
     let reload = reloading(state, pending);
     let write = writable(connected, conversation);
     Controls {
-        send: send_enabled(write, reload, conversation),
+        send: send_enabled(write, reload, conversation) || launch_send(state, connected),
         stop_visible: conversation.is_some_and(|chat| chat.status.busy()),
         stop_enabled: stop_enabled(connected, conversation),
-        editable: conversation.is_some_and(|chat| chat.read_only_reason.is_none()),
+        editable: chat_editable(conversation) || launch_ready(state, connected),
         new_chat: connected && !state.creating,
         more_visible: state.list_has_more,
         more_enabled: connected && !state.list_loading,
@@ -142,11 +142,52 @@ fn ready_to_write(conversation: &Conversation) -> bool {
 }
 
 fn send_enabled(write: bool, reload: bool, conversation: Option<&Conversation>) -> bool {
-    write && !reload && conversation.is_some_and(has_draft)
+    write && !reload && conversation.is_some_and(can_send)
 }
 
-fn has_draft(conversation: &Conversation) -> bool {
-    conversation.status != TurnStatus::Stopping && !conversation.draft.trim().is_empty()
+fn can_send(conversation: &Conversation) -> bool {
+    conversation.status != TurnStatus::Stopping
+        && !conversation.rewinding
+        && (!conversation.draft.trim().is_empty() || !conversation.attachments.is_empty())
+}
+
+fn chat_editable(conversation: Option<&Conversation>) -> bool {
+    conversation.is_some_and(|chat| chat.read_only_reason.is_none() && !chat.rewinding)
+}
+
+fn launch_ready(state: &AppState, connected: bool) -> bool {
+    connected && state.selected.is_none() && !state.creating && state.pending_launch.is_none()
+}
+
+fn launch_send(state: &AppState, connected: bool) -> bool {
+    launch_ready(state, connected) && launch_has_input(state)
+}
+
+fn launch_has_input(state: &AppState) -> bool {
+    !state.launch_draft.trim().is_empty() || !state.launch_attachments.is_empty()
+}
+
+/// Markdown block quote, capped so a huge reply stays editable.
+pub fn quote_markdown(text: &str) -> String {
+    const MAX_LINES: usize = 12;
+    let lines: Vec<&str> = text.trim().lines().collect();
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(MAX_LINES)
+        .map(|line| quote_line(line))
+        .collect();
+    if lines.len() > MAX_LINES {
+        out.push("> …".to_string());
+    }
+    out.join("\n")
+}
+
+fn quote_line(line: &str) -> String {
+    if line.is_empty() {
+        ">".to_string()
+    } else {
+        format!("> {line}")
+    }
 }
 
 fn stop_enabled(connected: bool, conversation: Option<&Conversation>) -> bool {
@@ -555,5 +596,17 @@ mod tests {
         let answers = collect_answers(&questions).expect("answers");
         assert_eq!(answers.get("a").map(Option::as_deref), Some(Some("kept")));
         assert_eq!(answers.get("b").map(Option::as_deref), Some(None));
+    }
+
+    #[test]
+    fn quote_markdown_prefixes_and_caps_lines() {
+        assert_eq!(quote_markdown("a\n\nb"), "> a\n>\n> b");
+        let long = (0..20)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let quoted = quote_markdown(&long);
+        assert!(quoted.ends_with("> …"));
+        assert_eq!(quoted.lines().count(), 13);
     }
 }
