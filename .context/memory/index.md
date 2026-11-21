@@ -1,11 +1,13 @@
 ---
 date: 2026-11-08
-updated: 2026-11-10
+updated: 2026-11-19
 subject: 2026-11-08.hermes-native-client
 status: active
 ---
 
 # Memory index
+
+- [command-autocomplete-contrast-2026-11-19.md](command-autocomplete-contrast-2026-11-19.md) — slash autocomplete tokens were near-black under the GTK theme; command tokens, badges, and descriptions now use readable foreground contrast.
 
 - [transcript-role-styling-2026-11-11.md](transcript-role-styling-2026-11-11.md) — per-role transcript styling (user/assistant/tool/system) with tool chips; complexity refactor of steering hotspots; ratchet baselines updated (coverage 43.2, 12 hotspots).
 - [model-picker-2026-11-10.md](model-picker-2026-11-10.md) — composer model picker; provider-less prime; empty-chat ACK is not proof after a grok-4.7 inference mismatch.
