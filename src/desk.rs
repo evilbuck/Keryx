@@ -249,6 +249,7 @@ impl Desk {
     }
 
     pub fn reconnect(&mut self) {
+        self.give_back_held();
         self.state.notice.clear();
         self.state.disconnect();
         self.pending_resumes.clear();
@@ -548,9 +549,10 @@ impl Desk {
     }
 
     fn restore_attachments(&mut self, id: &str, attachments: Vec<StagedImage>) {
-        if let Some(chat) = self.state.conversations.get_mut(id) {
-            chat.attachments = attachments;
-        }
+        let Some(chat) = self.state.conversations.get_mut(id) else {
+            return;
+        };
+        merge_attachments(&mut chat.attachments, attachments);
     }
 
     fn hold_files(&mut self, stored_id: &str, files: Vec<StagedImage>) {
@@ -850,6 +852,7 @@ impl Desk {
     fn on_connection(&mut self, connection: ConnectionState) {
         let connected = connection == ConnectionState::Connected;
         if !connected {
+            self.give_back_held();
             self.state.disconnect();
             self.state.catalog = Catalog::default();
             self.state.workspaces = WorkspaceCatalog::default();
@@ -1130,7 +1133,9 @@ impl Desk {
             self.state.cancel_pending_launch();
             self.select_created = false;
         }
-        if matches!(operation.as_str(), "submit" | "gateway") {
+        if operation == "connect" {
+            self.give_back_held();
+        } else if matches!(operation.as_str(), "submit" | "gateway") {
             self.give_back_if(session_id.as_deref());
         }
         self.state.creating = false;
@@ -1898,6 +1903,18 @@ fn is_timeline_event(event: &Event) -> bool {
     matches!(event, Event::Branched { .. } | Event::Undone { .. })
 }
 
+fn merge_attachments(current: &mut Vec<StagedImage>, held: Vec<StagedImage>) {
+    let present: Vec<u64> = current.iter().map(|file| file.id).collect();
+    let mut merged = Vec::new();
+    for file in held {
+        if !present.contains(&file.id) {
+            merged.push(file);
+        }
+    }
+    merged.extend(std::mem::take(current));
+    *current = merged;
+}
+
 fn held_matches(state: &AppState, held: &HeldFiles, session_id: Option<&str>) -> bool {
     let Some(session_id) = session_id else {
         return true;
@@ -2566,6 +2583,80 @@ mod tests {
         });
         assert!(desk.held_files.is_none());
         assert!(desk.state.conversations["chat"].attachments.is_empty());
+    }
+
+    fn hold_shot(desk: &mut Desk) {
+        desk.held_files = Some(HeldFiles {
+            stored_id: "chat".into(),
+            files: vec![staged_file()],
+        });
+    }
+
+    #[test]
+    fn disconnect_and_reconnect_return_held_files() {
+        let mut desk = Desk::offline("");
+        desk.select_created = true;
+        desk.apply(created(None));
+        hold_shot(&mut desk);
+        desk.apply(Event::Connection(ConnectionState::Disconnected(
+            "socket closed".into(),
+        )));
+        assert!(desk.held_files.is_none());
+        assert_eq!(desk.state.conversations["chat"].attachments.len(), 1);
+
+        hold_shot(&mut desk);
+        desk.state
+            .conversations
+            .get_mut("chat")
+            .unwrap()
+            .attachments
+            .clear();
+        desk.reconnect();
+        assert!(desk.held_files.is_none());
+        assert_eq!(desk.state.conversations["chat"].attachments.len(), 1);
+
+        hold_shot(&mut desk);
+        desk.state
+            .conversations
+            .get_mut("chat")
+            .unwrap()
+            .attachments
+            .clear();
+        desk.apply(Event::Error {
+            operation: "connect".into(),
+            session_id: None,
+            message: "not connected".into(),
+        });
+        assert_eq!(desk.state.conversations["chat"].attachments.len(), 1);
+    }
+
+    #[test]
+    fn failed_send_keeps_files_staged_during_the_upload() {
+        let mut desk = Desk::offline("");
+        desk.select_created = true;
+        desk.apply(created(None));
+        hold_shot(&mut desk);
+        desk.state
+            .conversations
+            .get_mut("chat")
+            .unwrap()
+            .attachments = vec![StagedImage {
+            id: 2,
+            filename: "notes.txt".into(),
+            mime_type: "text/plain".into(),
+            bytes: b"later".to_vec(),
+        }];
+        desk.apply(Event::Error {
+            operation: "submit".into(),
+            session_id: Some("rt".into()),
+            message: "upload failed".into(),
+        });
+        let names: Vec<_> = desk.state.conversations["chat"]
+            .attachments
+            .iter()
+            .map(|file| file.filename.as_str())
+            .collect();
+        assert_eq!(names, vec!["shot.png", "notes.txt"]);
     }
 
     #[test]
