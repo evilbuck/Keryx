@@ -2,7 +2,7 @@
 
 Everyday tasks for this client. Each guide is numbered steps, then **Eat** — the check that it worked.
 
-Dependencies are GTK 4.16+, libadwaita 1.6+, `pkg-config`, and a C toolchain. The crate was generated with `cargo init --bin --name hermes-native --vcs git .`; do not re-initialize it.
+Dependencies are a C toolchain with `g++`, `pkg-config`, Wayland/X11 development packages, a Vulkan driver at runtime, and GPUI 0.2.2. The crate was generated with `cargo init --bin --name hermes-native --vcs git .`; do not re-initialize it.
 
 ## Run
 

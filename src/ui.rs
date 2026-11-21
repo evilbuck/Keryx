@@ -1,2273 +1,1971 @@
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use std::time::Duration;
+//! GPUI window for Hermes Native.
+//!
+//! [`crate::desk::Desk`] owns the conversation. This module paints it and turns
+//! keystrokes and clicks into desk intents. Tokio stays on the `hermes-net`
+//! thread; a GPUI timer drains that thread's events onto the UI entity.
 
-use adw::prelude::*;
-use gtk::{gdk, gio, glib};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use crate::backend::{self, Backend};
-use crate::markdown;
-use crate::model::*;
+use gpui::{
+    App, Application, Bounds, ClipboardItem, Context, FocusHandle, FontWeight, KeyBinding,
+    KeyDownEvent, MouseButton, ScrollDelta, ScrollHandle, ScrollWheelEvent, TitlebarOptions,
+    Window, WindowBounds, WindowDecorations, WindowOptions, actions, div, prelude::*, px, rgb,
+    size,
+};
 
-struct Ui {
-    backend: Option<Backend>,
-    state: RefCell<AppState>,
-    pending_resumes: RefCell<HashSet<String>>,
-    window: adw::ApplicationWindow,
-    sessions: gio::ListStore,
-    selection: gtk::SingleSelection,
-    messages: gio::ListStore,
-    transcript: gtk::ScrolledWindow,
-    content: gtk::Stack,
-    title: gtk::Label,
-    connection: gtk::Label,
-    notice: gtk::Label,
-    activity: gtk::Label,
-    spinner: gtk::Spinner,
-    editor: gtk::TextView,
-    model_menu: gtk::MenuButton,
-    model_label: gtk::Label,
-    model_provider: gtk::Label,
-    model_current: Rc<RefCell<Option<ModelIdentity>>>,
-    model_popover: gtk::Popover,
-    model_search: gtk::SearchEntry,
-    model_results: gio::ListStore,
-    model_list: gtk::ListView,
-    model_selection: gtk::SingleSelection,
-    model_status: gtk::Label,
-    model_pending: RefCell<Option<PendingModel>>,
-    send: gtk::Button,
-    stop: gtk::Button,
-    new_chat: gtk::Button,
-    reconnect: gtk::Button,
-    more_sessions: gtk::Button,
-    older: gtk::Button,
-    latest: gtk::Button,
-    readonly: gtk::Label,
-    interaction: gtk::Box,
-    interaction_scroll: gtk::ScrolledWindow,
-    rendered_session: RefCell<Option<String>>,
-    rendered_revision: Cell<u64>,
-    rendered_interaction: RefCell<Option<(String, String)>>,
-    changing_draft: Cell<bool>,
-    follow_bottom: Cell<bool>,
-    select_created: Cell<bool>,
-    suppress_selection: Cell<bool>,
-    sequence: Cell<u64>,
+use crate::desk::Desk;
+use crate::markdown::render_markdown;
+use crate::model::{ChatMessage, Config, ConnectionState, InteractionKind, ModelState, Role};
+use crate::present::{self, QuestionDraft, Tone};
+
+actions!(hermes, [NewConversation]);
+
+pub struct Launch {
+    pub config: Result<Config, String>,
+    pub preview_dir: Option<PathBuf>,
 }
 
-/// A switch awaiting an explicit confirmation, kept so the retry repeats the same target.
-struct PendingModel {
-    stored_id: String,
-    runtime_id: String,
-    target: ModelIdentity,
-    prime: Option<ModelIdentity>,
+pub fn launch(options: Launch) {
+    let config = options.config;
+    let preview_dir = options.preview_dir;
+    Application::new().run(move |cx| open_window(config, preview_dir, cx));
 }
 
-/// The activity text a terminal completion collapses to. Non-terminal
-/// statuses mean the completion was not a confirmed end.
-fn completion_activity(status: &TurnStatus) -> String {
-    match status {
-        TurnStatus::Complete => String::new(),
-        TurnStatus::Interrupted => "Response stopped. Partial text may be incomplete.".into(),
-        TurnStatus::Failed => "The server reported a failed response.".into(),
-        TurnStatus::Idle
-        | TurnStatus::Submitting
-        | TurnStatus::Streaming
-        | TurnStatus::AwaitingInput
-        | TurnStatus::Stopping
-        | TurnStatus::Unknown => "Response ended without a confirmed completion.".into(),
-    }
-}
-
-/// The collapsed trigger caption. Never claims an unconfirmed pair.
-fn model_caption(model: &ModelState) -> String {
-    match model {
-        ModelState::Unknown => "Choose a model".into(),
-        ModelState::Confirmed(identity) => identity.model.clone(),
-        ModelState::Switching { target, .. } => format!("Switching to {}…", target.model),
-        ModelState::Queued { target, .. } => format!("{} · next turn", target.model),
-        ModelState::Unresolved(Some(identity)) => format!("{} · unconfirmed", identity.model),
-        ModelState::Unresolved(None) => "Model unconfirmed".into(),
-    }
-}
-
-fn provider_name(identity: &ModelIdentity, catalog: &Catalog) -> String {
-    catalog
-        .options
-        .iter()
-        .find(|option| &option.identity == identity)
-        .map_or_else(
-            || identity.provider.clone(),
-            |option| option.provider_name.clone(),
-        )
-}
-
-/// The provider line under the model. Empty while nothing is known.
-fn model_provider_line(model: &ModelState, catalog: &Catalog) -> String {
-    match model {
-        ModelState::Unknown => "server default".into(),
-        ModelState::Confirmed(identity) | ModelState::Unresolved(Some(identity)) => {
-            provider_name(identity, catalog)
-        }
-        ModelState::Switching { target, .. } | ModelState::Queued { target, .. } => {
-            provider_name(target, catalog)
-        }
-        ModelState::Unresolved(None) => "unconfirmed".into(),
-    }
-}
-
-fn model_tooltip(model: &ModelState, catalog: &Catalog) -> String {
-    match model {
-        ModelState::Unknown => "Choose the model for this conversation".into(),
-        ModelState::Confirmed(identity) => format!(
-            "{} · {}\nChanging this affects only this conversation.",
-            identity.model,
-            provider_name(identity, catalog)
-        ),
-        ModelState::Switching { target, .. } => format!("Switching to {} …", target.model),
-        ModelState::Queued { target, .. } => format!(
-            "{} · {}\nApplies from the next message; the running turn keeps its model.",
-            target.model,
-            provider_name(target, catalog)
-        ),
-        ModelState::Unresolved(Some(identity)) => format!(
-            "{} · {}\nThe last change was never confirmed. Pick again to be sure.",
-            identity.model,
-            provider_name(identity, catalog)
-        ),
-        ModelState::Unresolved(None) => {
-            "The last change was never confirmed. Pick again to be sure.".into()
-        }
-    }
-}
-
-/// Run `apply` against the conversation owning `runtime_id`, if tracked.
-fn with_conversation(
-    state: &mut AppState,
-    runtime_id: &str,
-    apply: impl FnOnce(&mut Conversation),
-) -> bool {
-    state
-        .conversation_for_runtime_mut(runtime_id)
-        .is_some_and(|c| {
-            apply(c);
-            true
+fn open_window(config: Result<Config, String>, preview_dir: Option<PathBuf>, cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("ctrl-n", NewConversation, None)]);
+    let bounds = Bounds::centered(None, size(px(1120.), px(800.)), cx);
+    if cx
+        .open_window(window_options(bounds), move |window, cx| {
+            let root = cx.new(|cx| Root::new(config, preview_dir, cx));
+            watch_close(window, &root, cx);
+            root
         })
+        .is_err()
+    {
+        eprintln!("Could not open the Hermes window.");
+        cx.quit();
+    }
+    cx.activate(true);
 }
 
-pub fn build(app: &adw::Application, config: Result<Config, String>) {
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Hermes Native")
-        .default_width(1120)
-        .default_height(800)
-        .width_request(640)
-        .height_request(480)
-        .build();
-    let header = adw::HeaderBar::new();
-    let title = gtk::Label::new(Some("Hermes Native"));
-    title.add_css_class("title");
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    header.set_title_widget(Some(&title));
-    let toggle_sidebar = icon_button("sidebar-show-symbolic", "Toggle conversations");
-    header.pack_start(&toggle_sidebar);
-    let connection = gtk::Label::new(Some("Connecting…"));
-    connection.add_css_class("connection-label");
-    let reconnect = icon_button(
-        "view-refresh-symbolic",
-        "Reconnect and reload server history",
-    );
-    header.pack_end(&reconnect);
-    header.pack_end(&connection);
-
-    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    sidebar.add_css_class("hermes-sidebar");
-    sidebar.set_width_request(220);
-    set_margins(&sidebar, 16);
-    let brand = gtk::Label::new(Some("HERMES"));
-    brand.add_css_class("hermes-brand");
-    brand.set_xalign(0.0);
-    let caption = gtk::Label::new(Some("REMOTE CONVERSATIONS"));
-    caption.add_css_class("hermes-caption");
-    caption.set_xalign(0.0);
-    sidebar.append(&brand);
-    sidebar.append(&caption);
-    let new_chat = text_icon_button("list-add-symbolic", "New conversation");
-    new_chat.set_tooltip_text(Some("Create a server-side conversation · Ctrl+N"));
-    new_chat.add_css_class("suggested-action");
-    sidebar.append(&new_chat);
-    let sessions = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let selection = gtk::SingleSelection::new(Some(sessions.clone()));
-    selection.set_autoselect(false);
-    selection.set_can_unselect(true);
-    let session_factory = gtk::SignalListItemFactory::new();
-    session_factory.connect_bind(|_, object| {
-        let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
-        let value = item
-            .item()
-            .and_downcast::<glib::BoxedAnyObject>()
-            .expect("session item");
-        let session = value.borrow::<SessionSummary>();
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 5);
-        row.add_css_class("session-row");
-        let title = gtk::Label::new(Some(if session.title.is_empty() {
-            "Untitled conversation"
-        } else {
-            &session.title
-        }));
-        title.set_xalign(0.0);
-        title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title.add_css_class("session-title");
-        row.append(&title);
-        let meta = gtk::Label::new(Some(&format!(
-            "{}{}",
-            session.source,
-            if session.read_only_reason.is_some() {
-                " · read-only"
-            } else {
-                ""
-            }
-        )));
-        meta.set_xalign(0.0);
-        meta.add_css_class("session-meta");
-        row.append(&meta);
-        let identity = match &session.read_only_reason {
-            Some(reason) => format!("Conversation ID: {}\n{}", session.stored_id, reason),
-            None => format!("Conversation ID: {}", session.stored_id),
-        };
-        row.set_tooltip_text(Some(&identity));
-        item.set_child(Some(&row));
-    });
-    let session_list = gtk::ListView::new(Some(selection.clone()), Some(session_factory));
-    // This property selects the row under the pointer. Leave it off so hover
-    // cannot resume a conversation; clicks and arrow keys still select.
-    session_list.set_single_click_activate(false);
-    session_list.add_css_class("navigation-sidebar");
-    let session_scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&session_list)
-        .build();
-    sidebar.append(&session_scroll);
-    let more_sessions = gtk::Button::with_label("Load more conversations");
-    more_sessions.add_css_class("flat");
-    more_sessions.set_visible(false);
-    sidebar.append(&more_sessions);
-
-    let main = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    main.set_hexpand(true);
-    main.add_css_class("hermes-transcript");
-    let notice = gtk::Label::new(None);
-    notice.set_wrap(true);
-    notice.set_selectable(true);
-    notice.set_xalign(0.0);
-    notice.add_css_class("readonly-notice");
-    set_margins(&notice, 12);
-    notice.set_visible(false);
-    main.append(&notice);
-    let readonly = gtk::Label::new(None);
-    readonly.set_wrap(true);
-    readonly.set_selectable(true);
-    readonly.set_xalign(0.0);
-    readonly.add_css_class("readonly-notice");
-    set_margins(&readonly, 12);
-    readonly.set_visible(false);
-    main.append(&readonly);
-    let history_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    history_bar.set_halign(gtk::Align::Center);
-    let older = gtk::Button::with_label("Load earlier messages");
-    older.add_css_class("flat");
-    let latest = gtk::Button::with_label("Reload history");
-    latest.set_tooltip_text(Some("Reload this conversation from the server"));
-    latest.add_css_class("flat");
-    history_bar.append(&older);
-    history_bar.append(&latest);
-    main.append(&history_bar);
-
-    let messages = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let message_factory = gtk::SignalListItemFactory::new();
-    message_factory.connect_bind(|_, object| {
-        let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
-        let value = item
-            .item()
-            .and_downcast::<glib::BoxedAnyObject>()
-            .expect("message item");
-        let message = value.borrow::<ChatMessage>();
-        let (speaker_label, row_class, speaker_class) = role_style(&message.role);
-        let row = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        row.add_css_class("message");
-        row.add_css_class(row_class);
-        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let speaker = gtk::Label::new(Some(speaker_label));
-        speaker.add_css_class("speaker");
-        speaker.add_css_class(speaker_class);
-        speaker.set_hexpand(true);
-        speaker.set_xalign(0.0);
-        heading.append(&speaker);
-        let copy = icon_button("edit-copy-symbolic", "Copy original message");
-        copy.add_css_class("flat");
-        copy.add_css_class("message-copy");
-        let source = value.clone();
-        copy.connect_clicked(move |button| {
-            button
-                .clipboard()
-                .set_text(&source.borrow::<ChatMessage>().text);
-        });
-        heading.append(&copy);
-        row.append(&heading);
-        row.append(&message_body(&message));
-        let column = adw::Clamp::builder()
-            .maximum_size(860)
-            .tightening_threshold(600)
-            .child(&row)
-            .build();
-        item.set_child(Some(&column));
-    });
-    let message_list = gtk::ListView::new(
-        Some(gtk::NoSelection::new(Some(messages.clone()))),
-        Some(message_factory),
-    );
-    message_list.set_margin_start(24);
-    message_list.set_margin_end(24);
-    message_list.set_margin_bottom(24);
-    message_list.set_valign(gtk::Align::Start);
-    let transcript = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&message_list)
-        .build();
-    let content = gtk::Stack::new();
-    content.set_vexpand(true);
-    content.add_named(&transcript, Some("messages"));
-    let empty = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    empty.set_valign(gtk::Align::Center);
-    empty.set_halign(gtk::Align::Center);
-    set_margins(&empty, 24);
-    let empty_icon = gtk::Image::from_icon_name("mail-send-symbolic");
-    empty_icon.set_pixel_size(40);
-    empty_icon.add_css_class("dim-label");
-    empty.append(&empty_icon);
-    let empty_title = gtk::Label::new(Some("A little space to think."));
-    empty_title.add_css_class("empty-title");
-    empty_title.set_wrap(true);
-    empty.append(&empty_title);
-    let empty_subtitle = gtk::Label::new(Some(
-        "Choose a conversation, or start something new.\nYour history stays on your Hermes server.",
-    ));
-    empty_subtitle.set_wrap(true);
-    empty_subtitle.set_justify(gtk::Justification::Center);
-    empty_subtitle.add_css_class("empty-subtitle");
-    empty.append(&empty_subtitle);
-    content.add_named(&empty, Some("empty"));
-    content.set_visible_child_name("empty");
-    main.append(&content);
-
-    let footer = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    set_margins(&footer, 20);
-    let interaction = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    interaction.add_css_class("interaction-panel");
-    let interaction_scroll = gtk::ScrolledWindow::builder()
-        .child(&interaction)
-        .max_content_height(280)
-        .propagate_natural_height(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .visible(false)
-        .build();
-    interaction_scroll.add_css_class("interaction-scroll");
-    footer.append(&interaction_scroll);
-    let activity_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let spinner = gtk::Spinner::new();
-    activity_row.append(&spinner);
-    let activity = gtk::Label::new(None);
-    activity.set_xalign(0.0);
-    activity.set_wrap(true);
-    activity.set_selectable(true);
-    activity.add_css_class("activity-label");
-    activity_row.append(&activity);
-    footer.append(&activity_row);
-    let composer = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    composer.add_css_class("hermes-composer");
-    let editor = gtk::TextView::builder()
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .accepts_tab(false)
-        .top_margin(5)
-        .bottom_margin(5)
-        .left_margin(5)
-        .right_margin(5)
-        .build();
-    editor.add_css_class("composer-input");
-    editor.update_property(&[gtk::accessible::Property::Label("Message")]);
-    let editor_scroll = gtk::ScrolledWindow::builder()
-        .min_content_height(60)
-        .max_content_height(160)
-        .propagate_natural_height(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&editor)
-        .build();
-    composer.append(&editor_scroll);
-    let model_menu = gtk::MenuButton::new();
-    model_menu.add_css_class("flat");
-    model_menu.add_css_class("model-trigger");
-    model_menu.update_property(&[gtk::accessible::Property::Label("Model")]);
-    let trigger = gtk::Box::new(gtk::Orientation::Vertical, 1);
-    let model_label = gtk::Label::new(Some("Choose a model"));
-    model_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    model_label.set_max_width_chars(38);
-    model_label.set_xalign(0.0);
-    model_label.add_css_class("model-caption");
-    trigger.append(&model_label);
-    let model_provider = gtk::Label::new(Some("server default"));
-    model_provider.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    model_provider.set_max_width_chars(38);
-    model_provider.set_xalign(0.0);
-    model_provider.add_css_class("model-provider");
-    trigger.append(&model_provider);
-    model_menu.set_child(Some(&trigger));
-
-    let model_popover = gtk::Popover::new();
-    model_popover.add_css_class("model-popover");
-    let panel = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    set_margins(&panel, 10);
-    panel.set_width_request(380);
-    let model_search = gtk::SearchEntry::new();
-    model_search.set_placeholder_text(Some("Search provider or model"));
-    model_search.update_property(&[gtk::accessible::Property::Label("Search models")]);
-    panel.append(&model_search);
-    let model_status = gtk::Label::new(Some("Loading models…"));
-    model_status.set_xalign(0.0);
-    model_status.set_wrap(true);
-    model_status.add_css_class("picker-status");
-    panel.append(&model_status);
-    let model_results = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let model_selection = gtk::SingleSelection::new(Some(model_results.clone()));
-    model_selection.set_autoselect(false);
-    model_selection.set_can_unselect(true);
-    let model_factory = gtk::SignalListItemFactory::new();
-    let current_model = Rc::new(RefCell::new(None::<ModelIdentity>));
-    let current_for_factory = Rc::clone(&current_model);
-    model_factory.connect_bind(move |_, object| {
-        bind_model_row(current_for_factory.as_ref(), object);
-    });
-    let model_list = gtk::ListView::new(Some(model_selection.clone()), Some(model_factory));
-    // Hover must never choose a model; only an explicit activation commits.
-    model_list.set_single_click_activate(false);
-    model_list.add_css_class("model-list");
-    let model_scroll = gtk::ScrolledWindow::builder()
-        .min_content_height(200)
-        .max_content_height(320)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&model_list)
-        .build();
-    panel.append(&model_scroll);
-    model_popover.set_child(Some(&panel));
-    model_menu.set_popover(Some(&model_popover));
-    let model_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    model_row.append(&model_menu);
-    composer.append(&model_row);
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let hint = gtk::Label::new(Some("Enter to send · Shift+Enter for a new line"));
-    hint.set_xalign(0.0);
-    hint.set_hexpand(true);
-    hint.add_css_class("composer-hint");
-    actions.append(&hint);
-    let stop = icon_button("media-playback-stop-symbolic", "Stop response");
-    actions.append(&stop);
-    let send = text_icon_button("mail-send-symbolic", "Send");
-    send.add_css_class("suggested-action");
-    actions.append(&send);
-    composer.append(&actions);
-    footer.append(&composer);
-    let footer_column = adw::Clamp::builder()
-        .maximum_size(900)
-        .tightening_threshold(640)
-        .child(&footer)
-        .build();
-    main.append(&footer_column);
-
-    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-    paned.set_start_child(Some(&sidebar));
-    paned.set_end_child(Some(&main));
-    paned.set_position(285);
-    paned.set_resize_start_child(false);
-    paned.set_shrink_start_child(false);
-    paned.set_shrink_end_child(false);
-    paned.set_wide_handle(true);
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&paned));
-    window.set_content(Some(&toolbar));
-    toggle_sidebar.connect_clicked(move |_| {
-        sidebar.set_visible(!sidebar.is_visible());
-    });
-
-    let (backend, initial_notice) = match config {
-        Ok(config) => (Some(backend::spawn(config)), String::new()),
-        Err(error) => (None, error),
-    };
-    let ui = Rc::new(Ui {
-        backend,
-        state: RefCell::new(AppState {
-            notice: initial_notice,
-            ..Default::default()
+fn window_options(bounds: Bounds<gpui::Pixels>) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Hermes Native".into()),
+            appears_transparent: false,
+            traffic_light_position: None,
         }),
-        pending_resumes: RefCell::new(HashSet::new()),
-        window,
-        sessions,
-        selection,
-        messages,
-        transcript,
-        content,
-        title,
-        connection,
-        notice,
-        activity,
-        spinner,
-        editor,
-        model_menu,
-        model_label,
-        model_provider,
-        model_current: current_model,
-        model_popover,
-        model_search,
-        model_results,
-        model_list,
-        model_selection,
-        model_status,
-        model_pending: RefCell::new(None),
-        send,
-        stop,
-        new_chat,
-        reconnect,
-        more_sessions,
-        older,
-        latest,
-        readonly,
-        interaction,
-        interaction_scroll,
-        rendered_session: RefCell::new(None),
-        rendered_revision: Cell::new(u64::MAX),
-        rendered_interaction: RefCell::new(None),
-        changing_draft: Cell::new(false),
-        follow_bottom: Cell::new(true),
-        select_created: Cell::new(false),
-        suppress_selection: Cell::new(false),
-        sequence: Cell::new(0),
+        window_min_size: Some(size(px(640.), px(480.))),
+        window_decorations: Some(WindowDecorations::Client),
+        app_id: Some("io.github.hermes_native.Client".into()),
+        focus: true,
+        show: true,
+        ..Default::default()
+    }
+}
+
+fn watch_close(window: &mut Window, root: &gpui::Entity<Root>, cx: &mut App) {
+    let root = root.clone();
+    window.on_window_should_close(cx, move |_window, cx| {
+        root.update(cx, |root, _cx| root.desk.shutdown());
+        true
     });
-    let pointer_row_click = Rc::new(Cell::new(false));
-    connect_actions(&ui, &session_list, &pointer_row_click);
-    ui.refresh();
-    ui.window.present();
-    let weak = Rc::downgrade(&ui);
-    // The window owns this strong reference until close. Callbacks otherwise use weak references.
-    let keep_alive = RefCell::new(Some(ui.clone()));
-    ui.window.connect_close_request(move |_| {
-        if let Some(ui) = keep_alive.borrow_mut().take()
-            && let Some(backend) = &ui.backend
-        {
-            let _ = backend.send(Command::Shutdown);
+}
+
+#[derive(Clone, Copy)]
+enum Focus {
+    Composer,
+    Search,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewStep {
+    Sidebar,
+    Transcript,
+    Reply,
+    Picker,
+    Approval,
+    Readonly,
+    Done,
+}
+
+struct Preview {
+    dir: PathBuf,
+    step: PreviewStep,
+    published: Option<String>,
+    since: Instant,
+    asked_create: bool,
+    sent_reply: bool,
+    sent_approval: bool,
+    picked_notes: bool,
+    picked_board: bool,
+}
+
+impl Preview {
+    fn new(dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("ack"), "");
+        let _ = std::fs::write(dir.join("phase"), "starting");
+        Self {
+            dir,
+            step: PreviewStep::Sidebar,
+            published: None,
+            since: Instant::now(),
+            asked_create: false,
+            sent_reply: false,
+            sent_approval: false,
+            picked_notes: false,
+            picked_board: false,
         }
-        glib::Propagation::Proceed
-    });
-    glib::timeout_add_local(Duration::from_millis(60), move || {
-        let Some(ui) = weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        if !ui.window.is_visible() {
-            return glib::ControlFlow::Break;
+    }
+}
+
+pub struct Root {
+    desk: Desk,
+    composer_focus: FocusHandle,
+    search_focus: FocusHandle,
+    clarify_focus: FocusHandle,
+    answer_qid: Option<String>,
+    transcript: ScrollHandle,
+    cursor: usize,
+    anchor: usize,
+    seen_generation: u64,
+    followed_revision: u64,
+    pending_focus: Option<Focus>,
+    polling: bool,
+    focused_once: bool,
+    spin: u8,
+    preview: Option<Preview>,
+}
+
+impl Root {
+    fn new(
+        config: Result<Config, String>,
+        preview_dir: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            desk: Desk::new(config),
+            composer_focus: cx.focus_handle(),
+            search_focus: cx.focus_handle(),
+            clarify_focus: cx.focus_handle(),
+            answer_qid: None,
+            transcript: ScrollHandle::new(),
+            cursor: 0,
+            anchor: 0,
+            seen_generation: 0,
+            followed_revision: u64::MAX,
+            pending_focus: None,
+            polling: false,
+            focused_once: false,
+            spin: 0,
+            preview: preview_dir.map(Preview::new),
         }
-        let mut changed = false;
-        if let Some(backend) = &ui.backend {
-            for _ in 0..512 {
-                let Some(event) = backend.try_recv() else {
-                    break;
-                };
-                ui.apply(event);
-                changed = true;
+    }
+
+    fn arm(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(40))
+                .await;
+            this.update(cx, |root, cx| root.tick(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        let changed = self.desk.poll();
+        let stepped = self.advance_preview();
+        self.spin = self.spin.wrapping_add(1);
+        if changed || stepped {
+            cx.notify();
+        }
+        self.arm(cx);
+    }
+
+    fn prepare(&mut self, window: &mut Window) {
+        self.sync_cursor();
+        self.claim_focus(window);
+        self.follow_transcript();
+    }
+
+    fn sync_cursor(&mut self) {
+        if self.seen_generation == self.desk.draft_generation {
+            return;
+        }
+        self.seen_generation = self.desk.draft_generation;
+        let len = self.desk.draft().len();
+        self.cursor = len;
+        self.anchor = len;
+    }
+
+    fn claim_focus(&mut self, window: &mut Window) {
+        if let Some(target) = self.pending_focus.take() {
+            self.focus_target(target, window);
+            return;
+        }
+        if !self.focused_once {
+            self.focused_once = true;
+            self.composer_focus.focus(window);
+        }
+    }
+
+    fn focus_target(&self, target: Focus, window: &mut Window) {
+        match target {
+            Focus::Composer => self.composer_focus.focus(window),
+            Focus::Search => self.search_focus.focus(window),
+        }
+    }
+
+    fn follow_transcript(&mut self) {
+        let revision = self.desk.selected_revision();
+        if self.desk.follow_bottom && revision != self.followed_revision {
+            self.transcript.scroll_to_bottom();
+            self.followed_revision = revision;
+        }
+    }
+
+    fn on_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.desk.create() {
+            self.composer_focus.focus(window);
+            cx.notify();
+        }
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.escape() {
+            cx.notify();
+            return;
+        }
+        if self.search_focus.is_focused(window) {
+            self.on_search_key(event, cx);
+        } else if self.clarify_focus.is_focused(window) {
+            self.on_answer_key(event, cx);
+        } else if self.composer_focus.is_focused(window) {
+            self.on_composer_key(event, cx);
+        }
+    }
+
+    fn escape(&mut self) -> bool {
+        if self.desk.confirm.is_some() {
+            self.desk.answer_confirm(false);
+            return true;
+        }
+        if self.desk.picker_open {
+            self.desk.close_picker();
+            self.pending_focus = Some(Focus::Composer);
+            return true;
+        }
+        false
+    }
+
+    fn on_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "enter" {
+            if self.desk.commit_picker() {
+                self.pending_focus = Some(Focus::Composer);
             }
+            cx.notify();
+            return;
         }
-        if changed {
-            ui.refresh();
+        if key == "up" || key == "down" {
+            self.desk.move_picker(if key == "up" { -1 } else { 1 });
+            cx.notify();
+            return;
         }
-        glib::ControlFlow::Continue
-    });
-}
-
-fn bind_model_row(current: &RefCell<Option<ModelIdentity>>, object: &glib::Object) {
-    let item = object.downcast_ref::<gtk::ListItem>().expect("list item");
-    let value = item
-        .item()
-        .and_downcast::<glib::BoxedAnyObject>()
-        .expect("model item");
-    let option = value.borrow::<ModelOption>();
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    row.add_css_class("model-row");
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 1);
-    text.set_hexpand(true);
-    let model = gtk::Label::new(Some(&option.identity.model));
-    model.set_xalign(0.0);
-    model.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    model.add_css_class("model-name");
-    text.append(&model);
-    let provider = gtk::Label::new(Some(&option.provider_name));
-    provider.set_xalign(0.0);
-    provider.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    provider.add_css_class("model-provider");
-    text.append(&provider);
-    row.append(&text);
-    if !option.selectable() {
-        let note = gtk::Label::new(Some("unavailable"));
-        note.add_css_class("model-provider");
-        row.append(&note);
+        if self.edit_search(
+            key,
+            event.keystroke.key_char.as_deref(),
+            &event.keystroke.modifiers,
+        ) {
+            cx.notify();
+        }
     }
-    if current
-        .borrow()
-        .as_ref()
-        .is_some_and(|shown| *shown == option.identity)
-    {
-        row.add_css_class("model-current");
-        row.append(&gtk::Image::from_icon_name("object-select-symbolic"));
+
+    fn edit_search(&mut self, key: &str, typed: Option<&str>, mods: &gpui::Modifiers) -> bool {
+        if mods.control || mods.alt || mods.platform {
+            return false;
+        }
+        if key == "backspace" {
+            let mut query = self.desk.picker_query.clone();
+            query.pop();
+            self.desk.set_picker_query(query);
+            return true;
+        }
+        if let Some(text) = typed {
+            let mut query = self.desk.picker_query.clone();
+            query.push_str(text);
+            self.desk.set_picker_query(query);
+            return true;
+        }
+        false
     }
-    item.set_child(Some(&row));
-}
 
-fn connect_model_picker(ui: &Rc<Ui>) {
-    let weak = Rc::downgrade(ui);
-    ui.model_search.connect_search_changed(move |_| {
-        weak.upgrade().inspect(|ui| ui.refresh_model_results());
-    });
-    let weak = Rc::downgrade(ui);
-    ui.model_search.connect_activate(move |_| {
-        weak.upgrade().inspect(|ui| ui.commit_model_selection());
-    });
-    let weak = Rc::downgrade(ui);
-    ui.model_search.connect_stop_search(move |_| {
-        weak.upgrade().inspect(|ui| {
-            ui.model_popover.popdown();
-            ui.editor.grab_focus();
-        });
-    });
-    let arrows = gtk::EventControllerKey::new();
-    let weak = Rc::downgrade(ui);
-    arrows.connect_key_pressed(move |_, key, _, _| model_arrow(weak.upgrade().as_ref(), key));
-    ui.model_search.add_controller(arrows);
-    let weak = Rc::downgrade(ui);
-    ui.model_menu
-        .connect_notify_local(Some("active"), move |menu, _| {
-            open_model_picker(weak.upgrade().as_ref(), menu.is_active());
-        });
-    let weak = Rc::downgrade(ui);
-    ui.model_results.connect_items_changed(move |_, _, _, _| {
-        weak.upgrade().inspect(|ui| select_first_model(ui));
-    });
-    let weak = Rc::downgrade(ui);
-    ui.model_list.connect_activate(move |_, _| {
-        weak.upgrade().inspect(|ui| ui.commit_model_selection());
-    });
-    let weak = Rc::downgrade(ui);
-    ui.model_popover.connect_show(move |_| {
-        weak.upgrade().inspect(|ui| {
-            ui.refresh_model_results();
-            ui.model_search.grab_focus();
-        });
-    });
-}
-
-fn model_arrow(ui: Option<&Rc<Ui>>, key: gdk::Key) -> glib::Propagation {
-    let step = match key {
-        gdk::Key::Down | gdk::Key::KP_Down => 1,
-        gdk::Key::Up | gdk::Key::KP_Up => -1,
-        _ => return glib::Propagation::Proceed,
-    };
-    let Some(ui) = ui else {
-        return glib::Propagation::Proceed;
-    };
-    move_model_highlight(ui, step);
-    glib::Propagation::Stop
-}
-
-fn move_model_highlight(ui: &Ui, step: i64) {
-    let count = i64::from(ui.model_selection.n_items());
-    if count == 0 {
-        return;
-    }
-    let current = ui.model_selection.selected();
-    let current = if current == gtk::INVALID_LIST_POSITION {
-        0
-    } else {
-        i64::from(current)
-    };
-    let next = (current + step).clamp(0, count - 1);
-    ui.model_selection.set_selected(next as u32);
-    ui.model_list
-        .scroll_to(next as u32, gtk::ListScrollFlags::NONE, None);
-}
-
-fn open_model_picker(ui: Option<&Rc<Ui>>, active: bool) {
-    if !active {
-        return;
-    }
-    let Some(ui) = ui else {
-        return;
-    };
-    ui.model_search.set_text("");
-    ui.refresh_model_results();
-    ui.model_search.grab_focus();
-}
-
-fn select_first_model(ui: &Ui) {
-    if ui.model_selection.n_items() > 0
-        && ui.model_selection.selected() == gtk::INVALID_LIST_POSITION
-    {
-        ui.model_selection.set_selected(0);
-    }
-}
-
-fn connect_actions(ui: &Rc<Ui>, session_list: &gtk::ListView, pointer_row_click: &Rc<Cell<bool>>) {
-    let respond = gio::SimpleAction::new(
-        "respond",
-        Some(glib::VariantTy::new("(ssv)").expect("static variant type")),
-    );
-    let weak = Rc::downgrade(ui);
-    respond.connect_activate(move |_, parameter| {
-        let Some(ui) = weak.upgrade() else {
+    fn on_answer_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(qid) = self.answer_qid.clone() else {
             return;
         };
-        let Some((runtime_id, request_id, body)) =
-            parameter.and_then(|p| p.get::<(String, String, glib::Variant)>())
+        let Some(next) = answer_edit(
+            &self.question_text(&qid),
+            event.keystroke.key.as_str(),
+            event.keystroke.key_char.as_deref(),
+            &event.keystroke.modifiers,
+        ) else {
+            return;
+        };
+        self.desk.set_question_text(&qid, next);
+        cx.notify();
+    }
+
+    fn question_text(&self, qid: &str) -> String {
+        self.desk
+            .questions
+            .iter()
+            .find(|question| question.qid == qid)
+            .map(|question| question.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn on_composer_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        if self.composer_command(key, mods, cx) {
+            cx.notify();
+            return;
+        }
+        if mods.control || mods.alt || mods.platform {
+            return;
+        }
+        if key == "enter" {
+            self.enter_key(mods.shift);
+            cx.notify();
+            return;
+        }
+        if let Some(text) = event.keystroke.key_char.as_deref() {
+            self.insert_text(text);
+            cx.notify();
+        }
+    }
+
+    fn composer_command(
+        &mut self,
+        key: &str,
+        mods: &gpui::Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.move_caret(key, mods.shift) {
+            return true;
+        }
+        if self.edit_key(key) {
+            return true;
+        }
+        self.chord(key, mods, cx)
+    }
+
+    fn move_caret(&mut self, key: &str, shift: bool) -> bool {
+        let draft = self.desk.draft();
+        let Some((anchor, cursor)) = caret_move(&draft, self.cursor, self.anchor, key, shift)
         else {
-            return;
+            return false;
         };
-        let Some(answer) = decode_interaction_answer(&body) else {
-            return;
-        };
-        let pending = {
-            let state = ui.state.borrow();
-            state.stored_for_runtime(&runtime_id).filter(|id| {
-                state
-                    .conversations
-                    .get(id)
-                    .is_some_and(|conversation| conversation.accepts_response(&request_id))
-            })
-        };
-        let Some(stored_id) = pending else {
-            return;
-        };
-        if ui.command(Command::Respond {
-            runtime_id,
-            request_id,
-            answer,
-        }) && let Some(conversation) = ui.state.borrow_mut().conversations.get_mut(&stored_id)
-        {
-            conversation.response_sent();
-        }
-        ui.refresh();
-    });
-    ui.window.add_action(&respond);
-    let weak = Rc::downgrade(ui);
-    let clicking = Rc::clone(pointer_row_click);
-    session_list.connect_activate(move |_, position| {
-        // GTK 4.24 claims the double-click release in the row gesture, so bubble never clears it.
-        clicking.set(false);
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if ui.suppress_selection.get() {
-            return;
-        }
-        // Enter and double-click. A single click selects without activating.
-        let Some(id) = ui.session_id_at(position) else {
-            return;
-        };
-        ui.select_created.set(false);
-        ui.select(&id, true);
-    });
-    watch_sidebar_clicks(session_list, pointer_row_click, ui);
-    let weak = Rc::downgrade(ui);
-    let clicking = Rc::clone(pointer_row_click);
-    ui.selection.connect_selected_notify(move |_| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        // Programmatic splices and set_selected must not be treated as a click.
-        if ui.suppress_selection.get() {
-            return;
-        }
-        ui.adopt_sidebar_selection(clicking.replace(false));
-    });
-    let weak = Rc::downgrade(ui);
-    ui.new_chat.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ui.create();
-        }
-    });
-    let weak = Rc::downgrade(ui);
-    ui.send.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ui.submit();
-        }
-    });
-    let weak = Rc::downgrade(ui);
-    ui.reconnect.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ui.state.borrow_mut().notice.clear();
-            ui.state.borrow_mut().disconnect();
-            ui.pending_resumes.borrow_mut().clear();
-            ui.command(Command::Reconnect);
-            ui.refresh();
-        }
-    });
-    let weak = Rc::downgrade(ui);
-    ui.stop.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let runtime = {
-            let state = ui.state.borrow();
-            state
-                .selected
-                .as_ref()
-                .and_then(|id| state.conversations.get(id))
-                .and_then(|c| c.runtime_id.clone())
-        };
-        if let Some(runtime_id) = runtime {
-            ui.command(Command::Interrupt { runtime_id });
-        }
-    });
-    let weak = Rc::downgrade(ui);
-    ui.more_sessions.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let offset = ui.state.borrow().sessions.len();
-        ui.state.borrow_mut().list_loading = true;
-        ui.command(Command::List { offset });
-        ui.refresh();
-    });
-    let weak = Rc::downgrade(ui);
-    ui.older.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let request = {
-            let mut state = ui.state.borrow_mut();
-            let selected = state.selected.clone();
-            selected.and_then(|id| {
-                state
-                    .conversations
-                    .get_mut(&id)
-                    .and_then(|c| c.begin_history_page().map(|before| (id, before)))
-            })
-        };
-        if let Some((stored_id, before)) = request {
-            ui.follow_bottom.set(false);
-            if !ui.command(Command::History {
-                stored_id: stored_id.clone(),
-                before,
-            }) && let Some(conversation) =
-                ui.state.borrow_mut().conversations.get_mut(&stored_id)
-            {
-                conversation.history_loading = false;
-            }
-            ui.refresh();
-        }
-    });
-    let weak = Rc::downgrade(ui);
-    ui.latest.connect_clicked(move |_| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        let id = ui.state.borrow().selected.clone();
-        if let Some(id) = id {
-            ui.resume(&id);
-        }
-    });
-    let weak = Rc::downgrade(ui);
-    ui.editor.buffer().connect_changed(move |buffer| {
-        let Some(ui) = weak.upgrade() else {
-            return;
-        };
-        if ui.changing_draft.get() {
-            return;
-        }
-        let text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), true)
-            .to_string();
-        let mut state = ui.state.borrow_mut();
-        if let Some(id) = state.selected.clone() {
-            state.conversations.entry(id).or_default().draft = text;
-        }
-        drop(state);
-        ui.refresh_controls();
-    });
-    let key = gtk::EventControllerKey::new();
-    let weak = Rc::downgrade(ui);
-    key.connect_key_pressed(move |_, key, _, modifiers| {
-        if (key == gdk::Key::Return || key == gdk::Key::KP_Enter)
-            && !modifiers.contains(gdk::ModifierType::SHIFT_MASK)
-        {
-            if let Some(ui) = weak.upgrade() {
-                ui.submit();
-            }
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    ui.editor.add_controller(key);
-    let shortcuts = gtk::EventControllerKey::new();
-    let weak = Rc::downgrade(ui);
-    shortcuts.connect_key_pressed(move |_, key, _, modifiers| {
-        if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
-            && (key == gdk::Key::n || key == gdk::Key::N)
-        {
-            if let Some(ui) = weak.upgrade() {
-                ui.create();
-            }
-            return glib::Propagation::Stop;
-        }
-        glib::Propagation::Proceed
-    });
-    ui.window.add_controller(shortcuts);
-    connect_model_picker(ui);
-    let adjustment = ui.transcript.vadjustment();
-    let weak = Rc::downgrade(ui);
-    adjustment.connect_value_changed(move |adjustment| {
-        if let Some(ui) = weak.upgrade() {
-            ui.follow_bottom
-                .set(adjustment.value() + adjustment.page_size() >= adjustment.upper() - 64.0);
-        }
-    });
-}
-
-impl Ui {
-    fn command(&self, command: Command) -> bool {
-        let result = self
-            .backend
-            .as_ref()
-            .ok_or_else(|| {
-                "Connection configuration is missing. Correct it and restart the application."
-                    .into()
-            })
-            .and_then(|backend| backend.send(command));
-        if let Err(error) = result {
-            self.state.borrow_mut().notice = error;
-            false
-        } else {
-            true
-        }
+        self.anchor = anchor;
+        self.cursor = cursor;
+        true
     }
 
-    fn create(&self) {
-        if !self.new_chat.is_sensitive() {
-            return;
-        }
-        self.select_created.set(true);
-        self.state.borrow_mut().creating = true;
-        if !self.command(Command::Create {
-            title: "New conversation".into(),
-        }) {
-            self.state.borrow_mut().creating = false;
-        }
-        self.refresh();
-    }
-
-    fn select(&self, id: &str, focus_editor: bool) {
-        self.state.borrow_mut().selected = Some(id.to_string());
-        self.state.borrow_mut().notice.clear();
-        self.follow_bottom.set(true);
-        let draft = self
-            .state
-            .borrow_mut()
-            .conversations
-            .entry(id.to_string())
-            .or_default()
-            .draft
-            .clone();
-        self.changing_draft.set(true);
-        self.editor.buffer().set_text(&draft);
-        self.changing_draft.set(false);
-        let needs_resume =
-            self.state.borrow().conversations.get(id).is_none_or(|c| {
-                !c.loaded || (c.runtime_id.is_none() && c.read_only_reason.is_none())
-            });
-        if needs_resume {
-            self.resume(id);
-        }
-        self.refresh();
-        self.sync_sidebar_selection();
-        if focus_editor {
-            self.editor.grab_focus();
-        }
-    }
-
-    fn resume(&self, id: &str) {
-        if !self.pending_resumes.borrow_mut().insert(id.to_string()) {
-            return;
-        }
-        self.follow_bottom.set(true);
-        if !self.command(Command::Resume {
-            stored_id: id.to_string(),
-        }) {
-            self.pending_resumes.borrow_mut().remove(id);
-        }
-        self.refresh();
-    }
-
-    fn submit(&self) {
-        let reload_pending = self
-            .state
-            .borrow()
-            .selected
-            .as_ref()
-            .is_some_and(|id| self.pending_resumes.borrow().contains(id));
-        if reload_pending || !self.send.is_sensitive() {
-            return;
-        }
-        let request = {
-            let state = self.state.borrow();
-            state.selected.as_ref().and_then(|id| {
-                state.conversations.get(id).and_then(|c| {
-                    c.runtime_id
-                        .as_ref()
-                        .map(|runtime| (id.clone(), runtime.clone(), c.draft.trim().to_string()))
-                })
-            })
-        };
-        let Some((id, runtime_id, text)) = request else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-        let busy = {
-            let state = self.state.borrow();
-            state
-                .conversations
-                .get(&id)
-                .is_some_and(|c| c.status.steerable())
-        };
-        if busy {
-            self.steer(id, runtime_id, text);
-            return;
-        }
-        if !self.command(Command::Submit {
-            runtime_id,
-            text: text.clone(),
-        }) {
-            self.refresh();
-            return;
-        }
-        self.sequence.set(self.sequence.get() + 1);
-        let mut state = self.state.borrow_mut();
-        if let Some(c) = state.conversations.get_mut(&id) {
-            c.record_message(ChatMessage {
-                id: format!("client-{}", self.sequence.get()),
-                role: Role::User,
-                text,
-            });
-            c.draft.clear();
-            c.status = TurnStatus::Submitting;
-            c.activity = "Sending…".into();
-        }
-        drop(state);
-        self.changing_draft.set(true);
-        self.editor.buffer().set_text("");
-        self.changing_draft.set(false);
-        self.follow_bottom.set(true);
-        self.refresh();
-    }
-
-    /// Busy-turn steer: optimistic row now, live turn untouched until the
-    /// gateway answers. Multiple steers stack, one row each.
-    fn steer(&self, id: String, runtime_id: String, text: String) {
-        if !self.command(Command::Steer {
-            runtime_id,
-            text: text.clone(),
-        }) {
-            self.refresh();
-            return;
-        }
-        self.sequence.set(self.sequence.get() + 1);
-        let mut state = self.state.borrow_mut();
-        if let Some(c) = state.conversations.get_mut(&id) {
-            c.record_message(ChatMessage {
-                id: format!("client-{}", self.sequence.get()),
-                role: Role::User,
-                text,
-            });
-            c.draft.clear();
-            c.activity = "Steering…".into();
-        }
-        drop(state);
-        self.changing_draft.set(true);
-        self.editor.buffer().set_text("");
-        self.changing_draft.set(false);
-        self.follow_bottom.set(true);
-        self.refresh();
-    }
-
-    /// Rebuild the result list from the cached catalog and current query. No network.
-    fn refresh_model_results(&self) {
-        let (options, status) = {
-            let state = self.state.borrow();
-            let catalog = &state.catalog;
-            let query = self.model_search.text().to_string();
-            let options: Vec<glib::BoxedAnyObject> = catalog
-                .search(&query)
-                .into_iter()
-                .filter_map(|index| catalog.options.get(index))
-                .cloned()
-                .map(glib::BoxedAnyObject::new)
-                .collect();
-            let status = if let Some(error) = &catalog.error {
-                error.clone()
-            } else if catalog.loading {
-                "Loading models…".into()
-            } else if catalog.is_empty() {
-                "No models are configured on this server.".into()
-            } else if options.is_empty() {
-                "No model matches that search.".into()
-            } else {
-                String::new()
-            };
-            (options, status)
-        };
-        self.model_results
-            .splice(0, self.model_results.n_items(), &options);
-        self.model_status.set_text(&status);
-        self.model_status.set_visible(!status.is_empty());
-    }
-
-    fn commit_model_selection(&self) {
-        let Some(selected) = self.model_selection.selected_item() else {
-            return;
-        };
-        let Some(value) = selected.downcast::<glib::BoxedAnyObject>().ok() else {
-            return;
-        };
-        let (identity, selectable) = {
-            let option = value.borrow::<ModelOption>();
-            (option.identity.clone(), option.selectable())
-        };
-        if !selectable {
-            self.model_status
-                .set_text("This catalog entry cannot be sent to the gateway.");
-            self.model_status.set_visible(true);
-            return;
-        }
-        self.model_popover.popdown();
-        self.editor.grab_focus();
-        self.choose_model(identity, false);
-    }
-
-    /// Ask the backend to switch the open conversation. `confirm` is only ever true after
-    /// the user accepted an explicit confirmation prompt.
-    fn choose_model(&self, target: ModelIdentity, confirm: bool) {
-        let request = {
-            let state = self.state.borrow();
-            let Some(stored) = state.selected.clone() else {
-                return;
-            };
-            let Some(conversation) = state.conversations.get(&stored) else {
-                return;
-            };
-            // An unresolved earlier attempt must be settled before another one starts.
-            if conversation.read_only_reason.is_some() || conversation.model.switching() {
-                return;
-            }
-            let Some(runtime) = conversation.runtime_id.clone() else {
-                return;
-            };
-            // A chat that never ran has no agent yet: the gateway's scoped switch would be
-            // acknowledged without taking effect, so the conversation's own pair primes it
-            // first. A chat that already ran is initialized.
-            let prime = if conversation.messages.is_empty() {
-                conversation.model.confirmed().cloned()
-            } else {
-                None
-            };
-            (stored, runtime, prime)
-        };
-        let (stored, runtime, prime) = request;
-        if !self.command(Command::SetModel {
-            runtime_id: runtime.clone(),
-            prime: prime.clone(),
-            target: target.clone(),
-            confirm_expensive: confirm,
-        }) {
-            return;
-        }
-        if let Some(conversation) = self.state.borrow_mut().conversations.get_mut(&stored) {
-            conversation.begin_model_switch(target.clone());
-        }
-        *self.model_pending.borrow_mut() = Some(PendingModel {
-            stored_id: stored,
-            runtime_id: runtime,
-            target,
-            prime,
-        });
-        self.refresh();
-        // Rebind the rows so the current-pair mark follows the request.
-        self.refresh_model_results();
-    }
-
-    /// The gateway wants an explicit confirmation. Nothing changed yet.
-    fn ask_model_confirmation(self: &Rc<Self>, runtime_id: &str, message: String) {
-        let pending = self
-            .model_pending
-            .borrow()
-            .as_ref()
-            .filter(|pending| pending.runtime_id == runtime_id)
-            .map(|pending| PendingModel {
-                stored_id: pending.stored_id.clone(),
-                runtime_id: pending.runtime_id.clone(),
-                target: pending.target.clone(),
-                prime: pending.prime.clone(),
-            });
-        let Some(pending) = pending else {
-            return;
-        };
-        let dialog = adw::AlertDialog::new(Some("Use this model?"), Some(&message));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("switch", "Switch");
-        dialog.set_response_appearance("switch", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        let weak = Rc::downgrade(self);
-        dialog.connect_response(None, move |dialog, response| {
-            if response != "switch" {
-                return;
-            }
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let _ = &pending.prime;
-            ui.choose_model(pending.target.clone(), true);
-            let _ = dialog;
-        });
-        dialog.present(Some(&self.window));
-    }
-
-    fn apply_model(self: &Rc<Self>, event: &Event) -> bool {
-        match event {
-            Event::Catalog { catalog } => {
-                self.state.borrow_mut().catalog = catalog.clone();
-                self.refresh_model_results();
-            }
-            Event::ModelAck {
-                runtime_id,
-                resolved,
-                deferred,
-            } => {
-                let primed = self.model_pending.borrow().as_ref().is_some_and(|pending| {
-                    pending.runtime_id == *runtime_id && pending.prime.is_some()
-                });
-                self.settle_model(runtime_id, |conversation| {
-                    conversation.model_acknowledged(resolved.clone(), *deferred, !primed);
-                });
-            }
-            Event::ModelRejected {
-                runtime_id,
-                message,
-            } => {
-                self.settle_model(runtime_id, |conversation| conversation.model_rejected());
-                self.state.borrow_mut().notice = message.clone();
-            }
-            Event::ModelConfirmation {
-                runtime_id,
-                message,
-                ..
-            } => {
-                self.settle_model(runtime_id, |conversation| conversation.model_rejected());
-                self.ask_model_confirmation(runtime_id, message.clone());
-            }
-            Event::ModelAmbiguous { runtime_id } => {
-                self.settle_model(runtime_id, |conversation| conversation.model_ambiguous());
-                self.state.borrow_mut().notice = "The model change was accepted for delivery but never answered. It stays unconfirmed and will not be retried.".into();
-            }
-            Event::ModelObserved { runtime_id, model } => {
-                let identity = self.state.borrow().catalog.identity_for_model(model);
-                if let Some(identity) = identity {
-                    self.settle_model(runtime_id, |conversation| {
-                        conversation.observe_model(identity)
-                    });
-                }
-            }
+    fn edit_key(&mut self, key: &str) -> bool {
+        match key {
+            "backspace" => self.backspace(),
+            "delete" => self.delete_forward(),
             _ => return false,
         }
         true
     }
 
-    fn settle_model(&self, runtime_id: &str, update: impl FnOnce(&mut Conversation)) {
-        *self.model_pending.borrow_mut() = None;
-        if let Some(conversation) = self
-            .state
-            .borrow_mut()
-            .conversation_for_runtime_mut(runtime_id)
-        {
-            update(conversation);
+    fn chord(&mut self, key: &str, mods: &gpui::Modifiers, cx: &mut Context<Self>) -> bool {
+        if !mods.control {
+            return false;
+        }
+        match key {
+            "a" => self.select_all(),
+            "c" => self.copy_selection(cx),
+            "x" => self.cut_selection(cx),
+            "v" => self.paste(cx),
+            _ => return false,
+        }
+        true
+    }
+
+    fn enter_key(&mut self, shift: bool) {
+        if shift {
+            self.insert_text("\n");
+        } else {
+            self.desk.submit();
         }
     }
 
-    fn note_created(
-        &self,
-        session: SessionSummary,
-        runtime_id: String,
-        model: Option<ModelIdentity>,
-    ) {
-        let id = session.stored_id.clone();
-        {
-            let mut state = self.state.borrow_mut();
-            state.sessions.insert(0, session);
-            state.conversations.insert(
-                id.clone(),
-                Conversation {
-                    runtime_id: Some(runtime_id),
-                    loaded: true,
-                    ..Default::default()
-                },
-            );
-            if let Some(model) = model
-                && let Some(conversation) = state.conversations.get_mut(&id)
-            {
-                conversation.confirm_model(model);
-            }
-            state.creating = false;
-        }
-        self.refresh_sessions();
-        if self.select_created.replace(false) {
-            self.select(&id, true);
-        }
-    }
-
-    fn apply(self: &Rc<Self>, event: Event) {
-        if self.apply_model(&event) {
+    fn insert_text(&mut self, extra: &str) {
+        if !self.desk.controls().editable {
             return;
         }
-        let mut state = self.state.borrow_mut();
-        match event {
-            Event::Connection(connection) => {
-                let connected = connection == ConnectionState::Connected;
-                if !connected {
-                    state.disconnect();
-                    // A catalog belongs to one connection; keep no stale rows across a reconnect.
-                    state.catalog = Catalog::default();
-                    self.pending_resumes.borrow_mut().clear();
-                }
-                state.connection = Some(connection);
-                state.creating = false;
-                state.list_loading = connected;
-                let selected = state.selected.clone();
-                drop(state);
-                if connected {
-                    self.command(Command::List { offset: 0 });
-                    if let Some(id) = selected {
-                        self.resume(&id);
-                    }
-                }
-            }
-            Event::Sessions {
-                sessions,
-                offset,
-                has_more,
-            } => {
-                if offset == 0 {
-                    state.sessions.clear();
-                }
-                for session in sessions {
-                    state.upsert_session(session);
-                }
-                state.list_has_more = has_more;
-                state.list_loading = false;
-                drop(state);
-                self.refresh_sessions();
-            }
-            Event::Created {
-                session,
-                runtime_id,
-                model,
-            } => {
-                drop(state);
-                self.note_created(session, runtime_id, model);
-            }
-            Event::Resumed {
-                stored_id,
-                runtime_id,
-                messages,
-                before,
-                read_only_reason,
-                model,
-            } => {
-                self.pending_resumes.borrow_mut().remove(&stored_id);
-                let c = state.conversations.entry(stored_id).or_default();
-                c.runtime_id = runtime_id;
-                c.messages = messages;
-                c.history_before = before;
-                c.history_loading = false;
-                c.loaded = true;
-                c.read_only_reason = read_only_reason;
-                c.status = TurnStatus::Idle;
-                c.activity.clear();
-                c.interaction = None;
-                // Resume metadata is the restored stored pair; it replaces any stale claim.
-                c.model = model.map_or(ModelState::Unknown, ModelState::Confirmed);
-                *self.model_pending.borrow_mut() = None;
-                c.revision += 1;
-            }
-            Event::History {
-                stored_id,
-                messages,
-                before,
-                next_before,
-            } => {
-                if let Some(c) = state.conversations.get_mut(&stored_id) {
-                    c.receive_history_page(before, next_before, messages);
-                }
-            }
-            other => {
-                if !self.apply_history(&mut state, &other) {
-                    self.apply_stream(&mut state, other);
-                }
-            }
-        }
+        let draft = self.desk.draft();
+        let (start, end) = selection_of(&draft, self.anchor, self.cursor);
+        self.replace(&draft, start, end, extra);
     }
 
-    /// Session-list and failure events. Returns true when the event was handled.
-    /// Live-turn and history-page events are consumed by `apply` directly.
-    fn apply_history(&self, state: &mut AppState, event: &Event) -> bool {
-        match event {
-            Event::Deleted { stored_id } => {
-                state.sessions.retain(|s| &s.stored_id != stored_id);
-                state.conversations.remove(stored_id);
-                true
-            }
-            Event::Error {
-                operation,
-                session_id,
-                message,
-            } => {
-                state.notice = format!("{operation}: {message}");
-                state.creating = false;
-                state.list_loading = false;
-                if let Some(id) = session_id {
-                    self.pending_resumes.borrow_mut().remove(id);
-                    let stored = if state.conversations.contains_key(id) {
-                        Some(id.clone())
-                    } else {
-                        state.stored_for_runtime(id)
-                    };
-                    if let Some(id) = stored {
-                        let c = state.conversations.get_mut(&id).unwrap();
-                        c.history_loading = false;
-                        c.operation_failed(operation, message.clone());
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Live-turn events. Returns true when the event was handled.
-    fn apply_stream(&self, state: &mut AppState, event: Event) -> bool {
-        match event {
-            Event::Submitted { runtime_id } => {
-                with_conversation(state, &runtime_id, |c| c.submit_acknowledged());
-                true
-            }
-            Event::MessageDelta {
-                runtime_id,
-                message_id,
-                delta,
-            } => {
-                with_conversation(state, &runtime_id, |c| c.receive_delta(message_id, delta));
-                true
-            }
-            Event::MessageComplete {
-                runtime_id,
-                message,
-                status,
-            } => {
-                with_conversation(state, &runtime_id, |c| {
-                    c.finish_message(message);
-                    c.activity = completion_activity(&status);
-                    c.status = status;
-                    c.interaction = None;
-                });
-                true
-            }
-            Event::Activity { runtime_id, text } => {
-                with_conversation(state, &runtime_id, |c| c.activity = text);
-                true
-            }
-            Event::Interrupting { runtime_id } => {
-                with_conversation(state, &runtime_id, |c| c.begin_stopping());
-                true
-            }
-            Event::SteerAccepted {
-                runtime_id,
-                outcome,
-            } => {
-                with_conversation(state, &runtime_id, |c| c.steer_acknowledged(outcome));
-                true
-            }
-            Event::TurnRolled { runtime_id } => {
-                with_conversation(state, &runtime_id, |c| c.turn_rolled());
-                true
-            }
-            Event::Interaction {
-                runtime_id,
-                request,
-            } => {
-                with_conversation(state, &runtime_id, |c| {
-                    c.receive_interaction(request);
-                });
-                true
-            }
-            Event::InteractionCancelled {
-                runtime_id,
-                request_id,
-            } => {
-                with_conversation(state, &runtime_id, |c| c.withdraw_interaction(&request_id));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn refresh_sessions(&self) {
-        let (rows, selected) = {
-            let state = self.state.borrow();
-            let rows: Vec<_> = state
-                .sessions
-                .iter()
-                .cloned()
-                .map(glib::BoxedAnyObject::new)
-                .collect();
-            let selected = state
-                .selected
-                .as_ref()
-                .and_then(|id| state.sessions.iter().position(|s| &s.stored_id == id))
-                .map(|index| index as u32)
-                .unwrap_or(gtk::INVALID_LIST_POSITION);
-            (rows, selected)
-        };
-        // Drop the state borrow before these mutations. Hold the guard across
-        // both: splice emits selection changes before the replacement position
-        // is applied, and a nested handler must not clear this flag.
-        self.suppress_selection.set(true);
-        self.sessions.splice(0, self.sessions.n_items(), &rows);
-        self.selection.set_selected(selected);
-        self.suppress_selection.set(false);
-    }
-
-    fn sync_sidebar_selection(&self) {
-        let selected = {
-            let state = self.state.borrow();
-            state
-                .selected
-                .as_ref()
-                .and_then(|id| state.sessions.iter().position(|s| &s.stored_id == id))
-                .map(|index| index as u32)
-                .unwrap_or(gtk::INVALID_LIST_POSITION)
-        };
-        self.suppress_selection.set(true);
-        self.selection.set_selected(selected);
-        self.suppress_selection.set(false);
-    }
-
-    fn session_id_at(&self, position: u32) -> Option<String> {
-        self.sessions
-            .item(position)
-            .and_downcast::<glib::BoxedAnyObject>()
-            .map(|value| value.borrow::<SessionSummary>().stored_id.clone())
-    }
-
-    fn adopt_sidebar_selection(&self, focus_editor: bool) {
-        if self.suppress_selection.get() {
+    fn backspace(&mut self) {
+        if !self.desk.controls().editable {
             return;
         }
-        let Some(id) = self.session_id_at(self.selection.selected()) else {
-            // A cleared highlight must not leave the open conversation behind.
-            self.sync_sidebar_selection();
+        let draft = self.desk.draft();
+        let (start, end) = selection_of(&draft, self.anchor, self.cursor);
+        if start != end {
+            self.replace(&draft, start, end, "");
+            return;
+        }
+        let prev = prev_boundary(&draft, start);
+        self.replace(&draft, prev, start, "");
+    }
+
+    fn delete_forward(&mut self) {
+        if !self.desk.controls().editable {
+            return;
+        }
+        let draft = self.desk.draft();
+        let (start, end) = selection_of(&draft, self.anchor, self.cursor);
+        if start != end {
+            self.replace(&draft, start, end, "");
+            return;
+        }
+        let next = next_boundary(&draft, start);
+        self.replace(&draft, start, next, "");
+    }
+
+    fn replace(&mut self, draft: &str, start: usize, end: usize, extra: &str) {
+        let mut next = String::new();
+        next.push_str(&draft[..start]);
+        next.push_str(extra);
+        next.push_str(&draft[end..]);
+        self.cursor = start + extra.len();
+        self.anchor = self.cursor;
+        self.desk.set_draft(next);
+    }
+
+    fn select_all(&mut self) {
+        self.anchor = 0;
+        self.cursor = self.desk.draft().len();
+    }
+
+    fn copy_selection(&self, cx: &mut Context<Self>) {
+        let draft = self.desk.draft();
+        let (start, end) = selection_of(&draft, self.anchor, self.cursor);
+        if start == end {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(draft[start..end].to_string()));
+    }
+
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        self.copy_selection(cx);
+        self.insert_text("");
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        if self.state.borrow().selected.as_deref() == Some(id.as_str()) {
-            if focus_editor {
-                self.editor.grab_focus();
-            }
-            return;
+        self.insert_text(&text);
+    }
+}
+
+impl gpui::Render for Root {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.polling {
+            self.polling = true;
+            self.arm(cx);
         }
-        self.select_created.set(false);
-        self.select(&id, focus_editor);
+        self.prepare(window);
+        let controls = self.desk.controls();
+        let connection = self.desk.connection();
+        shell(self, &controls, &connection, cx)
     }
+}
 
-    fn refresh(&self) {
-        let state = self.state.borrow();
-        let selected = state.selected.as_ref();
-        let conversation = selected.and_then(|id| state.conversations.get(id));
-        let identity_changed = *self.rendered_session.borrow() != state.selected;
-        let revision = conversation.map_or(0, |c| c.revision);
-        if identity_changed || self.rendered_revision.get() != revision {
-            if identity_changed {
-                self.messages.remove_all();
-                *self.rendered_session.borrow_mut() = state.selected.clone();
-            }
-            let current = conversation.map_or(&[][..], |c| c.messages.as_slice());
-            if self.messages.n_items() as usize > current.len() {
-                self.messages.splice(
-                    current.len() as u32,
-                    self.messages.n_items() - current.len() as u32,
-                    &[] as &[glib::BoxedAnyObject],
-                );
-            }
-            for (index, message) in current.iter().enumerate() {
-                let same = self
-                    .messages
-                    .item(index as u32)
-                    .and_downcast::<glib::BoxedAnyObject>()
-                    .is_some_and(|v| {
-                        let old = v.borrow::<ChatMessage>();
-                        old.id == message.id && old.text == message.text && old.role == message.role
-                    });
-                if !same {
-                    let value = glib::BoxedAnyObject::new(message.clone());
-                    if (index as u32) < self.messages.n_items() {
-                        self.messages.splice(index as u32, 1, &[value]);
-                    } else {
-                        self.messages.append(&value);
-                    }
-                }
-            }
-            self.rendered_revision.set(revision);
-            if self.follow_bottom.get() {
-                let adjustment = self.transcript.vadjustment();
-                glib::idle_add_local_once(move || {
-                    adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
-                });
-            }
-        }
-        self.content.set_visible_child_name(
-            if conversation.is_some_and(|c| !c.messages.is_empty()) {
-                "messages"
-            } else {
-                "empty"
-            },
-        );
-        self.title.set_text(
-            selected
-                .and_then(|id| state.sessions.iter().find(|s| &s.stored_id == id))
-                .map_or("Hermes Native", |s| s.title.as_str()),
-        );
-        self.notice.set_text(&state.notice);
-        self.notice.set_visible(!state.notice.is_empty());
-        let reason = conversation.and_then(|c| c.read_only_reason.as_deref());
-        self.readonly.set_text(reason.unwrap_or_default());
-        self.readonly.set_visible(reason.is_some());
-        self.activity.set_text(
-            if selected.is_some_and(|id| self.pending_resumes.borrow().contains(id)) {
-                "Loading server history…"
-            } else {
-                conversation.map_or("", |c| c.activity.as_str())
-            },
-        );
-        self.spinner.set_spinning(
-            conversation.is_some_and(|c| c.status.busy() || c.history_loading)
-                || selected.is_some_and(|id| self.pending_resumes.borrow().contains(id)),
-        );
-        self.older
-            .set_visible(conversation.is_some_and(|c| c.history_before > 0));
-        self.older
-            .set_sensitive(conversation.is_some_and(|c| !c.status.busy() && !c.history_loading));
-        self.latest.set_visible(selected.is_some());
-        drop(state);
-        self.refresh_interaction();
-        self.refresh_controls();
+fn shell(
+    root: &mut Root,
+    controls: &present::Controls,
+    connection: &present::ConnectionView,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("hermes-root")
+        .relative()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(0x16161a))
+        .text_color(rgb(0xeeeeee))
+        .font_family("sans")
+        .on_action(cx.listener(|root, _: &NewConversation, window, cx| root.on_new(window, cx)))
+        .on_key_down(
+            cx.listener(|root, event: &KeyDownEvent, window, cx| root.on_key(event, window, cx)),
+        )
+        .child(header(root, controls, connection, cx))
+        .child(body(root, controls, cx))
+        .children(overlay(root, cx))
+}
+
+fn header(
+    root: &mut Root,
+    controls: &present::Controls,
+    connection: &present::ConnectionView,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .px(px(16.))
+        .h(px(52.))
+        .bg(rgb(0x1e1e24))
+        .border_b_1()
+        .border_color(rgb(0x34343c))
+        .child(header_start(root, controls, cx))
+        .child(connection_label(connection, controls.reconnect, cx))
+}
+
+fn header_start(
+    _root: &mut Root,
+    controls: &present::Controls,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(text_button(
+            "toggle-sidebar",
+            "Conversations",
+            true,
+            false,
+            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                root.desk.toggle_sidebar();
+                cx.notify();
+            }),
+        ))
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_weight(FontWeight(700.))
+                .child(controls.title.clone()),
+        )
+}
+
+fn connection_label(
+    connection: &present::ConnectionView,
+    reconnect: bool,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(tone_color(connection.tone))
+                .child(connection.label),
+        )
+        .child(text_button(
+            "reconnect",
+            "Reconnect",
+            reconnect,
+            false,
+            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                root.desk.reconnect();
+                cx.notify();
+            }),
+        ))
+}
+
+fn tone_color(tone: Tone) -> gpui::Rgba {
+    match tone {
+        Tone::Live => rgb(0x3dba7a),
+        Tone::Error => rgb(0xe05a5a),
+        Tone::Neutral => rgb(0xb0b0b8),
     }
+}
 
-    fn refresh_model_trigger(
-        &self,
-        conversation: Option<&Conversation>,
-        catalog: &Catalog,
-        writable: bool,
-    ) {
-        let model = conversation.map_or(&ModelState::Unknown, |c| &c.model);
-        self.model_label.set_text(&model_caption(model));
-        self.model_provider
-            .set_text(&model_provider_line(model, catalog));
-        self.model_menu
-            .set_tooltip_text(Some(&model_tooltip(model, catalog)));
-        self.model_menu
-            .set_sensitive(writable && !model.switching());
-        *self.model_current.borrow_mut() = model.confirmed().or_else(|| model.target()).cloned();
-    }
+fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_1()
+        .min_h(px(0.))
+        .w_full()
+        .when(root.desk.sidebar_open, |row| {
+            row.child(sidebar(root, controls, cx))
+        })
+        .child(main_column(root, controls, cx).flex_1().min_w(px(0.)))
+}
 
-    fn refresh_controls(&self) {
-        let state = self.state.borrow();
-        let connected = state.connection.as_ref() == Some(&ConnectionState::Connected);
-        let conversation = state
-            .selected
-            .as_ref()
-            .and_then(|id| state.conversations.get(id));
-        let writable = connected
-            && conversation.is_some_and(|c| c.runtime_id.is_some() && c.read_only_reason.is_none());
-        let reload_pending = state
-            .selected
-            .as_ref()
-            .is_some_and(|id| self.pending_resumes.borrow().contains(id));
-        self.editor
-            .set_editable(conversation.is_some_and(|c| c.read_only_reason.is_none()));
-        self.send.set_sensitive(
-            writable
-                && !reload_pending
-                && conversation.is_some_and(|c| {
-                    c.status != TurnStatus::Stopping && !c.draft.trim().is_empty()
+fn sidebar(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .w(px(280.))
+        .h_full()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .p(px(16.))
+        .bg(rgb(0x1e1e24))
+        .border_r_1()
+        .border_color(rgb(0x34343c))
+        .child(brand())
+        .child(text_button(
+            "new-chat",
+            "New conversation",
+            controls.new_chat,
+            true,
+            cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| root.on_new(window, cx)),
+        ))
+        .child(session_scroll(root, cx).flex_1())
+        .when(controls.more_visible, |column| {
+            column.child(text_button(
+                "more-sessions",
+                "Load more conversations",
+                controls.more_enabled,
+                false,
+                cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                    root.desk.load_more();
+                    cx.notify();
                 }),
-        );
-        self.stop
-            .set_visible(conversation.is_some_and(|c| c.status.busy()));
-        self.stop.set_sensitive(
-            connected && !conversation.is_some_and(|c| c.status == TurnStatus::Stopping),
-        );
-        self.latest.set_sensitive(connected && !reload_pending);
-        self.new_chat.set_sensitive(connected && !state.creating);
-        self.more_sessions.set_visible(state.list_has_more);
-        self.more_sessions
-            .set_sensitive(connected && !state.list_loading);
-        self.reconnect.set_sensitive(
-            self.backend.is_some()
-                && !matches!(state.connection, Some(ConnectionState::Connecting)),
-        );
-        self.refresh_model_trigger(conversation, &state.catalog, writable);
-        self.connection.remove_css_class("connection-live");
-        self.connection.remove_css_class("connection-error");
-        match &state.connection {
-            Some(ConnectionState::Connected) => {
-                self.connection.set_text("Connected");
-                self.connection.add_css_class("connection-live");
-            }
-            Some(ConnectionState::Connecting) => self.connection.set_text("Connecting…"),
-            Some(ConnectionState::AuthenticationFailed(message)) => {
-                self.connection.set_text("Authentication failed");
-                self.connection.set_tooltip_text(Some(message));
-                self.connection.add_css_class("connection-error");
-            }
-            Some(ConnectionState::Disconnected(message)) => {
-                self.connection.set_text("Disconnected");
-                self.connection.set_tooltip_text(Some(message));
-                self.connection.add_css_class("connection-error");
-            }
-            None => self.connection.set_text(if self.backend.is_none() {
-                "Not configured"
-            } else {
-                "Connecting…"
+            ))
+        })
+}
+
+fn brand() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_size(px(18.))
+                .font_weight(FontWeight(800.))
+                .child("HERMES"),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(0x9a9aa3))
+                .child("REMOTE CONVERSATIONS"),
+        )
+}
+
+fn session_scroll(root: &mut Root, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("sessions")
+        .flex_1()
+        .overflow_y_scroll()
+        .child(session_list(root, cx))
+}
+
+fn session_list(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+    let selected = root.desk.state.selected.clone();
+    let mut list = div().flex().flex_col().gap(px(6.));
+    for session in root.desk.state.sessions.clone() {
+        let id = session.stored_id.clone();
+        let active = selected.as_deref() == Some(id.as_str());
+        let read_only = session_read_only(&root.desk, &id);
+        list = list.child(session_row(
+            &session,
+            active,
+            read_only,
+            cx.listener(move |root, _: &gpui::MouseDownEvent, window, cx| {
+                root.desk.select(&id);
+                root.composer_focus.focus(window);
+                cx.notify();
             }),
-        }
+        ));
     }
+    list
+}
 
-    fn refresh_interaction(&self) {
-        let request = {
-            let state = self.state.borrow();
-            state
-                .selected
-                .as_ref()
-                .and_then(|id| state.conversations.get(id))
-                .and_then(|c| c.interaction.clone().zip(c.runtime_id.clone()))
-        };
-        let identity = request
-            .as_ref()
-            .map(|(request, runtime)| (runtime.clone(), request.id.clone()));
-        if *self.rendered_interaction.borrow() == identity {
-            return;
-        }
-        *self.rendered_interaction.borrow_mut() = identity;
-        while let Some(child) = self.interaction.first_child() {
-            self.interaction.remove(&child);
-        }
-        let open = request.is_some();
-        self.interaction.set_visible(open);
-        self.interaction_scroll.set_visible(open);
-        let Some((request, runtime_id)) = request else {
-            return;
-        };
-        if !request.prompt.is_empty() {
-            self.interaction
-                .append(&full_label(&request.prompt, "clarify-prompt"));
-        }
-        match request.kind {
-            InteractionKind::Approval => self.build_approval(&request, &runtime_id),
-            InteractionKind::Clarification => self.build_clarification(&request, &runtime_id),
-        }
-        self.interaction.set_sensitive(true);
+fn session_read_only(desk: &Desk, id: &str) -> bool {
+    desk.state
+        .sessions
+        .iter()
+        .find(|session| session.stored_id == id)
+        .and_then(|session| session.read_only_reason.as_ref())
+        .is_some()
+        || desk
+            .state
+            .conversations
+            .get(id)
+            .and_then(|chat| chat.read_only_reason.as_ref())
+            .is_some()
+}
+
+fn session_row(
+    session: &crate::model::SessionSummary,
+    active: bool,
+    read_only: bool,
+    handler: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let mut row = div()
+        .id(gpui::SharedString::new(format!(
+            "session-{}",
+            session.stored_id
+        )))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .p(px(12.))
+        .rounded(px(10.))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, handler)
+        .child(
+            div()
+                .font_weight(FontWeight(600.))
+                .child(present::session_heading(&session.title)),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(0x9a9aa3))
+                .child(present::session_meta(&session.source, read_only)),
+        );
+    if active {
+        row = row.bg(rgb(0x2a3348));
     }
+    row
+}
 
-    fn build_approval(&self, request: &InteractionRequest, runtime_id: &str) {
-        let choices = if request.choices.is_empty() {
-            vec!["once".to_string(), "deny".to_string()]
-        } else {
-            request.choices.clone()
-        };
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        buttons.set_hexpand(true);
-        for choice in choices {
-            let button = gtk::Button::with_label(approval_label(&choice));
-            button.update_property(&[gtk::accessible::Property::Label(approval_label(&choice))]);
-            if choice == "deny" {
-                button.add_css_class("destructive-action");
+fn main_column(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .h_full()
+        .min_h(px(0.))
+        .bg(rgb(0x16161a))
+        .child(notice(&root.desk.state.notice))
+        .child(readonly_banner(controls))
+        .child(history_bar(controls, cx))
+        .child(transcript(root, controls, cx).flex_1())
+        .child(footer(root, controls, cx))
+}
+
+fn notice(text: &str) -> gpui::Div {
+    let mut banner = div()
+        .px(px(20.))
+        .text_size(px(13.))
+        .text_color(rgb(0xf0c674));
+    if !text.is_empty() {
+        banner = banner.py(px(8.)).child(text.to_string());
+    }
+    banner
+}
+
+fn readonly_banner(controls: &present::Controls) -> gpui::Div {
+    let mut banner = div().px(px(20.));
+    if let Some(reason) = &controls.readonly {
+        banner = banner.py(px(8.)).child(
+            div()
+                .p(px(12.))
+                .rounded(px(9.))
+                .bg(rgb(0x3a321c))
+                .text_color(rgb(0xf0c674))
+                .child(reason.clone()),
+        );
+    }
+    banner
+}
+
+fn history_bar(controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .justify_center()
+        .gap(px(8.))
+        .py(px(6.))
+        .when(controls.older_visible, |bar| {
+            bar.child(text_button(
+                "older",
+                "Load earlier messages",
+                controls.older_enabled,
+                false,
+                cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                    root.desk.load_older();
+                    cx.notify();
+                }),
+            ))
+        })
+        .when(controls.latest_visible, |bar| {
+            bar.child(text_button(
+                "latest",
+                "Reload history",
+                controls.latest_enabled,
+                false,
+                cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                    root.desk.reload();
+                    cx.notify();
+                }),
+            ))
+        })
+}
+
+fn transcript(
+    root: &mut Root,
+    controls: &present::Controls,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("transcript")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .track_scroll(&root.transcript)
+        .on_scroll_wheel(cx.listener(|root, event: &ScrollWheelEvent, _, _| {
+            if wheel_up(&event.delta) {
+                root.desk.follow_bottom = false;
             }
-            let runtime_id = runtime_id.to_string();
-            let request_id = request.id.clone();
-            let offered = choice.clone();
-            button.connect_clicked(move |button| {
-                dispatch_respond(
-                    button,
-                    &runtime_id,
-                    &request_id,
-                    glib::Variant::from(offered.as_str()),
-                );
-            });
-            buttons.append(&button);
-        }
-        self.interaction.append(&buttons);
-    }
-
-    fn build_clarification(&self, request: &InteractionRequest, runtime_id: &str) {
-        let slots = Rc::new(RefCell::new(Vec::<ClarifySlot>::new()));
-        for question in &request.questions {
-            if slots.borrow().iter().any(|slot| slot.qid == question.qid) {
-                continue;
-            }
-            let block = gtk::Box::new(gtk::Orientation::Vertical, 6);
-            block.add_css_class("clarify-question");
-            let prompt = full_label(&question.prompt, "clarify-prompt");
-            prompt.update_property(&[gtk::accessible::Property::Description(&format!(
-                "Question {}",
-                question.qid
-            ))]);
-            block.append(&prompt);
-            let locked = request.answers.get(&question.qid).cloned();
-            let slot = if let Some(value) = locked {
-                let text = value.as_deref().unwrap_or("Skipped");
-                let shown = full_label(text, "clarify-locked");
-                shown.set_sensitive(false);
-                block.append(&shown);
-                ClarifySlot {
-                    qid: question.qid.clone(),
-                    locked: Some(value),
-                    skipped: Rc::new(Cell::new(false)),
-                    entry: None,
-                    checks: Vec::new(),
-                    multi: question.multi_select,
-                }
-            } else {
-                let skipped = Rc::new(Cell::new(false));
-                let controls = gtk::Box::new(gtk::Orientation::Vertical, 4);
-                let (entry, checks) = if question.choices.is_empty() {
-                    let entry = gtk::Entry::new();
-                    entry.set_placeholder_text(Some("Your answer"));
-                    entry.update_property(&[gtk::accessible::Property::Label(&format!(
-                        "Answer for {}",
-                        question.qid
-                    ))]);
-                    controls.append(&entry);
-                    (Some(entry), Vec::new())
-                } else {
-                    let mut checks = Vec::new();
-                    let mut leader = None;
-                    for choice in &question.choices {
-                        let check = gtk::CheckButton::with_label(choice);
-                        check.update_property(&[gtk::accessible::Property::Label(choice.as_str())]);
-                        if !question.multi_select {
-                            if let Some(leader) = &leader {
-                                check.set_group(Some(leader));
-                            } else {
-                                leader = Some(check.clone());
-                            }
-                        }
-                        controls.append(&check);
-                        checks.push((choice.clone(), check));
-                    }
-                    (None, checks)
-                };
-                block.append(&controls);
-                let skip = gtk::Button::with_label("Skip");
-                skip.add_css_class("flat");
-                let skipped_flag = Rc::clone(&skipped);
-                let controls_for_skip = controls.clone();
-                skip.connect_clicked(move |button| {
-                    let next = !skipped_flag.get();
-                    skipped_flag.set(next);
-                    controls_for_skip.set_sensitive(!next);
-                    button.set_label(if next { "Answer instead" } else { "Skip" });
-                });
-                block.append(&skip);
-                ClarifySlot {
-                    qid: question.qid.clone(),
-                    locked: None,
-                    skipped,
-                    entry,
-                    checks,
-                    multi: question.multi_select,
-                }
-            };
-            slots.borrow_mut().push(slot);
-            self.interaction.append(&block);
-        }
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let submit = gtk::Button::with_label("Submit answers");
-        submit.add_css_class("suggested-action");
-        let submit_runtime = runtime_id.to_string();
-        let request_id = request.id.clone();
-        let collected = Rc::clone(&slots);
-        submit.connect_clicked(move |button| {
-            let Some(answers) = collect_clarification(&collected.borrow()) else {
-                return;
-            };
-            dispatch_respond(
-                button,
-                &submit_runtime,
-                &request_id,
-                glib::Variant::from(&answers),
-            );
-        });
-        let cancel = gtk::Button::with_label("Skip all");
-        cancel.add_css_class("flat");
-        let runtime_id = runtime_id.to_string();
-        let request_id = request.id.clone();
-        cancel.connect_clicked(move |button| {
-            dispatch_respond(button, &runtime_id, &request_id, glib::Variant::from(false));
-        });
-        buttons.append(&submit);
-        buttons.append(&cancel);
-        self.interaction.append(&buttons);
-    }
+        }))
+        .child(transcript_body(root, controls, cx))
 }
 
-struct ClarifySlot {
-    qid: String,
-    locked: Option<Option<String>>,
-    skipped: Rc<Cell<bool>>,
-    entry: Option<gtk::Entry>,
-    checks: Vec<(String, gtk::CheckButton)>,
-    multi: bool,
-}
-
-fn full_label(text: &str, class: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(text));
-    label.add_css_class(class);
-    label.set_wrap(true);
-    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_selectable(true);
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    label
-}
-
-fn approval_label(choice: &str) -> &str {
-    match choice {
-        "once" => "Allow once",
-        "session" => "Allow for this chat",
-        "always" => "Always allow",
-        "deny" => "Deny",
-        other => other,
-    }
-}
-
-fn dispatch_respond(button: &gtk::Button, runtime_id: &str, request_id: &str, body: glib::Variant) {
-    let payload = (runtime_id, request_id, body).to_variant();
-    let _ = button.activate_action("win.respond", Some(&payload));
-}
-
-fn decode_interaction_answer(body: &glib::Variant) -> Option<InteractionAnswer> {
-    if let Some(choice) = body.get::<String>() {
-        return Some(InteractionAnswer::Approval(choice));
-    }
-    if body.get::<bool>().is_some() {
-        return Some(InteractionAnswer::Cancel);
-    }
-    body.get::<HashMap<String, Option<String>>>()
-        .map(InteractionAnswer::Clarification)
-}
-
-fn collect_clarification(slots: &[ClarifySlot]) -> Option<HashMap<String, Option<String>>> {
-    let mut answers = HashMap::new();
-    for slot in slots {
-        if answers.contains_key(&slot.qid) {
-            return None;
-        }
-        if let Some(locked) = &slot.locked {
-            answers.insert(slot.qid.clone(), locked.clone());
-            continue;
-        }
-        if slot.skipped.get() {
-            answers.insert(slot.qid.clone(), None);
-            continue;
-        }
-        if let Some(entry) = &slot.entry {
-            let text = entry.text().trim().to_string();
-            if text.is_empty() {
-                entry.grab_focus();
-                return None;
-            }
-            answers.insert(slot.qid.clone(), Some(text));
-            continue;
-        }
-        let selected: Vec<String> = slot
-            .checks
-            .iter()
-            .filter(|(_, check)| check.is_active())
-            .map(|(choice, _)| choice.clone())
-            .collect();
-        if selected.is_empty() || (!slot.multi && selected.len() != 1) {
-            if let Some((_, check)) = slot.checks.first() {
-                check.grab_focus();
-            }
-            return None;
-        }
-        let value = if slot.multi {
-            serde_json::to_string(&selected).ok()?
-        } else {
-            selected.into_iter().next()?
-        };
-        answers.insert(slot.qid.clone(), Some(value));
-    }
-    Some(answers)
-}
-
-fn text_icon_button(icon: &str, label: &str) -> gtk::Button {
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    content.set_halign(gtk::Align::Center);
-    content.append(&gtk::Image::from_icon_name(icon));
-    content.append(&gtk::Label::new(Some(label)));
-    let button = gtk::Button::new();
-    button.set_child(Some(&content));
-    button.update_property(&[gtk::accessible::Property::Label(label)]);
-    button
-}
-
-fn icon_button(icon: &str, label: &str) -> gtk::Button {
-    let button = gtk::Button::from_icon_name(icon);
-    button.set_tooltip_text(Some(label));
-    button.update_property(&[gtk::accessible::Property::Label(label)]);
-    button
-}
-
-/// Speaker label, row class, and speaker class for a message role, so each
-/// role reads differently in the transcript.
-fn role_style(role: &Role) -> (&'static str, &'static str, &'static str) {
-    match role {
-        Role::User => ("YOU", "message-user", "speaker-user"),
-        Role::Assistant => ("HERMES", "message-assistant", "speaker-assistant"),
-        Role::Tool => ("TOOL", "message-tool", "speaker-tool"),
-        Role::System => ("SYSTEM", "message-system", "speaker-system"),
-    }
-}
-
-/// Tool rows are compact single-line chips; every other role renders Markdown.
-fn message_body(message: &ChatMessage) -> gtk::Widget {
-    if message.role == Role::Tool {
-        let chip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        chip.add_css_class("tool-chip");
-        let icon = gtk::Image::from_icon_name("system-run-symbolic");
-        icon.add_css_class("tool-icon");
-        icon.set_valign(gtk::Align::Center);
-        chip.append(&icon);
-        let label = gtk::Label::new(Some(&message.text));
-        label.set_xalign(0.0);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        label.add_css_class("tool-label");
-        chip.append(&label);
-        chip.upcast()
+fn transcript_body(
+    root: &mut Root,
+    controls: &present::Controls,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
+    if controls.show_messages {
+        message_column(root, cx)
     } else {
-        let rendered = markdown::render(&message.text);
-        rendered.add_css_class("message-prose");
-        rendered
+        empty_state()
     }
 }
 
-fn set_margins(widget: &impl IsA<gtk::Widget>, amount: i32) {
-    widget.set_margin_top(amount);
-    widget.set_margin_bottom(amount);
-    widget.set_margin_start(amount);
-    widget.set_margin_end(amount);
+fn empty_state() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .h_full()
+        .gap(px(8.))
+        .p(px(24.))
+        .child(
+            div()
+                .text_size(px(26.))
+                .font_weight(FontWeight(700.))
+                .child("A little space to think."),
+        )
+        .child(
+            div()
+                .text_color(rgb(0x9a9aa3))
+                .child("Choose a conversation, or start something new."),
+        )
+        .child(
+            div()
+                .text_color(rgb(0x9a9aa3))
+                .child("Your history stays on your Hermes server."),
+        )
 }
 
-fn watch_sidebar_clicks(list: &gtk::ListView, clicking: &Rc<Cell<bool>>, ui: &Rc<Ui>) {
-    let capture = gtk::EventControllerLegacy::new();
-    capture.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let flag = Rc::clone(clicking);
-    let series: Rc<Cell<Option<ClickSeries>>> = Rc::new(Cell::new(None));
-    let generation = Rc::new(Cell::new(0u32));
-    let click_list = list.clone();
-    capture.connect_event(move |_, event| {
-        if event.event_type() == gdk::EventType::KeyPress {
-            // Keybindings run after capture. They must not consume a stale click.
-            flag.set(false);
-        } else if is_primary_button(event, gdk::EventType::ButtonPress) {
-            let press_generation = generation.get().wrapping_add(1);
-            generation.set(press_generation);
-            flag.set(true);
-            if claims_double_click_release(event, &click_list, series.as_ref()) {
-                // The row gesture claims this release during the press, so bubble never sees it.
-                // Retire after dispatch, and only if no later press replaced this click.
-                let flag = Rc::clone(&flag);
-                let generation = Rc::clone(&generation);
-                glib::idle_add_local_once(move || {
-                    if generation.get() == press_generation {
-                        flag.set(false);
-                    }
-                });
-            }
-        }
-        glib::Propagation::Proceed
-    });
-    list.add_controller(capture);
-
-    let bubble = gtk::EventControllerLegacy::new();
-    bubble.set_propagation_phase(gtk::PropagationPhase::Bubble);
-    let flag = Rc::clone(clicking);
-    let weak = Rc::downgrade(ui);
-    let click_list = list.clone();
-    bubble.connect_event(move |_, event| {
-        if is_primary_button(event, gdk::EventType::ButtonRelease) {
-            let was_click = flag.replace(false);
-            // Same-row clicks do not notify. Changed rows already consumed the flag.
-            if was_click
-                && click_list.focus_child().is_some()
-                && let Some(ui) = weak.upgrade()
-            {
-                ui.editor.grab_focus();
-            }
-        }
-        glib::Propagation::Proceed
-    });
-    list.add_controller(bubble);
+fn message_column(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+    let messages = root
+        .desk
+        .state
+        .selected
+        .as_ref()
+        .and_then(|id| root.desk.state.conversations.get(id))
+        .map(|chat| chat.messages.clone())
+        .unwrap_or_default();
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .p(px(24.))
+        .w_full()
+        .max_w(px(860.))
+        .mx_auto();
+    for message in messages {
+        column = column.child(message_card(&message, cx));
+    }
+    column
 }
 
-#[derive(Clone, Copy)]
-struct ClickSeries {
-    origin_x: f64,
-    origin_y: f64,
-    last_time: u32,
-    n: u32,
+fn message_card(message: &ChatMessage, cx: &mut Context<Root>) -> gpui::Div {
+    let text = message.text.clone();
+    let id = message.id.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(14.))
+        .rounded(px(12.))
+        .bg(message_bg(&message.role))
+        .child(message_heading(&message.role, id, text, cx))
+        .child(message_body(message))
 }
 
-fn claims_double_click_release(
-    event: &gdk::Event,
-    list: &gtk::ListView,
-    series: &Cell<Option<ClickSeries>>,
-) -> bool {
-    let Some(button) = event.downcast_ref::<gdk::ButtonEvent>() else {
-        return false;
+fn message_bg(role: &Role) -> gpui::Rgba {
+    match role {
+        Role::User => rgb(0x1d2a44),
+        Role::Assistant => rgb(0x222228),
+        Role::Tool => rgb(0x16161a),
+        Role::System => rgb(0x3a321c),
+    }
+}
+
+fn message_heading(role: &Role, id: String, text: String, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .justify_between()
+        .items_center()
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(FontWeight(800.))
+                .text_color(role_color(role))
+                .child(present::role_label(role)),
+        )
+        .child(text_button(
+            format!("copy-{id}"),
+            "Copy",
+            true,
+            false,
+            cx.listener(move |_root, _: &gpui::MouseDownEvent, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }),
+        ))
+}
+
+fn role_color(role: &Role) -> gpui::Rgba {
+    match role {
+        Role::User => rgb(0x7ab0ff),
+        Role::Assistant => rgb(0x3dba7a),
+        Role::Tool => rgb(0xe0a23a),
+        Role::System => rgb(0xf0c674),
+    }
+}
+
+fn message_body(message: &ChatMessage) -> gpui::AnyElement {
+    if message.role == Role::Tool {
+        div()
+            .font_family("monospace")
+            .text_size(px(12.))
+            .text_color(rgb(0xe0a23a))
+            .child(message.text.clone())
+            .into_any_element()
+    } else {
+        render_markdown(&message.text, &format!("md-{}", message.id))
+    }
+}
+
+fn footer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(16.))
+        .w_full()
+        .max_w(px(900.))
+        .mx_auto()
+        .child(interaction(root, cx))
+        .child(activity_row(controls, root.spin))
+        .child(composer(root, controls, cx))
+}
+
+fn activity_row(controls: &present::Controls, tick: u8) -> gpui::Div {
+    div()
+        .flex()
+        .gap(px(8.))
+        .text_size(px(12.))
+        .text_color(rgb(0xb0b0b8))
+        .child(spin_mark(controls.spinning, tick))
+        .child(controls.activity.clone())
+}
+
+fn spin_mark(spinning: bool, tick: u8) -> &'static str {
+    if !spinning {
+        return "";
+    }
+    match tick % 3 {
+        0 => "·",
+        1 => "•",
+        _ => "●",
+    }
+}
+
+fn interaction(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+    root.desk.sync_questions();
+    let Some(kind) = interaction_kind(&root.desk) else {
+        return div();
     };
-    let Some((x, y)) = button.position() else {
-        series.set(None);
-        return false;
+    let mut panel = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(12.))
+        .rounded(px(10.))
+        .bg(rgb(0x243044));
+    if let Some(prompt) = interaction_prompt(&root.desk) {
+        panel = panel.child(prompt);
+    }
+    panel = match kind {
+        InteractionKind::Approval => panel.child(approval_buttons(&root.desk, cx)),
+        InteractionKind::Clarification => panel.child(clarify_panel(root, cx)),
     };
-    let time = button.time();
-    let settings = list.settings();
-    let distance = settings.gtk_double_click_distance().max(0) as f64;
-    let window = settings.gtk_double_click_time().max(0) as u32;
-    let next = match series.get() {
-        Some(prev)
-            if time.wrapping_sub(prev.last_time) <= window
-                && (prev.origin_x - x).abs() < distance
-                && (prev.origin_y - y).abs() < distance =>
-        {
-            ClickSeries {
-                origin_x: prev.origin_x,
-                origin_y: prev.origin_y,
-                last_time: time,
-                n: prev.n.saturating_add(1),
-            }
-        }
-        _ => ClickSeries {
-            origin_x: x,
-            origin_y: y,
-            last_time: time,
-            n: 1,
+    if !root.desk.form_note.is_empty() {
+        panel = panel.child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(0xf0c674))
+                .child(root.desk.form_note.clone()),
+        );
+    }
+    panel
+}
+
+fn interaction_kind(desk: &Desk) -> Option<InteractionKind> {
+    open_interaction(desk).map(|request| request.kind.clone())
+}
+
+fn interaction_prompt(desk: &Desk) -> Option<String> {
+    open_interaction(desk)
+        .map(|request| request.prompt.clone())
+        .filter(|prompt| !prompt.is_empty())
+}
+
+fn open_interaction(desk: &Desk) -> Option<&crate::model::InteractionRequest> {
+    desk.state
+        .selected
+        .as_ref()
+        .and_then(|id| desk.state.conversations.get(id))
+        .and_then(|chat| chat.interaction.as_ref())
+}
+
+fn approval_buttons(desk: &Desk, cx: &mut Context<Root>) -> gpui::Div {
+    let choices = open_interaction(desk)
+        .map(present::approval_choices)
+        .unwrap_or_default();
+    let mut row = div().flex().gap(px(8.)).flex_wrap();
+    for choice in choices {
+        let label = present::approval_label(&choice).to_string();
+        let primary = choice != "deny";
+        row = row.child(text_button(
+            format!("approve-{choice}"),
+            label,
+            true,
+            primary,
+            cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
+                root.desk.approve(&choice);
+                cx.notify();
+            }),
+        ));
+    }
+    row
+}
+
+fn clarify_panel(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+    let questions = root.desk.questions.clone();
+    let mut column = div().flex().flex_col().gap(px(8.));
+    for question in questions {
+        column = column.child(question_block(root, &question, cx));
+    }
+    column = column.child(clarify_actions(cx));
+    column
+}
+
+fn question_block(root: &mut Root, question: &QuestionDraft, cx: &mut Context<Root>) -> gpui::Div {
+    let mut block = div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(question.prompt.clone());
+    if let Some(locked) = &question.locked {
+        block = block.child(locked.clone().unwrap_or_else(|| "Skipped".into()));
+        return block;
+    }
+    block = block.child(question_choices(root, question, cx));
+    let qid = question.qid.clone();
+    block.child(text_button(
+        format!("skip-{qid}"),
+        if question.skipped {
+            "Answer instead"
+        } else {
+            "Skip"
         },
+        true,
+        false,
+        cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
+            root.desk.toggle_skip(&qid);
+            cx.notify();
+        }),
+    ))
+}
+
+fn question_choices(
+    root: &mut Root,
+    question: &QuestionDraft,
+    cx: &mut Context<Root>,
+) -> gpui::AnyElement {
+    if question.choices.is_empty() {
+        return free_answer(root, question, cx).into_any_element();
+    }
+    let mut row = div().flex().flex_col().gap(px(4.));
+    for (index, choice) in question.choices.iter().enumerate() {
+        let qid = question.qid.clone();
+        let mark = if question.selected.get(index).copied().unwrap_or(false) {
+            "[x] "
+        } else {
+            "[ ] "
+        };
+        row = row.child(text_button(
+            format!("choice-{}-{index}", question.qid),
+            format!("{mark}{choice}"),
+            !question.skipped,
+            false,
+            cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
+                root.desk.toggle_choice(&qid, index);
+                cx.notify();
+            }),
+        ));
+    }
+    row.into_any_element()
+}
+
+fn free_answer(
+    root: &mut Root,
+    question: &QuestionDraft,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    let qid = question.qid.clone();
+    let shown = if question.skipped {
+        "Skipped".to_string()
+    } else if question.text.is_empty() {
+        "Your answer".to_string()
+    } else {
+        question.text.clone()
     };
-    let claims = next.n == 2;
-    series.set(Some(next));
-    claims
+    div()
+        .id(gpui::SharedString::new(format!("answer-{qid}")))
+        .p(px(8.))
+        .rounded(px(8.))
+        .bg(rgb(0x1c1c22))
+        .text_color(if question.text.is_empty() {
+            rgb(0x8a8a92)
+        } else {
+            rgb(0xeeeeee)
+        })
+        .track_focus(&root.clarify_focus)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |root, _: &gpui::MouseDownEvent, window, cx| {
+                root.answer_qid = Some(qid.clone());
+                root.clarify_focus.focus(window);
+                cx.notify();
+            }),
+        )
+        .child(shown)
 }
 
-fn is_primary_button(event: &gdk::Event, kind: gdk::EventType) -> bool {
-    event.event_type() == kind
-        && event
-            .downcast_ref::<gdk::ButtonEvent>()
-            .is_some_and(|button| button.button() == gdk::BUTTON_PRIMARY)
+fn answer_edit(
+    current: &str,
+    key: &str,
+    typed: Option<&str>,
+    mods: &gpui::Modifiers,
+) -> Option<String> {
+    if mods.control || mods.alt || mods.platform {
+        return None;
+    }
+    let mut next = current.to_string();
+    if key == "backspace" {
+        next.pop();
+        return Some(next);
+    }
+    let text = typed?;
+    next.push_str(text);
+    Some(next)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn clarify_actions(cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .gap(px(8.))
+        .child(text_button(
+            "submit-answers",
+            "Submit answers",
+            true,
+            true,
+            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                root.desk.submit_questions();
+                cx.notify();
+            }),
+        ))
+        .child(text_button(
+            "skip-all",
+            "Skip all",
+            true,
+            false,
+            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                root.desk.cancel_questions();
+                cx.notify();
+            }),
+        ))
+}
 
-    fn pair(model: &str) -> ModelIdentity {
-        ModelIdentity {
-            provider: "custom:acme".into(),
-            model: model.into(),
+fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(10.))
+        .rounded(px(14.))
+        .border_1()
+        .border_color(rgb(0x3a3a42))
+        .bg(rgb(0x1c1c22))
+        .child(composer_input(root, controls, cx))
+        .child(model_trigger(root, controls, cx))
+        .child(composer_actions(controls, cx))
+}
+
+fn composer_input(
+    root: &mut Root,
+    controls: &present::Controls,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("composer")
+        .min_h(px(60.))
+        .track_focus(&root.composer_focus)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| {
+                root.composer_focus.focus(window);
+                cx.notify();
+            }),
+        )
+        .child(composer_text(root, controls.readonly.is_some()))
+}
+
+fn composer_text(root: &Root, read_only: bool) -> gpui::Div {
+    let draft = root.desk.draft();
+    if draft.is_empty() {
+        return div().text_color(rgb(0x8a8a92)).child(if read_only {
+            "Read only"
+        } else {
+            "Message"
+        });
+    }
+    let (start, end) = selection_of(&draft, root.anchor, root.cursor);
+    if start != end {
+        return selected_text(&draft, start, end);
+    }
+    let cursor = floor_boundary(&draft, root.cursor.min(draft.len()));
+    div()
+        .flex()
+        .flex_wrap()
+        .child(draft[..cursor].to_string())
+        .child(div().w(px(1.)).h(px(18.)).bg(rgb(0xffffff)))
+        .child(draft[cursor..].to_string())
+}
+
+fn selected_text(draft: &str, start: usize, end: usize) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .child(draft[..start].to_string())
+        .child(div().bg(rgb(0x3d7eff)).child(draft[start..end].to_string()))
+        .child(draft[end..].to_string())
+}
+
+fn model_trigger(
+    root: &mut Root,
+    controls: &present::Controls,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    let model = open_model(&root.desk);
+    let caption = present::model_caption(&model);
+    let provider = present::model_provider_line(&model, &root.desk.state.catalog);
+    div()
+        .id("model-trigger")
+        .flex()
+        .flex_col()
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(8.))
+        .cursor_pointer()
+        .opacity(if controls.model_enabled { 1. } else { 0.45 })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| {
+                root.desk.open_picker();
+                if root.desk.picker_open {
+                    root.search_focus.focus(window);
+                }
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight(600.))
+                .child(caption),
+        )
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(0x9a9aa3))
+                .child(provider),
+        )
+}
+
+fn open_model(desk: &Desk) -> ModelState {
+    desk.state
+        .selected
+        .as_ref()
+        .and_then(|id| desk.state.conversations.get(id))
+        .map(|chat| chat.model.clone())
+        .unwrap_or_default()
+}
+
+fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(11.))
+                .text_color(rgb(0x8a8a92))
+                .child("Enter to send · Shift+Enter for a new line"),
+        )
+        .when(controls.stop_visible, |row| {
+            row.child(text_button(
+                "stop",
+                "Stop",
+                controls.stop_enabled,
+                false,
+                cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                    root.desk.stop();
+                    cx.notify();
+                }),
+            ))
+        })
+        .child(text_button(
+            "send",
+            "Send",
+            controls.send,
+            true,
+            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                root.desk.submit();
+                cx.notify();
+            }),
+        ))
+}
+
+fn overlay(root: &mut Root, cx: &mut Context<Root>) -> Vec<gpui::AnyElement> {
+    let mut layers = Vec::new();
+    if root.desk.picker_open {
+        layers.push(picker(root, cx).into_any_element());
+    }
+    if root.desk.confirm.is_some() {
+        layers.push(confirm_dialog(root, cx));
+    }
+    layers
+}
+
+fn picker(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+    let rows = root.desk.picker_rows();
+    let status = present::picker_status(&root.desk.state.catalog, rows.len());
+    let note = if root.desk.picker_note.is_empty() {
+        status
+    } else {
+        root.desk.picker_note.clone()
+    };
+    div()
+        .absolute()
+        .bottom(px(120.))
+        .left(px(24.))
+        .w(px(380.))
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(10.))
+        .rounded(px(12.))
+        .bg(rgb(0x24242c))
+        .border_1()
+        .border_color(rgb(0x3a3a42))
+        .child(search_field(root, cx))
+        .when(!note.is_empty(), |panel| {
+            panel.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(0xb0b0b8))
+                    .child(note),
+            )
+        })
+        .child(model_list(root, &rows, cx))
+}
+
+fn search_field(root: &mut Root, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    let query = if root.desk.picker_query.is_empty() {
+        "Search provider or model".to_string()
+    } else {
+        root.desk.picker_query.clone()
+    };
+    let color = if root.desk.picker_query.is_empty() {
+        rgb(0x8a8a92)
+    } else {
+        rgb(0xeeeeee)
+    };
+    div()
+        .id("model-search")
+        .p(px(8.))
+        .rounded(px(8.))
+        .bg(rgb(0x1c1c22))
+        .text_color(color)
+        .track_focus(&root.search_focus)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| {
+                root.search_focus.focus(window);
+                cx.notify();
+            }),
+        )
+        .child(query)
+}
+
+fn model_list(
+    root: &Root,
+    rows: &[crate::model::ModelOption],
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    let current = open_model(&root.desk);
+    let mut list = div()
+        .id("model-list")
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .max_h(px(320.))
+        .overflow_y_scroll();
+    for (index, option) in rows.iter().enumerate() {
+        list = list.child(model_row(
+            option,
+            index,
+            index == root.desk.picker_index,
+            &current,
+            cx,
+        ));
+    }
+    list
+}
+
+fn model_row(
+    option: &crate::model::ModelOption,
+    index: usize,
+    highlighted: bool,
+    current: &ModelState,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
+    let selected = current.confirmed().or_else(|| current.target()) == Some(&option.identity);
+    let mut row = div()
+        .id(gpui::SharedString::new(format!("model-{index}")))
+        .flex()
+        .justify_between()
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(7.))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |root, _: &gpui::MouseDownEvent, window, cx| {
+                if root.desk.commit_picker_index(index) {
+                    root.composer_focus.focus(window);
+                }
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .font_weight(FontWeight(600.))
+                        .child(option.identity.model.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(0x9a9aa3))
+                        .child(option.provider_name.clone()),
+                ),
+        );
+    if !option.selectable() {
+        row = row.child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(0x9a9aa3))
+                .child("unavailable"),
+        );
+    } else if selected {
+        row = row.child("●");
+    }
+    if highlighted {
+        row = row.bg(rgb(0x2a3348));
+    }
+    row
+}
+
+fn confirm_dialog(root: &mut Root, cx: &mut Context<Root>) -> gpui::AnyElement {
+    let message = root
+        .desk
+        .confirm
+        .as_ref()
+        .map(|prompt| prompt.message.clone())
+        .unwrap_or_default();
+    div()
+        .absolute()
+        .top(px(0.))
+        .left(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .on_mouse_down(MouseButton::Left, |_, _, _| {})
+        .child(confirm_card(message, cx))
+        .into_any_element()
+}
+
+fn confirm_card(message: String, cx: &mut Context<Root>) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(80.))
+        .left(px(80.))
+        .w(px(420.))
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .p(px(16.))
+        .rounded(px(12.))
+        .bg(rgb(0x24242c))
+        .border_1()
+        .border_color(rgb(0x3a3a42))
+        .child(div().font_weight(FontWeight(700.)).child("Use this model?"))
+        .child(message)
+        .child(
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(text_button(
+                    "confirm-cancel",
+                    "Cancel",
+                    true,
+                    false,
+                    cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                        root.desk.answer_confirm(false);
+                        cx.notify();
+                    }),
+                ))
+                .child(text_button(
+                    "confirm-switch",
+                    "Switch",
+                    true,
+                    true,
+                    cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                        root.desk.answer_confirm(true);
+                        cx.notify();
+                    }),
+                )),
+        )
+}
+
+fn text_button(
+    id: impl AsRef<str>,
+    label: impl Into<String>,
+    enabled: bool,
+    primary: bool,
+    handler: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let mut button = div()
+        .id(gpui::SharedString::new(id.as_ref().to_string()))
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(8.))
+        .text_size(px(13.))
+        .child(label.into());
+    button = if primary {
+        button.bg(rgb(0x3d7eff)).text_color(rgb(0xffffff))
+    } else {
+        button.bg(rgb(0x2c2c34))
+    };
+    if enabled {
+        button
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, handler)
+    } else {
+        button.opacity(0.45)
+    }
+}
+
+fn wheel_up(delta: &ScrollDelta) -> bool {
+    match delta {
+        ScrollDelta::Pixels(point) => point.y > px(0.),
+        ScrollDelta::Lines(point) => point.y > 0.,
+    }
+}
+
+fn floor_boundary(text: &str, mut index: usize) -> usize {
+    if index > text.len() {
+        index = text.len();
+    }
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn selection_of(text: &str, anchor: usize, cursor: usize) -> (usize, usize) {
+    let anchor = floor_boundary(text, anchor);
+    let cursor = floor_boundary(text, cursor);
+    if anchor < cursor {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    }
+}
+
+fn prev_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = floor_boundary(text, cursor.min(text.len()));
+    if cursor == 0 {
+        0
+    } else {
+        floor_boundary(text, cursor - 1)
+    }
+}
+
+fn next_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = floor_boundary(text, cursor.min(text.len()));
+    if cursor >= text.len() {
+        return text.len();
+    }
+    let mut index = cursor + 1;
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn caret_move(
+    text: &str,
+    cursor: usize,
+    anchor: usize,
+    key: &str,
+    shift: bool,
+) -> Option<(usize, usize)> {
+    let next = match key {
+        "left" => prev_boundary(text, cursor),
+        "right" => next_boundary(text, cursor),
+        "home" => line_start(text, cursor),
+        "end" => line_end(text, cursor),
+        "up" => move_vertical(text, cursor, false),
+        "down" => move_vertical(text, cursor, true),
+        _ => return None,
+    };
+    let anchor = if shift { anchor } else { next };
+    Some((anchor, next))
+}
+
+fn line_start(text: &str, cursor: usize) -> usize {
+    let cursor = floor_boundary(text, cursor.min(text.len()));
+    text[..cursor]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+fn line_end(text: &str, cursor: usize) -> usize {
+    let cursor = floor_boundary(text, cursor.min(text.len()));
+    text[cursor..]
+        .find('\n')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len())
+}
+
+fn move_vertical(text: &str, cursor: usize, down: bool) -> usize {
+    let start = line_start(text, cursor);
+    let end = line_end(text, cursor);
+    let column = cursor.saturating_sub(start);
+    if down {
+        return lower_line(text, end, column);
+    }
+    upper_line(text, start, column)
+}
+
+fn lower_line(text: &str, end: usize, column: usize) -> usize {
+    if end >= text.len() {
+        return text.len();
+    }
+    let next_start = end + 1;
+    let next_end = line_end(text, next_start);
+    next_start + column.min(next_end.saturating_sub(next_start))
+}
+
+fn upper_line(text: &str, start: usize, column: usize) -> usize {
+    if start == 0 {
+        return 0;
+    }
+    let prev_end = start - 1;
+    let prev_start = line_start(text, prev_end);
+    prev_start + column.min(prev_end.saturating_sub(prev_start))
+}
+
+impl Root {
+    fn advance_preview(&mut self) -> bool {
+        if self.preview_holding() || self.preview_finished() {
+            return false;
+        }
+        match self.preview.as_ref().map(|preview| preview.step) {
+            Some(PreviewStep::Sidebar) => self.step_sidebar(),
+            Some(PreviewStep::Transcript) => self.step_transcript(),
+            Some(PreviewStep::Reply) => self.step_reply(),
+            Some(PreviewStep::Picker) => self.step_picker(),
+            Some(PreviewStep::Approval) => self.step_approval(),
+            Some(PreviewStep::Readonly) => self.step_readonly(),
+            Some(PreviewStep::Done) => self.step_done(),
+            None => false,
         }
     }
 
-    fn catalog() -> Catalog {
-        Catalog::parse(&serde_json::json!({"providers": [
-            {"slug": "acme", "name": "Acme", "is_user_defined": true, "models": ["one", "two"]}
-        ]}))
-        .expect("catalog")
+    fn preview_holding(&self) -> bool {
+        self.preview.as_ref().is_some_and(holding)
     }
 
-    #[test]
-    fn trigger_text_never_claims_an_unconfirmed_selection() {
-        let catalog = catalog();
-        assert_eq!(model_caption(&ModelState::Unknown), "Choose a model");
-        assert_eq!(
-            model_provider_line(&ModelState::Unknown, &catalog),
-            "server default"
-        );
-        assert_eq!(model_caption(&ModelState::Confirmed(pair("one"))), "one");
-        assert_eq!(
-            model_provider_line(&ModelState::Confirmed(pair("one")), &catalog),
-            "Acme"
-        );
-        assert_eq!(
-            model_caption(&ModelState::Switching {
-                from: Some(pair("one")),
-                target: pair("two")
-            }),
-            "Switching to two…"
-        );
-        assert_eq!(
-            model_caption(&ModelState::Queued {
-                from: Some(pair("one")),
-                target: pair("two")
-            }),
-            "two · next turn"
-        );
-        assert_eq!(
-            model_caption(&ModelState::Unresolved(None)),
-            "Model unconfirmed"
-        );
-        assert_eq!(
-            model_caption(&ModelState::Unresolved(Some(pair("one")))),
-            "one · unconfirmed"
-        );
+    fn preview_finished(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| matches!(preview.published.as_deref(), Some("done" | "error")))
     }
 
-    #[test]
-    fn queued_switch_says_it_applies_from_the_next_message() {
-        let catalog = catalog();
-        let tooltip = model_tooltip(
-            &ModelState::Queued {
-                from: Some(pair("one")),
-                target: pair("two"),
-            },
-            &catalog,
-        );
-        assert!(tooltip.contains("next message"), "{tooltip}");
-        assert!(tooltip.contains("Acme"), "{tooltip}");
+    fn step_sidebar(&mut self) -> bool {
+        if self.phase_done("sidebar") {
+            self.begin_step(PreviewStep::Transcript);
+            return true;
+        }
+        if sidebar_ready(&self.desk) {
+            self.publish("sidebar");
+            return true;
+        }
+        self.fail_late()
     }
+
+    fn step_transcript(&mut self) -> bool {
+        if self.phase_done("transcript") {
+            self.begin_step(PreviewStep::Reply);
+            return true;
+        }
+        if !self.preview_flag(|preview| preview.picked_notes) {
+            self.desk.select("notes");
+            self.pending_focus = Some(Focus::Composer);
+            self.set_preview(|preview| preview.picked_notes = true);
+            return true;
+        }
+        if transcript_ready(&self.desk) {
+            self.publish("transcript");
+            return true;
+        }
+        self.fail_late()
+    }
+
+    fn step_reply(&mut self) -> bool {
+        if self.phase_done("reply") {
+            self.begin_step(PreviewStep::Picker);
+            return true;
+        }
+        if !self.preview_flag(|preview| preview.asked_create) {
+            self.desk.create();
+            self.set_preview(|preview| preview.asked_create = true);
+            return true;
+        }
+        if new_chat_ready(&self.desk) && !self.preview_flag(|preview| preview.sent_reply) {
+            self.desk.set_draft("Show a markdown reply".into());
+            self.desk.submit();
+            self.set_preview(|preview| preview.sent_reply = true);
+            return true;
+        }
+        if reply_visible(&self.desk) {
+            self.publish("reply");
+            return true;
+        }
+        self.fail_late()
+    }
+
+    fn step_picker(&mut self) -> bool {
+        if self.phase_done("picker") {
+            self.desk.close_picker();
+            self.begin_step(PreviewStep::Approval);
+            return true;
+        }
+        self.desk.open_picker();
+        self.pending_focus = Some(Focus::Search);
+        self.publish("picker");
+        true
+    }
+
+    fn step_approval(&mut self) -> bool {
+        if self.phase_done("approval") {
+            self.begin_step(PreviewStep::Readonly);
+            return true;
+        }
+        if new_chat_ready(&self.desk) && !self.preview_flag(|preview| preview.sent_approval) {
+            self.desk.set_draft("approve the preview tool".into());
+            self.desk.submit();
+            self.set_preview(|preview| preview.sent_approval = true);
+            return true;
+        }
+        if interaction_open(&self.desk) {
+            self.publish("approval");
+            return true;
+        }
+        self.fail_late()
+    }
+
+    fn step_readonly(&mut self) -> bool {
+        if self.phase_done("readonly") {
+            self.begin_step(PreviewStep::Done);
+            return true;
+        }
+        if !self.preview_flag(|preview| preview.picked_board) {
+            self.desk.select("board");
+            self.set_preview(|preview| preview.picked_board = true);
+            return true;
+        }
+        if board_readonly(&self.desk) {
+            self.publish("readonly");
+            return true;
+        }
+        self.fail_late()
+    }
+
+    fn step_done(&mut self) -> bool {
+        self.publish("done");
+        true
+    }
+
+    fn phase_done(&self, phase: &str) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| preview.published.as_deref() == Some(phase) && !holding(preview))
+    }
+
+    fn begin_step(&mut self, step: PreviewStep) {
+        if let Some(preview) = self.preview.as_mut() {
+            preview.step = step;
+            preview.published = None;
+            preview.since = Instant::now();
+        }
+    }
+
+    fn publish(&mut self, phase: &str) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        if preview.published.as_deref() == Some(phase) {
+            return;
+        }
+        let _ = std::fs::write(preview.dir.join("phase"), phase);
+        preview.published = Some(phase.to_string());
+        preview.since = Instant::now();
+    }
+
+    fn fail_late(&mut self) -> bool {
+        let late = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.since.elapsed() > Duration::from_secs(20));
+        if !late {
+            return false;
+        }
+        self.publish("error");
+        self.begin_step(PreviewStep::Done);
+        true
+    }
+
+    fn preview_flag(&self, flag: impl Fn(&Preview) -> bool) -> bool {
+        self.preview.as_ref().is_some_and(flag)
+    }
+
+    fn set_preview(&mut self, set: impl FnOnce(&mut Preview)) {
+        if let Some(preview) = self.preview.as_mut() {
+            set(preview);
+        }
+    }
+}
+
+fn holding(preview: &Preview) -> bool {
+    let Some(phase) = preview.published.as_deref() else {
+        return false;
+    };
+    if ack_is(&preview.dir, phase) {
+        return false;
+    }
+    preview.since.elapsed() < Duration::from_secs(15)
+}
+
+fn ack_is(dir: &std::path::Path, phase: &str) -> bool {
+    std::fs::read_to_string(dir.join("ack"))
+        .map(|text| text.trim() == phase)
+        .unwrap_or(false)
+}
+
+fn sidebar_ready(desk: &Desk) -> bool {
+    desk.state.connection == Some(ConnectionState::Connected) && !desk.state.sessions.is_empty()
+}
+
+fn transcript_ready(desk: &Desk) -> bool {
+    desk.state.selected.as_deref() == Some("notes")
+        && desk
+            .state
+            .conversations
+            .get("notes")
+            .is_some_and(|chat| chat.loaded && !chat.messages.is_empty())
+}
+
+fn new_chat_ready(desk: &Desk) -> bool {
+    desk.state
+        .selected
+        .as_deref()
+        .is_some_and(|id| id.starts_with("stored-"))
+        && desk
+            .state
+            .selected
+            .as_ref()
+            .and_then(|id| desk.state.conversations.get(id))
+            .is_some_and(|chat| chat.loaded && chat.runtime_id.is_some())
+}
+
+fn reply_visible(desk: &Desk) -> bool {
+    desk.state
+        .selected
+        .as_ref()
+        .and_then(|id| desk.state.conversations.get(id))
+        .is_some_and(|chat| {
+            chat.messages.iter().any(|message| {
+                message.role == Role::Assistant && message.text.contains("# Preview")
+            })
+        })
+}
+
+fn interaction_open(desk: &Desk) -> bool {
+    open_interaction(desk).is_some()
+}
+
+fn board_readonly(desk: &Desk) -> bool {
+    desk.state
+        .conversations
+        .get("board")
+        .and_then(|chat| chat.read_only_reason.as_ref())
+        .is_some()
 }

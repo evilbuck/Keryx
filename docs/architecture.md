@@ -1,12 +1,24 @@
 # Architecture
 
-Hermes Native is one GTK 4 / libadwaita process. The window is a sidebar plus a transcript plus a composer. Nothing here installs a package, a desktop shortcut, or a settings screen.
+Hermes Native is one GPUI process. The window is a sidebar plus a transcript plus a composer. Nothing here installs a package, a desktop shortcut, or a settings screen.
+
+The UI entity is `ui::Root`. It reads `desk::Desk` and paints with `div` elements. `Desk` owns `AppState`, sends `Command`s, and applies `Event`s. The network worker is unchanged: a `hermes-net` thread runs a current-thread Tokio runtime. GPUI's foreground executor does not run Tokio. Every 40ms a `background_executor` timer calls `Desk::poll`, which drains the worker channel on the UI entity.
+
+| GTK surface | GPUI |
+| --- | --- |
+| `adw::ApplicationWindow` + `HeaderBar` | `Application::open_window` and the header `div` |
+| sidebar `ListView` | session `div` rows |
+| transcript `ListView` | scrollable message column |
+| `GtkTextView` composer | focused `div` with its own caret and selection |
+| model `MenuButton` / `Popover` | picker overlay |
+| `AlertDialog` for an expensive model | confirm overlay |
+| Markdown `gtk::Widget` tree | `markdown::render_markdown` |
 
 ## Window
 
 The sidebar lists server session metadata and offers **New conversation** (also Ctrl+N). Rows show the server title, source, and a read-only mark when resume is refused. Selecting a row does not create another chat.
 
-The transcript is a `GtkListView`. GTK recycles the visible row widgets. Each conversation message uses native widgets from a per-block Markdown parse: headings, lists, links, code, and tables. Saved tool-result rows show the tool name when available, not their arguments or output. Prose and code are selectable. **Copy original message** copies the displayed message text (the summary for tool rows). **Copy code** copies that fence. Links open only after normalization, and only for `http`, `https`, and `mailto`. Other schemes stay inert. HTML is literal text. Images are alt text and are never fetched. There is no webview.
+The transcript is one scrollable column. Each conversation message is painted from a per-block Markdown parse: headings, lists, links, code, and tables. Saved tool-result rows show the tool name when available, not their arguments or output. **Copy** copies the displayed message text (the summary for tool rows). **Copy code** copies that fence. Links open only after normalization, and only for `http`, `https`, and `mailto`. Other schemes stay inert. HTML is literal text. Images are alt text and are never fetched. There is no webview. GPUI 0.2.2 does not select arbitrary text with the pointer, so prose and code blocks are copied from those buttons. The composer does keep its own selection. Loaded messages are all painted; there is no row recycling.
 
 The composer is a multiline editor anchored at the bottom. Enter sends. Shift+Enter inserts a line. Stop is available only while a turn is busy. Clarify and approval controls appear only when the server asks. Choices are the server’s list, with allow-once and deny as the approval fallback when the server sends no choices. An approval card is implemented; whether a live server shows one depends on that server’s policy. This document does not claim a live approval card has been observed.
 

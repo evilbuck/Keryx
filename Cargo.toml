@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
-gtk = { package = "gtk4", version = "0.10", features = ["v4_16"] }
+# Published GPUI 0.2.2 (crates.io, 2025-10-22). Same version number on Zed's
+# main branch has since diverged, so this pin stays on the registry snapshot
+# whose `Application::new` API matches https://gpui.rs/ and docs.rs/gpui/0.2.2.
+# Default features include the Linux Wayland and X11 windowing backends.
+gpui = "0.2.2"
 pulldown-cmark = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -20,3 +23,8 @@ dotenvy = "0.15"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# xattr 0.2.3 (via zed-async-tar / GPUI) names libc::ENOATTR, which libc 0.2.191
+# no longer exposes on Linux. This path patch maps that constant to ENODATA.
+[patch.crates-io]
+xattr = { path = "third_party/xattr" }
