@@ -1,49 +1,23 @@
 //! Native Markdown for chat transcripts.
 //!
-//! Call [`render`] on the GTK main thread after `gtk::init`. The returned
-//! widget does not retain the source; whole-message copy stays with the UI.
-//! Re-render the full source on each streaming update.
-//!
-//! Inline emphasis is Pango (`<b>`, `<i>`, `<s>`, `<tt>`, `<a>`), not CSS.
-//! Everything else is a theme widget with an `md-*` class. No colors are set
-//! here. Suggested `style.css` hooks:
-//!
-//! - `md-root` vertical transcript block (box spacing 6)
-//! - `md-p` paragraph, `md-h1`…`md-h6` headings, `md-html` literal HTML
-//! - `md-quote` block quote (start margin 12, spacing 4)
-//! - `md-list`, `md-list-ordered`, `md-list-unordered`, `md-item`,
-//!   `md-marker`, `md-item-body`, `md-task`
-//! - `md-rule` thematic break
-//! - `md-codeblock`, `md-code-header`, `md-code-lang`, `md-code-copy`,
-//!   `md-code-scroll`, `md-code-view`
-//! - `md-table-scroll`, `md-table`, `md-th`, `md-td`
+//! [`parse`] builds a block tree. The GPUI view paints that tree. Re-parse the
+//! full source on each streaming update. Inline emphasis is carried on the
+//! tree; `inline_markup` still produces the escaped Pango-like markup the
+//! safety tests assert against.
 //!
 //! Only `http`, `https`, and `mailto` links launch, and only after
 //! normalization. HTML is literal text. Images are alt text and never fetched.
 
-use gtk::accessible::{Property, Relation};
-use gtk::glib;
-use gtk::prelude::*;
 use pulldown_cmark::{
     Alignment, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
 };
 
+mod view;
+
+pub(crate) use view::column as render_markdown;
+
 const MAX_DEPTH: usize = 64;
 const MAX_HREF_LEN: usize = 8 * 1024;
-
-/// Build a selectable native widget for `source`.
-#[must_use]
-pub fn render(source: &str) -> gtk::Widget {
-    let blocks = parse(source);
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    root.add_css_class("md-root");
-    root.set_hexpand(true);
-    root.set_halign(gtk::Align::Fill);
-    root.set_valign(gtk::Align::Start);
-    root.set_can_focus(false);
-    render_blocks(&root, &blocks);
-    root.upcast()
-}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Inline {
@@ -699,12 +673,14 @@ fn write_plain(out: &mut String, inlines: &[Inline]) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn inline_markup(inlines: &[Inline]) -> String {
     let mut out = String::new();
     write_markup(&mut out, inlines);
     out
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_markup(out: &mut String, inlines: &[Inline]) {
     for inline in inlines {
         match inline {
@@ -748,6 +724,7 @@ fn write_markup(out: &mut String, inlines: &[Inline]) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn wrap_tag(out: &mut String, tag: &str, children: &[Inline]) {
     out.push('<');
     out.push_str(tag);
@@ -758,6 +735,7 @@ fn wrap_tag(out: &mut String, tag: &str, children: &[Inline]) {
     out.push('>');
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn push_escaped(out: &mut String, text: &str) {
     for ch in text.chars() {
         match ch {
@@ -772,368 +750,6 @@ fn push_escaped(out: &mut String, text: &str) {
             c => out.push(c),
         }
     }
-}
-
-fn render_blocks(parent: &gtk::Box, blocks: &[Block]) {
-    for block in blocks {
-        parent.append(&render_block(block));
-    }
-}
-
-fn render_block(block: &Block) -> gtk::Widget {
-    match block {
-        Block::Paragraph(inlines) => {
-            let label = prose_label(&inline_markup(inlines), &["md-p"]);
-            label.set_accessible_role(gtk::AccessibleRole::Paragraph);
-            label.upcast()
-        }
-        Block::Heading { level, inlines } => {
-            let class = match level {
-                1 => "md-h1",
-                2 => "md-h2",
-                3 => "md-h3",
-                4 => "md-h4",
-                5 => "md-h5",
-                _ => "md-h6",
-            };
-            let markup = format!("<b>{}</b>", inline_markup(inlines));
-            let label = prose_label(&markup, &[class]);
-            label.set_accessible_role(gtk::AccessibleRole::Heading);
-            label.update_property(&[Property::Level(i32::from(*level))]);
-            label.upcast()
-        }
-        Block::Quote(blocks) => {
-            let quote = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            quote.add_css_class("md-quote");
-            quote.set_accessible_role(gtk::AccessibleRole::BlockQuote);
-            quote.set_margin_start(12);
-            quote.set_hexpand(true);
-            quote.set_halign(gtk::Align::Fill);
-            render_blocks(&quote, blocks);
-            quote.upcast()
-        }
-        Block::List {
-            ordered,
-            start,
-            items,
-        } => render_list(*ordered, *start, items).upcast(),
-        Block::Code { language, code } => render_code(language, code).upcast(),
-        Block::Rule => {
-            let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
-            rule.add_css_class("md-rule");
-            rule.set_hexpand(true);
-            rule.set_margin_top(4);
-            rule.set_margin_bottom(4);
-            rule.upcast()
-        }
-        Block::Table {
-            aligns,
-            headers,
-            rows,
-        } => render_table(aligns, headers, rows).upcast(),
-        Block::Html(text) => {
-            let mut escaped = String::new();
-            push_escaped(&mut escaped, text);
-            let label = prose_label(&escaped, &["md-html"]);
-            label.set_accessible_role(gtk::AccessibleRole::Paragraph);
-            label.update_property(&[Property::Description("Literal HTML, not rendered")]);
-            label.upcast()
-        }
-    }
-}
-
-fn prose_label(markup: &str, classes: &[&str]) -> gtk::Label {
-    let label = gtk::Label::new(None);
-    label.set_use_markup(true);
-    label.set_markup(markup);
-    label.set_selectable(true);
-    label.set_wrap(true);
-    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
-    label.set_max_width_chars(72);
-    label.set_xalign(0.0);
-    label.set_halign(gtk::Align::Fill);
-    label.set_hexpand(true);
-    label.set_valign(gtk::Align::Start);
-    label.set_justify(gtk::Justification::Left);
-    label.set_accessible_role(gtk::AccessibleRole::Paragraph);
-    for class in classes {
-        label.add_css_class(class);
-    }
-    label.connect_activate_link(|label, uri| {
-        if let Some(safe) = safe_href(uri) {
-            let window = label.root().and_downcast::<gtk::Window>();
-            gtk::UriLauncher::new(&safe).launch(
-                window.as_ref(),
-                None::<&gtk::gio::Cancellable>,
-                |_| {},
-            );
-        }
-        glib::Propagation::Stop
-    });
-    label
-}
-
-fn render_list(ordered: bool, start: u64, items: &[ListItem]) -> gtk::Box {
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    list.add_css_class("md-list");
-    list.add_css_class(if ordered {
-        "md-list-ordered"
-    } else {
-        "md-list-unordered"
-    });
-    list.set_accessible_role(gtk::AccessibleRole::List);
-    list.set_hexpand(true);
-    list.set_halign(gtk::Align::Fill);
-    let count = i32::try_from(items.len()).unwrap_or(i32::MAX);
-    let mut number = start;
-    for (index, item) in items.iter().enumerate() {
-        let pos = i32::try_from(index).unwrap_or(i32::MAX).saturating_add(1);
-        list.append(&render_item(item, ordered, number, pos, count));
-        number = number.saturating_add(1);
-    }
-    list
-}
-
-fn render_item(item: &ListItem, ordered: bool, number: u64, pos: i32, count: i32) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    row.add_css_class("md-item");
-    row.set_accessible_role(gtk::AccessibleRole::ListItem);
-    row.update_relation(&[Relation::PosInSet(pos), Relation::SetSize(count)]);
-    row.set_hexpand(true);
-    row.set_halign(gtk::Align::Fill);
-    row.set_valign(gtk::Align::Start);
-
-    if let Some(checked) = item.task {
-        let check = gtk::CheckButton::new();
-        check.add_css_class("md-task");
-        check.set_active(checked);
-        check.set_can_target(false);
-        check.set_focusable(false);
-        check.set_halign(gtk::Align::Start);
-        check.set_valign(gtk::Align::Start);
-        check.set_margin_top(2);
-        let name = if checked {
-            "Completed task"
-        } else {
-            "Incomplete task"
-        };
-        check.update_property(&[Property::Label(name), Property::ReadOnly(true)]);
-        row.append(&check);
-    } else {
-        let marker_text = if ordered {
-            format!("{number}.")
-        } else {
-            "•".to_string()
-        };
-        let marker = gtk::Label::new(Some(&marker_text));
-        marker.add_css_class("md-marker");
-        marker.set_accessible_role(gtk::AccessibleRole::Presentation);
-        marker.set_selectable(false);
-        marker.set_halign(gtk::Align::Start);
-        marker.set_valign(gtk::Align::Start);
-        marker.set_xalign(1.0);
-        row.append(&marker);
-    }
-
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    body.add_css_class("md-item-body");
-    body.set_hexpand(true);
-    body.set_halign(gtk::Align::Fill);
-    render_blocks(&body, &item.blocks);
-    row.append(&body);
-    row
-}
-
-fn render_code(language: &str, code: &str) -> gtk::Box {
-    let block = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    block.add_css_class("md-codeblock");
-    block.set_hexpand(true);
-    block.set_halign(gtk::Align::Fill);
-    block.set_accessible_role(gtk::AccessibleRole::Group);
-    let accessible = code_accessible_name(language);
-    block.update_property(&[Property::Description(&accessible)]);
-
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    header.add_css_class("md-code-header");
-    header.set_hexpand(true);
-    if language.is_empty() {
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        header.append(&spacer);
-    } else {
-        let lang = gtk::Label::new(Some(language));
-        lang.add_css_class("md-code-lang");
-        lang.set_selectable(true);
-        lang.set_wrap(true);
-        lang.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        lang.set_max_width_chars(24);
-        lang.set_xalign(0.0);
-        lang.set_halign(gtk::Align::Start);
-        lang.set_hexpand(true);
-        header.append(&lang);
-    }
-
-    let copy = gtk::Button::with_label("Copy code");
-    copy.add_css_class("md-code-copy");
-    copy.add_css_class("flat");
-    copy.set_tooltip_text(Some("Copy code"));
-    copy.set_halign(gtk::Align::End);
-    copy.set_valign(gtk::Align::Center);
-    let copied = code.to_string();
-    copy.connect_clicked(move |button| {
-        button.clipboard().set_text(&copied);
-    });
-    header.append(&copy);
-    block.append(&header);
-
-    let view = gtk::TextView::new();
-    view.add_css_class("md-code-view");
-    view.set_editable(false);
-    view.set_cursor_visible(false);
-    view.set_monospace(true);
-    view.set_wrap_mode(gtk::WrapMode::None);
-    view.set_accepts_tab(false);
-    view.set_left_margin(8);
-    view.set_right_margin(8);
-    view.set_top_margin(6);
-    view.set_bottom_margin(6);
-    view.set_hexpand(true);
-    view.set_vexpand(false);
-    view.buffer().set_text(code);
-    view.update_property(&[Property::ReadOnly(true)]);
-
-    let scroll = horizontal_scroll(&view, "md-code-scroll");
-    block.append(&scroll);
-    block
-}
-
-fn code_accessible_name(language: &str) -> String {
-    if language.is_empty() {
-        "Code".to_string()
-    } else {
-        let lang: String = language.chars().take(64).collect();
-        format!("{lang} code")
-    }
-}
-
-fn render_table(
-    aligns: &[ColAlign],
-    headers: &[Vec<Vec<Inline>>],
-    rows: &[Vec<Vec<Inline>>],
-) -> gtk::ScrolledWindow {
-    let grid = gtk::Grid::new();
-    grid.add_css_class("md-table");
-    grid.set_accessible_role(gtk::AccessibleRole::Table);
-    grid.set_row_spacing(4);
-    grid.set_column_spacing(12);
-    grid.set_hexpand(true);
-    grid.set_halign(gtk::Align::Fill);
-    grid.set_vexpand(false);
-    grid.set_valign(gtk::Align::Start);
-    let cols = table_columns(aligns, headers, rows);
-    let row_count = i32::try_from(headers.len() + rows.len()).unwrap_or(i32::MAX);
-    let col_count = i32::try_from(cols).unwrap_or(i32::MAX);
-    grid.update_relation(&[Relation::RowCount(row_count), Relation::ColCount(col_count)]);
-
-    let mut row_index = 1i32;
-    for header in headers {
-        attach_row(&grid, header, aligns, cols, row_index, true);
-        row_index = row_index.saturating_add(1);
-    }
-    for row in rows {
-        attach_row(&grid, row, aligns, cols, row_index, false);
-        row_index = row_index.saturating_add(1);
-    }
-    horizontal_scroll(&grid, "md-table-scroll")
-}
-
-fn table_columns(
-    aligns: &[ColAlign],
-    headers: &[Vec<Vec<Inline>>],
-    rows: &[Vec<Vec<Inline>>],
-) -> usize {
-    let mut cols = aligns.len();
-    for row in headers.iter().chain(rows) {
-        cols = cols.max(row.len());
-    }
-    cols
-}
-
-fn attach_row(
-    grid: &gtk::Grid,
-    cells: &[Vec<Inline>],
-    aligns: &[ColAlign],
-    cols: usize,
-    row_index: i32,
-    header: bool,
-) {
-    for col in 0..cols {
-        let inlines = cells.get(col).map(Vec::as_slice).unwrap_or(&[]);
-        let align = aligns.get(col).copied().unwrap_or(ColAlign::Left);
-        let mut markup = inline_markup(inlines);
-        if header && !markup.is_empty() {
-            markup = format!("<b>{markup}</b>");
-        }
-        let label = prose_label(&markup, &[if header { "md-th" } else { "md-td" }]);
-        // GtkGrid, asked for an unconstrained height, sizes columns to each
-        // child's minimum width and then measures height at that width.
-        // A wrapping label's minimum width is about one character, so the
-        // row becomes a stack of glyphs. GtkScrolledWindow does not forward
-        // the real width unless the horizontal policy is NEVER
-        // (gtk_scrolled_window_measure, GTK 4.24), and a NEVER vertical
-        // policy adopts that stacked minimum. The transcript list uses the
-        // row minimum, so the frame is a tall blank box and follow-bottom
-        // hides the text above the viewport. Keep cells unwrapped: height
-        // is the hard-break line count, and wide text scrolls horizontally.
-        label.set_wrap(false);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::None);
-        label.set_width_chars(-1);
-        label.set_max_width_chars(-1);
-        label.set_vexpand(false);
-        label.set_valign(gtk::Align::Start);
-        label.set_accessible_role(if header {
-            gtk::AccessibleRole::ColumnHeader
-        } else {
-            gtk::AccessibleRole::Cell
-        });
-        apply_align(&label, align);
-        let column = i32::try_from(col).unwrap_or(i32::MAX).saturating_add(1);
-        label.update_relation(&[Relation::RowIndex(row_index), Relation::ColIndex(column)]);
-        grid.attach(&label, column - 1, row_index - 1, 1, 1);
-    }
-}
-
-fn apply_align(label: &gtk::Label, align: ColAlign) {
-    let (xalign, justify) = match align {
-        ColAlign::Left => (0.0, gtk::Justification::Left),
-        ColAlign::Center => (0.5, gtk::Justification::Center),
-        ColAlign::Right => (1.0, gtk::Justification::Right),
-    };
-    label.set_xalign(xalign);
-    label.set_justify(justify);
-}
-
-fn horizontal_scroll(child: &impl IsA<gtk::Widget>, class: &str) -> gtk::ScrolledWindow {
-    // Height must not depend on a width this window refuses to forward.
-    // Callers keep children width-independent (code does not wrap; table
-    // cells do not wrap) so the minimum height is the content height.
-    child.set_vexpand(false);
-    child.set_valign(gtk::Align::Start);
-    let scroll = gtk::ScrolledWindow::new();
-    scroll.add_css_class(class);
-    scroll.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
-    scroll.set_propagate_natural_width(false);
-    scroll.set_propagate_natural_height(true);
-    scroll.set_min_content_width(0);
-    scroll.set_min_content_height(0);
-    scroll.set_has_frame(true);
-    scroll.set_hexpand(true);
-    scroll.set_vexpand(false);
-    scroll.set_halign(gtk::Align::Fill);
-    scroll.set_valign(gtk::Align::Start);
-    scroll.set_child(Some(child));
-    scroll
 }
 
 #[cfg(test)]
