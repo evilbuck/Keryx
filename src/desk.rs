@@ -249,9 +249,9 @@ impl Desk {
     }
 
     pub fn reconnect(&mut self) {
-        self.give_back_held();
         self.state.notice.clear();
         self.state.disconnect();
+        self.give_back_held();
         self.pending_resumes.clear();
         self.model_pending = None;
         self.confirm = None;
@@ -548,11 +548,21 @@ impl Desk {
         true
     }
 
-    fn restore_attachments(&mut self, id: &str, attachments: Vec<StagedImage>) {
+    fn restore_attachments(&mut self, id: &str, attachments: Vec<StagedImage>) -> usize {
         let Some(chat) = self.state.conversations.get_mut(id) else {
-            return;
+            return attachments.len();
         };
-        merge_attachments(&mut chat.attachments, attachments);
+        merge_attachments(&mut chat.attachments, attachments)
+    }
+
+    fn note_dropped_files(&mut self, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        let note = format!(
+            " {dropped} attachment(s) stayed off the composer because it already holds {MAX_STAGED_IMAGES} files."
+        );
+        self.state.notice.push_str(&note);
     }
 
     fn hold_files(&mut self, stored_id: &str, files: Vec<StagedImage>) {
@@ -577,7 +587,8 @@ impl Desk {
             self.held_files = Some(held);
             return;
         }
-        self.restore_attachments(&held.stored_id, held.files);
+        let dropped = self.restore_attachments(&held.stored_id, held.files);
+        self.note_dropped_files(dropped);
     }
 
     fn release_held(&mut self, runtime_id: &str) {
@@ -1903,16 +1914,24 @@ fn is_timeline_event(event: &Event) -> bool {
     matches!(event, Event::Branched { .. } | Event::Undone { .. })
 }
 
-fn merge_attachments(current: &mut Vec<StagedImage>, held: Vec<StagedImage>) {
+fn merge_attachments(current: &mut Vec<StagedImage>, held: Vec<StagedImage>) -> usize {
+    let room = MAX_STAGED_IMAGES.saturating_sub(current.len());
     let present: Vec<u64> = current.iter().map(|file| file.id).collect();
-    let mut merged = Vec::new();
+    let mut restored = Vec::new();
+    let mut dropped = 0usize;
     for file in held {
-        if !present.contains(&file.id) {
-            merged.push(file);
+        if present.contains(&file.id) {
+            continue;
+        }
+        if restored.len() < room {
+            restored.push(file);
+        } else {
+            dropped += 1;
         }
     }
-    merged.extend(std::mem::take(current));
-    *current = merged;
+    restored.extend(std::mem::take(current));
+    *current = restored;
+    dropped
 }
 
 fn held_matches(state: &AppState, held: &HeldFiles, session_id: Option<&str>) -> bool {
@@ -2657,6 +2676,43 @@ mod tests {
             .map(|file| file.filename.as_str())
             .collect();
         assert_eq!(names, vec!["shot.png", "notes.txt"]);
+    }
+
+    fn plain_file(id: u64) -> StagedImage {
+        StagedImage {
+            id,
+            filename: format!("file-{id}.txt"),
+            mime_type: "text/plain".into(),
+            bytes: b"x".to_vec(),
+        }
+    }
+
+    #[test]
+    fn restore_keeps_the_six_file_cap_and_prefers_files_staged_during_upload() {
+        let mut desk = Desk::offline("");
+        desk.select_created = true;
+        desk.apply(created(None));
+        desk.held_files = Some(HeldFiles {
+            stored_id: "chat".into(),
+            files: vec![plain_file(1)],
+        });
+        desk.state
+            .conversations
+            .get_mut("chat")
+            .unwrap()
+            .attachments = (2..=7).map(plain_file).collect();
+        desk.apply(Event::Error {
+            operation: "submit".into(),
+            session_id: Some("rt".into()),
+            message: "upload failed".into(),
+        });
+        let ids: Vec<u64> = desk.state.conversations["chat"]
+            .attachments
+            .iter()
+            .map(|file| file.id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4, 5, 6, 7]);
+        assert!(desk.state.notice.contains("1 attachment"));
     }
 
     #[test]
