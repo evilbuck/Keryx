@@ -7,10 +7,13 @@ use hermes_native::ui::{self, Launch};
 
 fn main() -> ExitCode {
     match arguments() {
-        Ok(options) => {
-            ui::launch(options);
-            ExitCode::SUCCESS
-        }
+        Ok(options) => match ui::launch(options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        },
         Err(()) => ExitCode::FAILURE,
     }
 }
@@ -19,7 +22,21 @@ fn arguments() -> Result<Launch, ()> {
     dotenvy::from_path(".env").ok();
     let mut trusted_tunnel = false;
     let mut preview = false;
-    for argument in std::env::args().skip(1) {
+    let mut agent_socket = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        if let Some(path) = argument.strip_prefix("--agent-socket=") {
+            agent_socket = Some(socket_path(path)?);
+            continue;
+        }
+        if argument == "--agent-socket" {
+            let Some(path) = args.next() else {
+                eprintln!("--agent-socket requires a path.");
+                return Err(());
+            };
+            agent_socket = Some(socket_path(&path)?);
+            continue;
+        }
         if !known_argument(&argument, &mut trusted_tunnel, &mut preview) {
             eprintln!("Unknown argument. Use --help.");
             return Err(());
@@ -33,7 +50,16 @@ fn arguments() -> Result<Launch, ()> {
     Ok(Launch {
         config,
         preview_dir: preview.then(preview_dir),
+        agent_socket,
     })
+}
+
+fn socket_path(path: &str) -> Result<PathBuf, ()> {
+    if path.is_empty() || path.starts_with('-') {
+        eprintln!("--agent-socket requires a path.");
+        return Err(());
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn known_argument(argument: &str, trusted: &mut bool, preview: &mut bool) -> bool {
@@ -55,7 +81,7 @@ fn known_argument(argument: &str, trusted: &mut bool, preview: &mut bool) -> boo
 
 fn print_help() {
     println!(
-        "Hermes Native\n\nUsage: hermes-native [--trusted-tunnel] [--preview]\n\nSet HERMES_GATEWAY_URL, HERMES_USER and HERMES_PASSWORD in the environment or project .env.\n--trusted-tunnel allows HTTP only on loopback/Tailscale, inside an encrypted tunnel you trust.\n--preview starts a loopback gateway and walks the main views.\nCredentials stay in memory. Public HTTP and invalid TLS certificates are rejected."
+        "Hermes Native\n\nUsage: hermes-native [--trusted-tunnel] [--preview] [--agent-socket PATH]\n\nSet HERMES_GATEWAY_URL, HERMES_USER and HERMES_PASSWORD in the environment or project .env.\n--trusted-tunnel allows HTTP only on loopback/Tailscale, inside an encrypted tunnel you trust.\n--preview starts a loopback gateway and walks the main views.\n--agent-socket PATH turns on a private local control socket. It is off unless this option is set, and it is not a network listener.\nCredentials stay in memory. Public HTTP and invalid TLS certificates are rejected."
     );
 }
 
