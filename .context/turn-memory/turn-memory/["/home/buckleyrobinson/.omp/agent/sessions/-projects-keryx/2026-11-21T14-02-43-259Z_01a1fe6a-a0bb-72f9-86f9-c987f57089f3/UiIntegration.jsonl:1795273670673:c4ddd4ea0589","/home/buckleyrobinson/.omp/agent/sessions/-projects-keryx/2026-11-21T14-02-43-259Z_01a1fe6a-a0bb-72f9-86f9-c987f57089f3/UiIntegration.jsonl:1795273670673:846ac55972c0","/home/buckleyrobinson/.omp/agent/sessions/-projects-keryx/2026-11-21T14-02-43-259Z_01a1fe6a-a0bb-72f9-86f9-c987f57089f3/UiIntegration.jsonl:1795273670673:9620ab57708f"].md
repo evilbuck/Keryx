@@ -1,0 +1,1 @@
+{"durable_fact":"In GPUI 0.2.2, mouse events cannot be injected externally because `Window::dispatch_event` returns crate-private `DispatchEventResult`; key injection remains available through `Window::dispatch_keystroke`."}
