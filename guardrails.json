@@ -16,7 +16,7 @@
     "patch_coverage_min": 90
   },
   "ratchet": {
-    "baseline_coverage": 43.2,
+    "baseline_coverage": 53.3,
     "baseline_complexity_inventory": [],
     "complexity_baseline_file": ".guardrails/complexity-baseline.json",
     "baseline_lint_clean": true
