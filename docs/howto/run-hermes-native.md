@@ -6,7 +6,7 @@ You do not install or start a local Hermes. Startup loads `./.env` from the work
 
 ## Steps
 
-1. Install GTK 4 (4.16 or newer), libadwaita (1.6 or newer), `pkg-config`, and a C build toolchain. Rust 1.99.1 with GTK 4.24.1 and libadwaita 1.10.0 is the tested set. This repo does not declare a minimum supported Rust version.
+1. Install `g++`, `pkg-config`, `libwayland-dev`, `libxkbcommon-dev`, `libxkbcommon-x11-dev`, and `libxcb1-dev`. Running the window also needs `libvulkan1`, a Vulkan driver (`mesa-vulkan-drivers` for software rendering), `fontconfig` fonts, and a Wayland or X11 session. Rust 1.100.0 is the tested compiler. This repo does not declare a minimum supported Rust version. GPUI is crates.io `gpui` 0.2.2.
 2. From the project directory, create the configuration only if it does not already exist, then restrict its permissions:
 
    ```sh
@@ -29,6 +29,8 @@ You do not install or start a local Hermes. Startup loads `./.env` from the work
 
    Add `--trusted-tunnel` only when the URL is `http` on loopback or a Tailscale host (`*.ts.net`, 100.64.0.0/10, or `fd7a:115c:a1e0::/48`) and you have confirmed that hop is inside an encrypted tunnel you trust. Public HTTP is rejected. The flag does not turn off HTTPS certificate checks and does not accept other private-IP ranges.
 6. **Eat:** the window shows the session sidebar, the header reads **Connected**, and the composer hint is **Enter to send · Shift+Enter for a new line**.
+
+   `hermes-native --preview` skips the real gateway. It binds a loopback stub and walks the sidebar, a Markdown transcript, a live reply, the model picker, an approval card, and a read-only session. Screenshots of that walk can watch `/tmp/hermes-native-preview/phase` and acknowledge a phase by writing its name to `ack`.
 
 If the header reads **Not configured**, the three variables were empty or `.env` was not in this directory. **Authentication failed** means the remote rejected the password. **Disconnected** means the socket did not stay up; use the reconnect button. Nothing you already sent is replayed.
 
