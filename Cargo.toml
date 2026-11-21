@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Published GPUI 0.2.2 (crates.io, 2025-10-22). Same version number on Zed's
-# main branch has since diverged, so this pin stays on the registry snapshot
-# whose `Application::new` API matches https://gpui.rs/ and docs.rs/gpui/0.2.2.
+# Published GPUI 0.2.2 (crates.io, 2025-10-22), exactly pinned. Zed's main
+# branch still says 0.2.2 but has diverged, so this stays on the registry
+# snapshot whose Application::new API matches https://gpui.rs/ and
+# docs.rs/gpui/0.2.2. vendor/gpui is that snapshot with
+# DispatchEventResult made public so Window::dispatch_event is callable.
 # Default features include the Linux Wayland and X11 windowing backends.
-gpui = "0.2.2"
+gpui = "=0.2.2"
 pulldown-cmark = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
@@ -27,5 +29,9 @@ strip = "debuginfo"
 
 # xattr 0.2.3 (via zed-async-tar / GPUI) names libc::ENOATTR, which libc 0.2.191
 # no longer exposes on Linux. This path patch maps that constant to ENODATA.
+# gpui is the crates.io 0.2.2 snapshot with DispatchEventResult public. The
+# published method returns that crate-private type, so the call does not compile
+# from this crate without the patch.
 [patch.crates-io]
 xattr = { path = "third_party/xattr" }
+gpui = { path = "vendor/gpui" }

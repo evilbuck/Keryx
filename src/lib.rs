@@ -1,3 +1,4 @@
+pub mod automation;
 pub mod backend;
 pub mod desk;
 pub mod inspector;

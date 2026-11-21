@@ -699,6 +699,9 @@ impl Root {
         if mods.control || mods.alt || mods.shift || mods.platform {
             return false;
         }
+        if self.desk.state.active_draft().contains('\n') {
+            return false;
+        }
         let back = match key {
             "up" => true,
             "down" => false,
