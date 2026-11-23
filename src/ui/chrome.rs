@@ -321,12 +321,14 @@ pub fn workspace_button(root: &mut Root, cx: &mut Context<Root>) -> gpui::Statef
             cx.notify();
         }),
     )
+    .max_w_full()
+    .truncate()
 }
 
 pub fn inspector(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let tab = root.desk.state.inspector_tab;
     div()
-        .w(px(320.))
+        .w(px(super::INSPECTOR_WIDTH))
         .h_full()
         .flex()
         .flex_col()
@@ -913,6 +915,7 @@ impl Root {
             }
             PaletteAction::FocusFilter => {
                 self.sheet = Sheet::None;
+                self.desk.sidebar_open = true;
                 self.pending_focus = Some(Focus::Session);
             }
             PaletteAction::FindInTranscript => {

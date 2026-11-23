@@ -30,6 +30,9 @@ actions!(hermes, [NewConversation]);
 
 const APP_ID: &str = "io.github.hermes_native.Client";
 const WINDOW_TITLE: &str = "Hermes Native";
+const SIDEBAR_WIDTH: f32 = 280.;
+const INSPECTOR_WIDTH: f32 = 320.;
+const MIN_CHAT_WIDTH: f32 = 320.;
 
 pub struct Launch {
     pub config: Result<Config, String>,
@@ -153,6 +156,7 @@ impl Preview {
 
 pub struct Root {
     desk: Desk,
+    sidebar_was_open: bool,
     composer_focus: FocusHandle,
     search_focus: FocusHandle,
     clarify_focus: FocusHandle,
@@ -197,6 +201,7 @@ impl Root {
     ) -> Self {
         Self {
             desk: Desk::new(config),
+            sidebar_was_open: true,
             composer_focus: cx.focus_handle(),
             search_focus: cx.focus_handle(),
             clarify_focus: cx.focus_handle(),
@@ -268,10 +273,29 @@ impl Root {
 
     fn prepare(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         self.agent_window = Some(window.window_handle());
+        self.fit_side_panels(window);
         self.sync_cursor();
         self.claim_focus(window);
         self.sync_find_match();
         self.follow_transcript();
+    }
+
+    fn fit_side_panels(&mut self, window: &Window) {
+        let min_split_width = px(SIDEBAR_WIDTH + MIN_CHAT_WIDTH + INSPECTOR_WIDTH);
+        if window.viewport_size().width < min_split_width
+            && self.desk.sidebar_open
+            && self.desk.state.inspector_open
+        {
+            // A newly opened panel takes over from the one already visible.
+            self.desk.sidebar_open = !self.sidebar_was_open;
+            self.desk.state.inspector_open = self.sidebar_was_open;
+        }
+        self.sidebar_was_open = self.desk.sidebar_open;
+        if (!self.desk.sidebar_open && self.session_focus.is_focused(window))
+            || (!self.desk.state.inspector_open && self.side_focus.is_focused(window))
+        {
+            self.pending_focus.get_or_insert(Focus::Composer);
+        }
     }
 
     fn sync_cursor(&mut self) {
@@ -812,7 +836,7 @@ fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -
 
 fn sidebar(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
     div()
-        .w(px(280.))
+        .w(px(SIDEBAR_WIDTH))
         .h_full()
         .flex()
         .flex_col()
@@ -1278,12 +1302,14 @@ fn footer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>)
         .w_full()
         .max_w(px(900.))
         .mx_auto()
-        .child(interaction(root, cx))
+        .children(interaction(root, cx))
         .when(chrome::slash_open(root), |column| {
             column.child(chrome::slash_row(root, cx))
         })
         .child(chrome::attachment_row(root, cx))
-        .child(activity_row(controls, root.spin))
+        .when(controls.spinning || !controls.activity.is_empty(), |column| {
+            column.child(activity_row(controls, root.spin))
+        })
         .child(composer(root, controls, cx))
 }
 
@@ -1308,11 +1334,9 @@ fn spin_mark(spinning: bool, tick: u8) -> &'static str {
     }
 }
 
-fn interaction(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+fn interaction(root: &mut Root, cx: &mut Context<Root>) -> Option<gpui::Div> {
     root.desk.sync_questions();
-    let Some(kind) = interaction_kind(&root.desk) else {
-        return div();
-    };
+    let kind = interaction_kind(&root.desk)?;
     let mut panel = div()
         .flex()
         .flex_col()
@@ -1335,7 +1359,7 @@ fn interaction(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                 .child(root.desk.form_note.clone()),
         );
     }
-    panel
+    Some(panel)
 }
 
 fn interaction_kind(desk: &Desk) -> Option<InteractionKind> {
@@ -1541,6 +1565,7 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
             div()
                 .relative()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap(px(8.))
                 .child(model_trigger(root, controls, cx))
@@ -1626,6 +1651,7 @@ fn model_trigger(
         .id("model-trigger")
         .flex()
         .flex_col()
+        .max_w_full()
         .px(px(8.))
         .py(px(4.))
         .rounded(px(8.))
@@ -1646,12 +1672,14 @@ fn model_trigger(
         })
         .child(
             div()
+                .truncate()
                 .text_size(px(12.))
                 .font_weight(FontWeight(600.))
                 .child(caption),
         )
         .child(
             div()
+                .truncate()
                 .text_size(px(10.))
                 .text_color(rgb(0x9a9aa3))
                 .child(provider),
@@ -1675,33 +1703,40 @@ fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpu
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.))
                 .text_size(px(11.))
                 .text_color(rgb(0x8a8a92))
                 .child("Enter to send · Shift+Enter for a new line"),
         )
         .when(controls.stop_visible, |row| {
-            row.child(text_button(
-                "stop",
-                "Stop",
-                controls.stop_enabled,
-                false,
+            row.child(
+                text_button(
+                    "stop",
+                    "Stop",
+                    controls.stop_enabled,
+                    false,
+                    cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                        root.desk.stop();
+                        cx.notify();
+                    }),
+                )
+                .flex_shrink_0(),
+            )
+        })
+        .child(
+            text_button(
+                "send",
+                "Send",
+                controls.send,
+                true,
                 cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
-                    root.desk.stop();
+                    root.desk.submit();
+                    root.take_composer_follow();
                     cx.notify();
                 }),
-            ))
-        })
-        .child(text_button(
-            "send",
-            "Send",
-            controls.send,
-            true,
-            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
-                root.desk.submit();
-                root.take_composer_follow();
-                cx.notify();
-            }),
-        ))
+            )
+            .flex_shrink_0(),
+        )
 }
 
 fn rewind_button(

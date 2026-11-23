@@ -20,6 +20,8 @@ The sidebar lists server session metadata and offers **New conversation** (also 
 
 At narrow widths the header puts conversation tools on a second row, leaving connection status and Reconnect beside the title. Long titles truncate rather than pushing controls out of the window.
 
+The Conversations sidebar and Flight Deck can share the window only when at least 320 logical pixels remain for chat. In a narrower window, opening either panel closes the other. Composer tools wrap within the available width, and Commands → **Filter & search all conversations** opens the sidebar before focusing search.
+
 The transcript is one scrollable column. Each conversation message is painted from a per-block Markdown parse: headings, lists, links, code, and tables. Saved tool-result rows show the tool name when available, not their arguments or output. **Copy** copies the displayed message text (the summary for tool rows). **Copy code** copies that fence. Links open only after normalization, and only for `http`, `https`, and `mailto`. Other schemes stay inert. HTML is literal text. Images are alt text and are never fetched. There is no webview. GPUI 0.2.2 does not select arbitrary text with the pointer, so prose and code blocks are copied from those buttons. The composer does keep its own selection. Loaded messages are all painted; there is no row recycling.
 
 Find is available once a conversation is selected. A match moves its message into view; enter and shift-enter cycle through matches. Escape and Close return focus to the composer without changing the draft.
