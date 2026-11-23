@@ -634,7 +634,8 @@ impl gpui::Render for Root {
         self.prepare(window, cx);
         let controls = self.desk.controls();
         let connection = self.desk.connection();
-        shell(self, &controls, &connection, cx)
+        let compact_header = window.viewport_size().width < px(760.);
+        shell(self, &controls, &connection, compact_header, cx)
     }
 }
 
@@ -642,6 +643,7 @@ fn shell(
     root: &mut Root,
     controls: &present::Controls,
     connection: &present::ConnectionView,
+    compact_header: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -657,7 +659,7 @@ fn shell(
         .on_key_down(
             cx.listener(|root, event: &KeyDownEvent, window, cx| root.on_key(event, window, cx)),
         )
-        .child(header(root, controls, connection, cx))
+        .child(header(root, controls, connection, compact_header, cx))
         .child(body(root, controls, cx))
         .children(overlay(root, cx))
 }
@@ -666,19 +668,50 @@ fn header(
     root: &mut Root,
     controls: &present::Controls,
     connection: &present::ConnectionView,
+    compact: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Div {
-    div()
+    let sidebar = conversations_button(cx).flex_shrink_0();
+    let title = header_title(root, controls);
+    let tools = chrome::header_tools(root, cx).flex_shrink_0();
+    let status = connection_label(connection, controls.reconnect, cx).flex_shrink_0();
+    let bar = div()
         .flex()
-        .items_center()
-        .justify_between()
+        .flex_shrink_0()
         .px(px(16.))
-        .min_h(px(56.))
         .bg(rgb(0x1e1e24))
         .border_b_1()
-        .border_color(rgb(0x34343c))
-        .child(header_start(root, controls, cx))
-        .child(connection_label(connection, controls.reconnect, cx))
+        .border_color(rgb(0x34343c));
+    if compact {
+        return bar
+            .flex_col()
+            .gap(px(4.))
+            .py(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(title.flex_1())
+                    .child(status),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(sidebar)
+                    .child(tools),
+            );
+    }
+    bar.items_center()
+        .gap(px(12.))
+        .min_h(px(56.))
+        .child(sidebar)
+        .child(title)
+        .child(tools)
+        .child(div().flex_1())
+        .child(status)
 }
 
 fn lineage_caption(desk: &Desk) -> gpui::Div {
@@ -690,43 +723,38 @@ fn lineage_caption(desk: &Desk) -> gpui::Div {
         .map(|(_, title)| format!("Branched from {title}"))
         .unwrap_or_default();
     div()
+        .truncate()
         .text_size(px(11.))
         .text_color(rgb(0x9a9aa3))
         .child(text)
 }
 
-fn header_start(
-    root: &mut Root,
-    controls: &present::Controls,
-    cx: &mut Context<Root>,
-) -> gpui::Div {
+fn conversations_button(cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    text_button(
+        "toggle-sidebar",
+        "Conversations",
+        true,
+        false,
+        cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+            root.desk.toggle_sidebar();
+            cx.notify();
+        }),
+    )
+}
+
+fn header_title(root: &Root, controls: &present::Controls) -> gpui::Div {
     div()
         .flex()
-        .items_center()
-        .gap(px(12.))
-        .child(text_button(
-            "toggle-sidebar",
-            "Conversations",
-            true,
-            false,
-            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
-                root.desk.toggle_sidebar();
-                cx.notify();
-            }),
-        ))
+        .flex_col()
+        .min_w(px(0.))
         .child(
             div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(px(16.))
-                        .font_weight(FontWeight(700.))
-                        .child(controls.title.clone()),
-                )
-                .child(lineage_caption(&root.desk)),
+                .truncate()
+                .text_size(px(16.))
+                .font_weight(FontWeight(700.))
+                .child(controls.title.clone()),
         )
-        .child(chrome::header_tools(root, cx))
+        .child(lineage_caption(&root.desk))
 }
 
 fn connection_label(
