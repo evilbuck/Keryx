@@ -26,6 +26,8 @@ The composer is a multiline editor anchored at the bottom. Enter sends. Shift+En
 
 The composer's bottom-left trigger names the model and its provider, and opens a popover with a search field over the server's configured catalog. Rows keep provider and model together: the same model name under two providers is two rows, and a row whose name cannot be sent to the gateway (whitespace, or a leading `-`) is shown as unavailable instead of being silently rewritten. Search is local: it never sends a request and never selects anything. Hover does not commit; only an explicit row activation or Enter inside the search field does. Enter in the picker never submits the draft, and Escape returns focus to the editor.
 
+The popover is anchored above the model button and follows it when the layout changes. Clicking outside it dismisses it without blocking the clicked control. Clicking the model button again also dismisses it.
+
 The catalog is fetched once per connection with `explicit_only: true`, `include_unconfigured: false`, and `refresh: false`, and is dropped when the connection closes so a reconnect cannot show another connection's rows.
 
 A switch is `config.set` with `session_id`, `key: "model"`, and the value `<model> --provider <provider> --session`. `--session` is mandatory: without it the gateway may persist the choice as the profile default, and a reply whose `scope` is not `session` is treated as a refusal. A value with quoted tokens is rejected by the gateway's `split()` tokenizer, which is why unrepresentable catalog rows are disabled rather than quoted.

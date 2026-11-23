@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, FocusHandle, FontWeight, KeyBinding,
     KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PlatformInput, ScrollDelta, ScrollHandle, ScrollWheelEvent, TitlebarOptions, Window, WindowBounds,
-    WindowDecorations, WindowOptions, actions, div, point, prelude::*, px, rgb, size,
+    PlatformInput, ScrollDelta, ScrollHandle, ScrollWheelEvent, TitlebarOptions, Window,
+    WindowBounds, WindowDecorations, WindowOptions, actions, anchored, deferred, div, point,
+    prelude::*, px, rgb, size,
 };
 
 use crate::automation::{Automation, Request};
@@ -1588,6 +1589,7 @@ fn model_trigger(
     let provider = present::model_provider_line(&model, &root.desk.state.catalog);
     div()
         .id("model-trigger")
+        .relative()
         .flex()
         .flex_col()
         .px(px(8.))
@@ -1595,16 +1597,19 @@ fn model_trigger(
         .rounded(px(8.))
         .cursor_pointer()
         .opacity(if controls.model_enabled { 1. } else { 0.45 })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| {
-                root.desk.open_picker();
-                if root.desk.picker_open {
-                    root.search_focus.focus(window);
-                }
-                cx.notify();
-            }),
-        )
+        // When open, the picker's outside-click handler owns clicks on the trigger too.
+        .when(!root.desk.picker_open, |trigger| {
+            trigger.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                    root.desk.open_picker();
+                    if root.desk.picker_open {
+                        root.search_focus.focus(window);
+                    }
+                    cx.notify();
+                }),
+            )
+        })
         .child(
             div()
                 .text_size(px(12.))
@@ -1617,6 +1622,15 @@ fn model_trigger(
                 .text_color(rgb(0x9a9aa3))
                 .child(provider),
         )
+        .when(root.desk.picker_open, |trigger| {
+            trigger.child(deferred(
+                anchored()
+                    .anchor(gpui::Corner::BottomLeft)
+                    .offset(point(px(0.), px(-6.)))
+                    .snap_to_window()
+                    .child(picker(root, cx)),
+            ))
+        })
 }
 
 fn open_model(desk: &Desk) -> ModelState {
@@ -1699,9 +1713,6 @@ fn overlay(root: &mut Root, cx: &mut Context<Root>) -> Vec<gpui::AnyElement> {
         }
         chrome::Sheet::None => {}
     }
-    if root.desk.picker_open {
-        layers.push(picker(root, cx).into_any_element());
-    }
     if root.desk.confirm.is_some() {
         layers.push(confirm_dialog(root, cx));
     }
@@ -1717,9 +1728,14 @@ fn picker(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
         root.desk.picker_note.clone()
     };
     div()
-        .absolute()
-        .bottom(px(120.))
-        .left(px(24.))
+        .occlude()
+        .on_mouse_down_out(cx.listener(|root, _: &MouseDownEvent, window, cx| {
+            root.desk.close_picker();
+            if root.search_focus.is_focused(window) {
+                root.composer_focus.focus(window);
+            }
+            cx.notify();
+        }))
         .w(px(380.))
         .flex()
         .flex_col()

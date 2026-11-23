@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- The model picker opens above its button and closes when you click elsewhere in the window.
 - Multiline composer drafts keep arrow-key navigation instead of replacing the draft with prompt history.
 - Idle disconnects: after 30s of inbound silence the client now sends a WebSocket Ping, so healthy idle connections are no longer dropped by the 90s silence rule; only a link that stays silent despite probes is disconnected.
 - Reconnect stampedes: the automatic retry backoff now carries equal jitter (each attempt lands in the second half of its scheduled delay, sampled from the clock), so clients dropped by the same gateway restart retry over a spread instead of all hitting the gateway on the same instant.
