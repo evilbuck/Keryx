@@ -33,7 +33,7 @@ const WINDOW_TITLE: &str = "Hermes Native";
 const SIDEBAR_WIDTH: f32 = 280.;
 const INSPECTOR_WIDTH: f32 = 320.;
 const MIN_CHAT_WIDTH: f32 = 320.;
-const COMPACT_FIND_HEIGHT: f32 = 560.;
+const COMPACT_FOOTER_HEIGHT: f32 = 560.;
 
 pub struct Launch {
     pub config: Result<Config, String>,
@@ -159,6 +159,7 @@ pub struct Root {
     desk: Desk,
     sidebar_was_open: bool,
     composer_focus: FocusHandle,
+    turn_controls_focus: FocusHandle,
     search_focus: FocusHandle,
     clarify_focus: FocusHandle,
     session_focus: FocusHandle,
@@ -206,6 +207,7 @@ impl Root {
             desk: Desk::new(config),
             sidebar_was_open: true,
             composer_focus: cx.focus_handle(),
+            turn_controls_focus: cx.focus_handle(),
             search_focus: cx.focus_handle(),
             clarify_focus: cx.focus_handle(),
             session_focus: cx.focus_handle(),
@@ -281,8 +283,27 @@ impl Root {
         self.fit_side_panels(window);
         self.sync_cursor();
         self.claim_focus(window);
+        self.sync_turn_focus(window);
         self.sync_find_match();
         self.follow_transcript();
+    }
+
+    fn sync_turn_focus(&mut self, window: &mut Window) {
+        if self.compact_turn_controls(window) {
+            if self.composer_focus.is_focused(window) || self.search_focus.is_focused(window) {
+                self.desk.close_picker();
+                self.turn_controls_focus.focus(window);
+            }
+        } else if self.turn_controls_focus.is_focused(window)
+            || (open_interaction(&self.desk).is_none() && self.clarify_focus.is_focused(window))
+        {
+            self.composer_focus.focus(window);
+        }
+    }
+
+    fn compact_turn_controls(&self, window: &Window) -> bool {
+        window.viewport_size().height < px(COMPACT_FOOTER_HEIGHT)
+            && open_interaction(&self.desk).is_some()
     }
 
     fn fit_side_panels(&mut self, window: &Window) {
@@ -673,10 +694,11 @@ impl gpui::Render for Root {
         let connection = self.desk.connection();
         let viewport = window.viewport_size();
         let compact_header = viewport.width < px(760.);
-        let compact_find = viewport.height < px(COMPACT_FIND_HEIGHT)
-            && self.desk.state.transcript_find.open
-            && self.find_focus.is_focused(window);
-        shell(self, &controls, &connection, compact_header, compact_find, cx)
+        let find_focused =
+            self.desk.state.transcript_find.open && self.find_focus.is_focused(window);
+        let compact_footer = self.compact_turn_controls(window)
+            || (viewport.height < px(COMPACT_FOOTER_HEIGHT) && find_focused);
+        shell(self, &controls, &connection, compact_header, compact_footer, cx)
     }
 }
 
@@ -685,7 +707,7 @@ fn shell(
     controls: &present::Controls,
     connection: &present::ConnectionView,
     compact_header: bool,
-    compact_find: bool,
+    compact_footer: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -702,7 +724,15 @@ fn shell(
             cx.listener(|root, event: &KeyDownEvent, window, cx| root.on_key(event, window, cx)),
         )
         .child(header(root, controls, connection, compact_header, cx))
-        .child(body(root, controls, compact_find, cx))
+        .child(body(root, controls, compact_footer, cx))
+        // Keep a keyboard target mounted while the editor is temporarily absent.
+        .child(
+            div()
+                .id("turn-controls-focus")
+                .absolute()
+                .size(px(0.))
+                .track_focus(&root.turn_controls_focus),
+        )
         .children(overlay(root, cx))
 }
 
@@ -837,7 +867,7 @@ fn tone_color(tone: Tone) -> gpui::Rgba {
 fn body(
     root: &mut Root,
     controls: &present::Controls,
-    compact_find: bool,
+    compact_footer: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Div {
     div()
@@ -849,7 +879,7 @@ fn body(
             row.child(sidebar(root, controls, cx))
         })
         .child(
-            main_column(root, controls, compact_find, cx)
+            main_column(root, controls, compact_footer, cx)
                 .flex_1()
                 .min_w(px(0.)),
         )
@@ -1041,7 +1071,7 @@ fn session_row(
 fn main_column(
     root: &mut Root,
     controls: &present::Controls,
-    compact_find: bool,
+    compact_footer: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Div {
     div()
@@ -1057,14 +1087,26 @@ fn main_column(
         })
         .child(history_bar(controls, cx))
         .child(transcript(root, controls, cx).flex_1())
-        .when(!compact_find, |column| column.child(footer(root, controls, cx)))
-        .when(compact_find, |column| {
+        .when(!compact_footer, |column| column.child(footer(root, controls, cx)))
+        .when(compact_footer, |column| {
             column
-                .children(interaction(root, cx))
+                .when_some(interaction(root, cx), |column, panel| {
+                    column.child(
+                        div()
+                            .id("compact-interaction")
+                            .min_h(px(0.))
+                            .max_h(px(208.))
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .child(panel.flex_shrink_0()),
+                    )
+                })
                 .when(controls.stop_visible, |column| {
                     column.child(
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .justify_end()
                             .p(px(12.))
                             .child(stop_button(controls, cx)),
@@ -2725,6 +2767,8 @@ impl Root {
     fn focused_name(&self, window: &Window) -> &'static str {
         if self.composer_focus.is_focused(window) {
             "composer"
+        } else if self.turn_controls_focus.is_focused(window) {
+            "turn-controls"
         } else if self.search_focus.is_focused(window) {
             "search"
         } else if self.find_focus.is_focused(window) {
