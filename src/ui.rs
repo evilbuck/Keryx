@@ -1643,9 +1643,9 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
         .flex_col()
         .gap(px(8.))
         .p(px(10.))
-        .rounded(px(14.))
-        .border_1()
         .border_color(rgb(0x3a3a42))
+        .track_focus(&root.composer_focus)
+        .focus(|style| style.border_color(rgb(0x6f8cff)))
         .bg(rgb(0x1c1c22))
         .child(composer_input(root, controls, cx))
         .child(

@@ -11,6 +11,8 @@
 
 ### Fixed
 
+- The chat composer now highlights its border while focused.
+
 - Shortcut chords no longer type letters into the find bar, session search, and side-ask fields: Ctrl/Alt/Cmd-modified keys (e.g. Ctrl+V) were being inserted as literal characters ("v") into the query text.
 - Slash suggestion menu state: every draft edit (including backspace and delete, not just typed characters) now resets the selection to the top; a menu dismissed with Escape stays dismissed while the draft still holds the slash token instead of popping back open on the next keystroke; and a stale selection index is clamped when the candidate list shrinks, so the highlighted row and Enter acceptance no longer silently die.
 - The model picker opens above its button, stays clear of the conversation drawer in narrow windows, and closes when you click elsewhere.
