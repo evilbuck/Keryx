@@ -175,6 +175,8 @@ pub struct Root {
     revealed_find_match: Option<usize>,
     answer_qid: Option<String>,
     transcript: ScrollHandle,
+    draft_scroll: ScrollHandle,
+    reveal_draft_caret: bool,
     cursor: usize,
     anchor: usize,
     seen_generation: u64,
@@ -220,6 +222,8 @@ impl Root {
             revealed_find_match: None,
             answer_qid: None,
             transcript: ScrollHandle::new(),
+            draft_scroll: ScrollHandle::new(),
+            reveal_draft_caret: false,
             cursor: 0,
             anchor: 0,
             seen_generation: 0,
@@ -306,6 +310,7 @@ impl Root {
         let len = self.desk.draft().len();
         self.cursor = len;
         self.anchor = len;
+        self.reveal_draft_caret = true;
     }
 
     fn claim_focus(&mut self, window: &mut Window) {
@@ -528,6 +533,7 @@ impl Root {
         };
         self.anchor = anchor;
         self.cursor = cursor;
+        self.reveal_draft_caret = true;
         true
     }
 
@@ -622,12 +628,14 @@ impl Root {
         next.push_str(&draft[end..]);
         self.cursor = start + extra.len();
         self.anchor = self.cursor;
+        self.reveal_draft_caret = true;
         self.desk.set_draft(next);
     }
 
     fn select_all(&mut self) {
         self.anchor = 0;
         self.cursor = self.desk.draft().len();
+        self.reveal_draft_caret = true;
     }
 
     fn copy_selection(&self, cx: &mut Context<Self>) {
@@ -1155,7 +1163,7 @@ fn message_column(
         .flex()
         .flex_col()
         .gap(px(12.))
-        .p(px(24.));
+        .px(px(24.));
     let active = root
         .jump_to
         .or_else(|| root.desk.state.transcript_find.active_message_index());
@@ -1165,7 +1173,9 @@ fn message_column(
                 .flex_shrink_0()
                 .w_full()
                 .max_w(px(812.))
-                .mx_auto(),
+                .mx_auto()
+                .when(index == 0, |card| card.mt(px(24.)))
+                .when(index + 1 == messages.len(), |card| card.mb(px(24.))),
         );
     }
     column
@@ -1597,6 +1607,12 @@ fn composer_input(
     div()
         .id("composer")
         .min_h(px(60.))
+        .max_h(px(128.))
+        .flex()
+        .flex_col()
+        .overflow_y_scroll()
+        .track_scroll(&root.draft_scroll)
+        .pr(px(2.))
         .track_focus(&root.composer_focus)
         .on_mouse_down(
             MouseButton::Left,
@@ -1608,7 +1624,8 @@ fn composer_input(
         .child(composer_text(root, controls.readonly.is_some()))
 }
 
-fn composer_text(root: &Root, read_only: bool) -> gpui::Div {
+fn composer_text(root: &mut Root, read_only: bool) -> gpui::Div {
+    let reveal = std::mem::take(&mut root.reveal_draft_caret);
     let draft = root.desk.draft();
     if draft.is_empty() {
         return div().text_color(rgb(0x8a8a92)).child(if read_only {
@@ -1618,25 +1635,69 @@ fn composer_text(root: &Root, read_only: bool) -> gpui::Div {
         });
     }
     let (start, end) = selection_of(&draft, root.anchor, root.cursor);
-    if start != end {
-        return selected_text(&draft, start, end);
-    }
     let cursor = floor_boundary(&draft, root.cursor.min(draft.len()));
+    let mut text = gpui::StyledText::new(draft);
+    if start != end {
+        let selection = gpui::HighlightStyle {
+            background_color: Some(rgb(0x3d7eff).into()),
+            ..Default::default()
+        };
+        text = text.with_highlights([(start..end, selection)]);
+    }
+    let caret = composer_caret(
+        text.layout().clone(),
+        cursor,
+        start == end,
+        reveal.then(|| root.draft_scroll.clone()),
+    );
     div()
-        .flex()
-        .flex_wrap()
-        .child(draft[..cursor].to_string())
-        .child(div().w(px(1.)).h(px(18.)).bg(rgb(0xffffff)))
-        .child(draft[cursor..].to_string())
+        .relative()
+        .w_full()
+        .flex_shrink_0()
+        .child(text)
+        .child(caret)
 }
 
-fn selected_text(draft: &str, start: usize, end: usize) -> gpui::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .child(draft[..start].to_string())
-        .child(div().bg(rgb(0x3d7eff)).child(draft[start..end].to_string()))
-        .child(draft[end..].to_string())
+fn composer_caret(
+    layout: gpui::TextLayout,
+    cursor: usize,
+    visible: bool,
+    scroll: Option<ScrollHandle>,
+) -> impl IntoElement {
+    canvas(
+        move |_, window, _| {
+            let origin = layout.position_for_index(cursor)?;
+            let caret = Bounds::new(origin, size(px(1.), layout.line_height()));
+            if let Some(scroll) = scroll {
+                reveal_caret(scroll, caret, window);
+            }
+            visible.then_some(caret)
+        },
+        |_, caret, window, _| {
+            if let Some(caret) = caret {
+                window.paint_quad(gpui::fill(caret, rgb(0xffffff)));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+fn reveal_caret(scroll: ScrollHandle, caret: Bounds<gpui::Pixels>, window: &Window) {
+    let viewport = scroll.bounds();
+    let dy = if caret.top() < viewport.top() {
+        viewport.top() - caret.top()
+    } else {
+        (viewport.bottom() - caret.bottom()).min(px(0.))
+    };
+    if dy != px(0.) {
+        let offset = scroll.offset() + point(px(0.), dy);
+        // Child positions have already been laid out with this frame's scroll offset.
+        window.on_next_frame(move |window, _| {
+            scroll.set_offset(offset);
+            window.refresh();
+        });
+    }
 }
 
 fn model_trigger(
@@ -2120,31 +2181,26 @@ fn line_end(text: &str, cursor: usize) -> usize {
 }
 
 fn move_vertical(text: &str, cursor: usize, down: bool) -> usize {
+    let cursor = floor_boundary(text, cursor.min(text.len()));
     let start = line_start(text, cursor);
-    let end = line_end(text, cursor);
-    let column = cursor.saturating_sub(start);
-    if down {
-        return lower_line(text, end, column);
-    }
-    upper_line(text, start, column)
-}
-
-fn lower_line(text: &str, end: usize, column: usize) -> usize {
-    if end >= text.len() {
-        return text.len();
-    }
-    let next_start = end + 1;
-    let next_end = line_end(text, next_start);
-    next_start + column.min(next_end.saturating_sub(next_start))
-}
-
-fn upper_line(text: &str, start: usize, column: usize) -> usize {
-    if start == 0 {
-        return 0;
-    }
-    let prev_end = start - 1;
-    let prev_start = line_start(text, prev_end);
-    prev_start + column.min(prev_end.saturating_sub(prev_start))
+    let target = if down {
+        let end = line_end(text, cursor);
+        if end == text.len() {
+            return end;
+        }
+        end + 1
+    } else {
+        if start == 0 {
+            return 0;
+        }
+        line_start(text, start - 1)
+    };
+    let end = line_end(text, target);
+    let column = text[start..cursor].chars().count();
+    text[target..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(byte, _)| target + byte)
 }
 
 impl Root {
@@ -3962,6 +4018,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn vertical_caret_keeps_character_columns_across_utf8_lines() {
+        assert_eq!(caret_move("a\né", 1, 1, "down", false), Some((4, 4)));
+        assert_eq!(caret_move("éx\nabc", 2, 2, "down", false), Some((5, 5)));
+        assert_eq!(caret_move("éx\nabc", 5, 5, "up", true), Some((5, 2)));
+    }
 
     struct UnlinkPark {
         entered: mpsc::Sender<()>,

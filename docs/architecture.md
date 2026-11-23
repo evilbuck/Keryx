@@ -28,6 +28,8 @@ Find is available once a conversation is selected. A match moves its message int
 
 The composer is a multiline editor anchored at the bottom. Enter sends. Shift+Enter inserts a line. Stop is available only while a turn is busy. Clarify and approval controls appear only when the server asks. Choices are the server’s list, with allow-once and deny as the approval fallback when the server sends no choices. An approval card is implemented; whether a live server shows one depends on that server’s policy. This document does not claim a live approval card has been observed.
 
+Long drafts scroll inside the editor instead of growing over Send. Keyboard edits and movement keep the caret in view; Up and Down preserve the character column across logical lines, including UTF-8 text.
+
 The command palette and workspace chooser keep their Close button outside the scrolling list. Up and Down keep the highlighted result visible. Escape or Close dismisses the sheet and returns focus to the composer without changing its draft.
 
 ## Model picker
