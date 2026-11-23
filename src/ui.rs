@@ -33,6 +33,7 @@ const WINDOW_TITLE: &str = "Hermes Native";
 const SIDEBAR_WIDTH: f32 = 280.;
 const INSPECTOR_WIDTH: f32 = 320.;
 const MIN_CHAT_WIDTH: f32 = 320.;
+const COMPACT_FIND_HEIGHT: f32 = 560.;
 
 pub struct Launch {
     pub config: Result<Config, String>,
@@ -578,6 +579,7 @@ impl Root {
                     self.sheet_text = query;
                 }
             }
+            Some(crate::desk::ComposerFollow::Find) => self.focus_find(),
             None => {}
         }
     }
@@ -669,8 +671,12 @@ impl gpui::Render for Root {
         self.prepare(window, cx);
         let controls = self.desk.controls();
         let connection = self.desk.connection();
-        let compact_header = window.viewport_size().width < px(760.);
-        shell(self, &controls, &connection, compact_header, cx)
+        let viewport = window.viewport_size();
+        let compact_header = viewport.width < px(760.);
+        let compact_find = viewport.height < px(COMPACT_FIND_HEIGHT)
+            && self.desk.state.transcript_find.open
+            && self.find_focus.is_focused(window);
+        shell(self, &controls, &connection, compact_header, compact_find, cx)
     }
 }
 
@@ -679,6 +685,7 @@ fn shell(
     controls: &present::Controls,
     connection: &present::ConnectionView,
     compact_header: bool,
+    compact_find: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -695,7 +702,7 @@ fn shell(
             cx.listener(|root, event: &KeyDownEvent, window, cx| root.on_key(event, window, cx)),
         )
         .child(header(root, controls, connection, compact_header, cx))
-        .child(body(root, controls, cx))
+        .child(body(root, controls, compact_find, cx))
         .children(overlay(root, cx))
 }
 
@@ -827,7 +834,12 @@ fn tone_color(tone: Tone) -> gpui::Rgba {
     }
 }
 
-fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+fn body(
+    root: &mut Root,
+    controls: &present::Controls,
+    compact_find: bool,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
     div()
         .flex()
         .flex_1()
@@ -836,7 +848,11 @@ fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -
         .when(root.desk.sidebar_open, |row| {
             row.child(sidebar(root, controls, cx))
         })
-        .child(main_column(root, controls, cx).flex_1().min_w(px(0.)))
+        .child(
+            main_column(root, controls, compact_find, cx)
+                .flex_1()
+                .min_w(px(0.)),
+        )
         .when(root.desk.state.inspector_open, |row| {
             row.child(chrome::inspector(root, cx))
         })
@@ -1022,7 +1038,12 @@ fn session_row(
     row
 }
 
-fn main_column(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+fn main_column(
+    root: &mut Root,
+    controls: &present::Controls,
+    compact_find: bool,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -1036,7 +1057,20 @@ fn main_column(root: &mut Root, controls: &present::Controls, cx: &mut Context<R
         })
         .child(history_bar(controls, cx))
         .child(transcript(root, controls, cx).flex_1())
-        .child(footer(root, controls, cx))
+        .when(!compact_find, |column| column.child(footer(root, controls, cx)))
+        .when(compact_find, |column| {
+            column
+                .children(interaction(root, cx))
+                .when(controls.stop_visible, |column| {
+                    column.child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .p(px(12.))
+                            .child(stop_button(controls, cx)),
+                    )
+                })
+        })
 }
 
 fn notice(text: &str) -> gpui::Div {
@@ -1769,21 +1803,7 @@ fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpu
                 .text_color(rgb(0x8a8a92))
                 .child("Enter to send · Shift+Enter for a new line"),
         )
-        .when(controls.stop_visible, |row| {
-            row.child(
-                text_button(
-                    "stop",
-                    "Stop",
-                    controls.stop_enabled,
-                    false,
-                    cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
-                        root.desk.stop();
-                        cx.notify();
-                    }),
-                )
-                .flex_shrink_0(),
-            )
-        })
+        .when(controls.stop_visible, |row| row.child(stop_button(controls, cx)))
         .child(
             text_button(
                 "send",
@@ -1798,6 +1818,20 @@ fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpu
             )
             .flex_shrink_0(),
         )
+}
+
+fn stop_button(controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    text_button(
+        "stop",
+        "Stop",
+        controls.stop_enabled,
+        false,
+        cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+            root.desk.stop();
+            cx.notify();
+        }),
+    )
+    .flex_shrink_0()
 }
 
 fn rewind_button(

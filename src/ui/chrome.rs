@@ -743,8 +743,14 @@ impl Root {
 
     fn open_find_chord(&mut self) {
         if self.desk.open_find(None) {
-            self.pending_focus = Some(Focus::Find);
+            self.focus_find();
         }
+    }
+
+    pub(super) fn focus_find(&mut self) {
+        self.sheet = Sheet::None;
+        self.desk.close_picker();
+        self.pending_focus = Some(Focus::Find);
     }
 
     pub(super) fn try_recall(&mut self, key: &str, mods: &gpui::Modifiers) -> bool {
@@ -918,10 +924,7 @@ impl Root {
                 self.desk.sidebar_open = true;
                 self.pending_focus = Some(Focus::Session);
             }
-            PaletteAction::FindInTranscript => {
-                self.close_sheet();
-                self.open_find_chord();
-            }
+            PaletteAction::FindInTranscript => self.open_find_chord(),
             other => {
                 self.desk.run_palette(other);
                 self.close_sheet();
