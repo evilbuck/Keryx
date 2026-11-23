@@ -27,16 +27,24 @@ pub enum Sheet {
     Workspace,
 }
 
-pub fn header_tools(_root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+const PALETTE_ROWS: usize = 12;
+const WORKSPACE_ROWS: usize = 8;
+
+pub fn header_tools(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     div()
         .flex()
         .items_center()
         .gap(px(8.))
-        .child(tool_button("find-chat", "Find", cx, |root, _, cx| {
-            root.desk.open_find(None);
-            root.pending_focus = Some(Focus::Find);
-            cx.notify();
-        }))
+        .child(text_button(
+            "find-chat",
+            "Find",
+            root.desk.state.selected.is_some(),
+            false,
+            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                root.open_find_chord();
+                cx.notify();
+            }),
+        ))
         .child(tool_button("palette", "Commands", cx, |root, _, cx| {
             root.toggle_palette();
             cx.notify();
@@ -184,6 +192,8 @@ pub fn find_bar(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
             div()
                 .id("find-query")
                 .flex_1()
+                .min_w(px(0.))
+                .truncate()
                 .track_focus(&root.find_focus)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -201,26 +211,28 @@ pub fn find_bar(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                 .child(count),
         )
         .child(tool_button("find-prev", "Prev", cx, |root, _, cx| {
-            root.desk.step_find(-1);
+            root.move_find_match(-1);
             cx.notify();
         }))
         .child(tool_button("find-next", "Next", cx, |root, _, cx| {
-            root.desk.step_find(1);
+            root.move_find_match(1);
             cx.notify();
         }))
         .child(tool_button("find-close", "Close", cx, |root, _, cx| {
-            root.desk.close_find();
+            root.close_find();
             cx.notify();
         }))
 }
 
 pub fn slash_row(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+    let candidates = slash_candidates(root);
+    let selected_index = slash_selection(root.slash_index, candidates.len());
     let mut row = div().flex().flex_col().gap(px(4.));
-    for (index, candidate) in slash_candidates(root).into_iter().enumerate() {
+    for (index, candidate) in candidates.into_iter().enumerate() {
         let token = candidate.token.clone();
         let insert = candidate.insert_text.clone();
         let execute = candidate.zero_arg_execute;
-        let selected = index == root.slash_index;
+        let selected = index == selected_index;
         row = row.child(
             div()
                 .id(SharedString::new(format!("slash-{token}")))
@@ -244,6 +256,22 @@ pub fn slash_row(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
         );
     }
     row
+}
+
+/// Selection state for the slash suggestion menu after the draft is edited.
+///
+/// Every edit restarts the selection at the top. A menu dismissed with Escape
+/// stays hidden while the draft still holds a slash token; removing the token
+/// re-arms the menu.
+pub(super) fn slash_state_after_edit(hidden: bool, next_draft: &str) -> (usize, bool) {
+    let hidden = hidden && crate::studio::active_slash_prefix(next_draft).is_some();
+    (0, hidden)
+}
+
+/// Clamps the slash selection so a shrunk candidate list still highlights a
+/// row and Enter accepts it.
+pub(super) fn slash_selection(index: usize, count: usize) -> usize {
+    index.min(count.saturating_sub(1))
 }
 
 pub fn slash_open(root: &Root) -> bool {
@@ -311,12 +339,14 @@ pub fn workspace_button(root: &mut Root, cx: &mut Context<Root>) -> gpui::Statef
             cx.notify();
         }),
     )
+    .max_w_full()
+    .truncate()
 }
 
 pub fn inspector(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let tab = root.desk.state.inspector_tab;
     div()
-        .w(px(320.))
+        .w(px(super::INSPECTOR_WIDTH))
         .h_full()
         .flex()
         .flex_col()
@@ -511,6 +541,7 @@ fn outline_row(entry: crate::model::OutlineEntry, cx: &mut Context<Root>) -> gpu
             false,
             cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
                 root.jump_to = Some(index);
+                root.scroll_to_message(index);
                 cx.notify();
             }),
         ))
@@ -528,8 +559,8 @@ fn outline_row(entry: crate::model::OutlineEntry, cx: &mut Context<Root>) -> gpu
 
 pub fn palette(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let entries = build_palette_entries(&root.desk.state, &root.sheet_text, now_epoch_secs());
-    let mut list = div().flex().flex_col().gap(px(4.));
-    for (index, entry) in entries.iter().take(12).enumerate() {
+    let mut list = sheet_list(root);
+    for (index, entry) in entries.iter().take(PALETTE_ROWS).enumerate() {
         let action = entry.action.clone();
         let selected = index == root.sheet_index;
         list = list.child(
@@ -548,6 +579,7 @@ pub fn palette(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                     MouseButton::Left,
                     cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
                         root.activate_palette(action.clone(), cx);
+                        cx.notify();
                     }),
                 )
                 .child(entry.title.clone())
@@ -579,9 +611,20 @@ pub fn text_sheet(
         .py(px(6.))
         .rounded(px(8.))
         .bg(rgb(0x2c2c34))
-        .track_focus(&root.sheet_focus)
+        .min_h(px(0.))
         .child(text);
     sheet_frame(root, title, body, cx)
+}
+
+fn sheet_list(root: &Root) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("sheet-list")
+        .min_h(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .overflow_y_scroll()
+        .track_scroll(&root.sheet_scroll)
 }
 
 fn sheet_frame(
@@ -590,12 +633,12 @@ fn sheet_frame(
     body: impl IntoElement,
     cx: &mut Context<Root>,
 ) -> gpui::Div {
-    let _ = root;
-    div()
-        .absolute()
-        .top(px(80.))
-        .left(px(280.))
-        .w(px(460.))
+    let panel = div()
+        .id("sheet")
+        .track_focus(&root.sheet_focus)
+        .w_full()
+        .max_w(px(460.))
+        .max_h_full()
         .flex()
         .flex_col()
         .gap(px(8.))
@@ -604,18 +647,38 @@ fn sheet_frame(
         .bg(rgb(0x24242c))
         .border_1()
         .border_color(rgb(0x3a3a42))
-        .child(div().font_weight(FontWeight(700.)).child(title.to_string()))
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_weight(FontWeight(700.))
+                .child(title.to_string()),
+        )
         .child(body)
-        .child(tool_button("sheet-close", "Close", cx, |root, _, cx| {
-            root.sheet = Sheet::None;
-            cx.notify();
-        }))
+        .child(div().flex_shrink_0().child(tool_button(
+            "sheet-close",
+            "Close",
+            cx,
+            |root, _, cx| {
+                root.close_sheet();
+                cx.notify();
+            },
+        )));
+    div()
+        .absolute()
+        .top(px(80.))
+        .bottom(px(12.))
+        .left(px(12.))
+        .right(px(12.))
+        .flex()
+        .justify_center()
+        .items_start()
+        .child(panel)
 }
 
 pub fn workspace_sheet(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let options = root.desk.state.workspaces.search(&root.sheet_text);
-    let mut list = div().flex().flex_col().gap(px(4.));
-    for (index, option_index) in options.iter().take(8).enumerate() {
+    let mut list = sheet_list(root);
+    for (index, option_index) in options.iter().take(WORKSPACE_ROWS).enumerate() {
         let Some(option) = root
             .desk
             .state
@@ -643,7 +706,7 @@ pub fn workspace_sheet(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                     MouseButton::Left,
                     cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
                         root.desk.choose_workspace(Some(cwd.clone()));
-                        root.sheet = Sheet::None;
+                        root.close_sheet();
                         cx.notify();
                     }),
                 )
@@ -656,7 +719,7 @@ pub fn workspace_sheet(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
 impl Root {
     pub(super) fn toggle_palette(&mut self) {
         if self.sheet == Sheet::Palette {
-            self.sheet = Sheet::None;
+            self.close_sheet();
             return;
         }
         self.open_sheet(Sheet::Palette);
@@ -666,7 +729,13 @@ impl Root {
         self.sheet = sheet;
         self.sheet_text.clear();
         self.sheet_index = 0;
+        self.sheet_scroll.set_offset(Default::default());
         self.pending_focus = Some(Focus::Sheet);
+    }
+
+    pub(super) fn close_sheet(&mut self) {
+        self.sheet = Sheet::None;
+        self.pending_focus = Some(Focus::Composer);
     }
 
     pub(super) fn global_chord(&mut self, event: &KeyDownEvent) -> bool {
@@ -691,7 +760,14 @@ impl Root {
     }
 
     fn open_find_chord(&mut self) {
-        self.desk.open_find(None);
+        if self.desk.open_find(None) {
+            self.focus_find();
+        }
+    }
+
+    pub(super) fn focus_find(&mut self) {
+        self.sheet = Sheet::None;
+        self.desk.close_picker();
         self.pending_focus = Some(Focus::Find);
     }
 
@@ -715,6 +791,7 @@ impl Root {
             return false;
         }
         let count = slash_candidates(self).len();
+        self.slash_index = slash_selection(self.slash_index, count);
         match key {
             "up" => self.slash_index = self.slash_index.saturating_sub(1),
             "down" => self.slash_index = (self.slash_index + 1).min(count.saturating_sub(1)),
@@ -727,7 +804,9 @@ impl Root {
     }
 
     fn accept_selected_slash(&mut self, execute: bool) {
-        let Some(candidate) = slash_candidates(self).get(self.slash_index).cloned() else {
+        let candidates = slash_candidates(self);
+        let index = slash_selection(self.slash_index, candidates.len());
+        let Some(candidate) = candidates.get(index).cloned() else {
             return;
         };
         self.accept_slash(
@@ -750,10 +829,6 @@ impl Root {
 
     pub(super) fn on_sheet_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
-        if key == "escape" {
-            self.sheet = Sheet::None;
-            return true;
-        }
         if self.sheet == Sheet::Palette {
             return self.palette_key(key, event, cx);
         }
@@ -764,44 +839,71 @@ impl Root {
     }
 
     fn palette_key(&mut self, key: &str, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let count =
-            build_palette_entries(&self.desk.state, &self.sheet_text, now_epoch_secs()).len();
+        let count = build_palette_entries(&self.desk.state, &self.sheet_text, now_epoch_secs())
+            .len()
+            .min(PALETTE_ROWS);
         match key {
             "up" => {
-                self.sheet_index = self.sheet_index.saturating_sub(1);
+                self.move_sheet_index(count, false);
                 true
             }
             "down" => {
-                self.sheet_index = (self.sheet_index + 1).min(count.saturating_sub(1));
+                self.move_sheet_index(count, true);
                 true
             }
             "enter" => {
                 self.activate_index(cx);
                 true
             }
-            "backspace" => pop_text(&mut self.sheet_text),
-            _ => push_text(&mut self.sheet_text, event),
+            _ => self.edit_sheet_query(key, event),
         }
     }
 
     fn workspace_key(&mut self, key: &str, event: &KeyDownEvent) -> bool {
-        let count = self.desk.state.workspaces.search(&self.sheet_text).len();
+        let count = self
+            .desk
+            .state
+            .workspaces
+            .search(&self.sheet_text)
+            .len()
+            .min(WORKSPACE_ROWS);
         match key {
             "up" => {
-                self.sheet_index = self.sheet_index.saturating_sub(1);
+                self.move_sheet_index(count, false);
                 true
             }
             "down" => {
-                self.sheet_index = (self.sheet_index + 1).min(count.saturating_sub(1));
+                self.move_sheet_index(count, true);
                 true
             }
             "enter" => {
                 self.commit_workspace();
                 true
             }
-            "backspace" => pop_text(&mut self.sheet_text),
-            _ => push_text(&mut self.sheet_text, event),
+            _ => self.edit_sheet_query(key, event),
         }
+    }
+
+    fn move_sheet_index(&mut self, count: usize, forward: bool) {
+        self.sheet_index = if forward {
+            (self.sheet_index + 1).min(count.saturating_sub(1))
+        } else {
+            self.sheet_index.saturating_sub(1)
+        };
+        self.sheet_scroll.scroll_to_item(self.sheet_index);
+    }
+
+    fn edit_sheet_query(&mut self, key: &str, event: &KeyDownEvent) -> bool {
+        let changed = if key == "backspace" {
+            pop_text(&mut self.sheet_text)
+        } else {
+            push_text(&mut self.sheet_text, event)
+        };
+        if changed {
+            self.sheet_index = 0;
+            self.sheet_scroll.set_offset(Default::default());
+        }
+        changed
     }
 
     fn field_key(&mut self, key: &str, event: &KeyDownEvent) -> bool {
@@ -840,11 +942,13 @@ impl Root {
             }
             PaletteAction::FocusFilter => {
                 self.sheet = Sheet::None;
+                self.desk.sidebar_open = true;
                 self.pending_focus = Some(Focus::Session);
             }
+            PaletteAction::FindInTranscript => self.open_find_chord(),
             other => {
                 self.desk.run_palette(other);
-                self.sheet = Sheet::None;
+                self.close_sheet();
             }
         }
     }
@@ -854,7 +958,7 @@ impl Root {
             cx.write_to_clipboard(ClipboardItem::new_string(markdown));
             self.desk.state.notice = "Copied the conversation as Markdown.".into();
         }
-        self.sheet = Sheet::None;
+        self.close_sheet();
     }
 
     fn export_transcript(&mut self, cx: &mut Context<Self>) {
@@ -867,7 +971,7 @@ impl Root {
             Err(error) => format!("Export failed: {error}"),
         };
         cx.write_to_clipboard(ClipboardItem::new_string(markdown));
-        self.sheet = Sheet::None;
+        self.close_sheet();
     }
 
     fn commit_workspace(&mut self) {
@@ -877,7 +981,7 @@ impl Root {
             .and_then(|index| self.desk.state.workspaces.options.get(*index))
             .map(|option| option.root.clone());
         self.desk.choose_workspace(chosen);
-        self.sheet = Sheet::None;
+        self.close_sheet();
     }
 
     fn commit_field(&mut self) {
@@ -893,22 +997,51 @@ impl Root {
             }
             _ => {}
         }
-        self.sheet = Sheet::None;
+        self.close_sheet();
+    }
+
+    pub(super) fn close_find(&mut self) {
+        self.desk.close_find();
+        self.pending_focus = Some(Focus::Composer);
+    }
+
+    fn move_find_match(&mut self, delta: isize) {
+        let active = self.desk.step_find(delta);
+        self.reveal_find_match(active);
+    }
+
+    pub(super) fn sync_find_match(&mut self) {
+        let active = self.desk.state.transcript_find.active_message_index();
+        if active != self.revealed_find_match {
+            self.reveal_find_match(active);
+        }
+    }
+
+    fn reveal_find_match(&mut self, active: Option<usize>) {
+        self.revealed_find_match = active;
+        self.jump_to = None;
+        if let Some(index) = active {
+            self.scroll_to_message(index);
+        }
+    }
+
+    fn scroll_to_message(&mut self, index: usize) {
+        self.desk.follow_bottom = false;
+        self.transcript.scroll_to_top_of_item(index);
     }
 
     pub(super) fn on_find_key(&mut self, event: &KeyDownEvent) -> bool {
-        let key = event.keystroke.key.as_str();
-        if key == "escape" {
-            self.desk.close_find();
-            return true;
+        if is_chord(event) {
+            return false;
         }
+        let key = event.keystroke.key.as_str();
         if key == "enter" {
             let delta = if event.keystroke.modifiers.shift {
                 -1
             } else {
                 1
             };
-            self.desk.step_find(delta);
+            self.move_find_match(delta);
             return true;
         }
         if key == "backspace" {
@@ -927,6 +1060,9 @@ impl Root {
     }
 
     pub(super) fn on_session_key(&mut self, event: &KeyDownEvent) -> bool {
+        if is_chord(event) {
+            return false;
+        }
         let key = event.keystroke.key.as_str();
         if key == "escape" {
             self.pending_focus = Some(Focus::Composer);
@@ -948,6 +1084,9 @@ impl Root {
     }
 
     pub(super) fn on_side_key(&mut self, event: &KeyDownEvent) -> bool {
+        if is_chord(event) {
+            return false;
+        }
         let key = event.keystroke.key.as_str();
         if key == "enter" {
             let question = std::mem::take(&mut self.side_text);
@@ -966,9 +1105,42 @@ impl Root {
     }
 }
 
+/// True for key events that belong to a shortcut chord (Ctrl/Alt/Cmd), so
+/// plain-text fields never swallow them as typed letters.
+fn is_chord(event: &KeyDownEvent) -> bool {
+    let mods = &event.keystroke.modifiers;
+    mods.control || mods.alt || mods.platform
+}
+
 fn pop_text(text: &mut String) -> bool {
     text.pop();
     true
+}
+#[cfg(test)]
+mod chord_tests {
+    use super::*;
+    use gpui::{KeyDownEvent, Keystroke, Modifiers};
+
+    fn event(key: &str, key_char: Option<&str>, control: bool) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    control,
+                    ..Default::default()
+                },
+                key: key.into(),
+                key_char: key_char.map(String::from),
+            },
+            is_held: false,
+        }
+    }
+
+    #[test]
+    fn chorded_keys_are_ignored_by_text_fields() {
+        // Ctrl+V must not type a literal "v" into find, session, or side fields.
+        assert!(is_chord(&event("v", Some("v"), true)));
+        assert!(!is_chord(&event("v", Some("v"), false)));
+    }
 }
 
 fn push_text(text: &mut String, event: &KeyDownEvent) -> bool {
@@ -980,4 +1152,31 @@ fn push_text(text: &mut String, event: &KeyDownEvent) -> bool {
     }
     text.push_str(typed);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_edit_resets_selection_to_top() {
+        assert_eq!(slash_state_after_edit(false, "/wo"), (0, false));
+        assert_eq!(slash_state_after_edit(false, "plain text"), (0, false));
+    }
+
+    #[test]
+    fn slash_escape_stays_hidden_while_token_remains() {
+        // Typing more filter characters must not reopen a dismissed menu.
+        assert_eq!(slash_state_after_edit(true, "/work"), (0, true));
+        // Removing the slash token re-arms the menu.
+        assert_eq!(slash_state_after_edit(true, "hello"), (0, false));
+        assert_eq!(slash_state_after_edit(true, ""), (0, false));
+    }
+
+    #[test]
+    fn slash_selection_clamps_to_candidate_count() {
+        assert_eq!(slash_selection(0, 0), 0);
+        assert_eq!(slash_selection(4, 2), 1);
+        assert_eq!(slash_selection(1, 3), 1);
+    }
 }

@@ -18,13 +18,29 @@ The UI entity is `ui::Root`. It reads `desk::Desk` and paints with `div` element
 
 The sidebar lists server session metadata and offers **New conversation** (also Ctrl+N). Rows show the server title, source, and a read-only mark when resume is refused. Selecting a row does not create another chat.
 
+At narrow widths the header puts conversation tools on a second row, leaving connection status and Reconnect beside the title. Long titles truncate rather than pushing controls out of the window.
+
+The Conversations sidebar and Flight Deck can share the window only when at least 320 logical pixels remain for chat. In a narrower window, opening either panel closes the other. Composer tools wrap within the available width, and Commands → **Filter & search all conversations** opens the sidebar before focusing search.
+
 The transcript is one scrollable column. Each conversation message is painted from a per-block Markdown parse: headings, lists, links, code, and tables. Saved tool-result rows show the tool name when available, not their arguments or output. **Copy** copies the displayed message text (the summary for tool rows). **Copy code** copies that fence. Links open only after normalization, and only for `http`, `https`, and `mailto`. Other schemes stay inert. HTML is literal text. Images are alt text and are never fetched. There is no webview. GPUI 0.2.2 does not select arbitrary text with the pointer, so prose and code blocks are copied from those buttons. The composer does keep its own selection. Loaded messages are all painted; there is no row recycling.
 
+Find is available once a conversation is selected. A match moves its message into view; enter and shift-enter cycle through matches. Escape and Close return focus to the composer without changing the draft.
+
+In a short window, focusing Find gives the transcript the composer's space. The draft remains intact, and Stop and pending approval or clarification controls stay available. The Find shortcut and `/find` both move keyboard input to the search field.
+
 The composer is a multiline editor anchored at the bottom. Enter sends. Shift+Enter inserts a line. Stop is available only while a turn is busy. Clarify and approval controls appear only when the server asks. Choices are the server’s list, with allow-once and deny as the approval fallback when the server sends no choices. An approval card is implemented; whether a live server shows one depends on that server’s policy. This document does not claim a live approval card has been observed.
+
+In short windows, a pending approval or clarification takes the place of the draft editor until a decision is sent. Long decision forms scroll independently of Stop. An existing draft is preserved, and keyboard focus returns to the editor if it moved to the turn controls.
+
+Long drafts scroll inside the editor instead of growing over Send. Keyboard edits and movement keep the caret in view; Up and Down preserve the character column across logical lines, including UTF-8 text.
+
+The command palette and workspace chooser keep their Close button outside the scrolling list. Up and Down keep the highlighted result visible. Escape or Close dismisses the sheet and returns focus to the composer without changing its draft.
 
 ## Model picker
 
 The composer's bottom-left trigger names the model and its provider, and opens a popover with a search field over the server's configured catalog. Rows keep provider and model together: the same model name under two providers is two rows, and a row whose name cannot be sent to the gateway (whitespace, or a leading `-`) is shown as unavailable instead of being silently rewritten. Search is local: it never sends a request and never selects anything. Hover does not commit; only an explicit row activation or Enter inside the search field does. Enter in the picker never submits the draft, and Escape returns focus to the editor.
+
+The popover opens above the model button and shrinks to the composer width instead of sliding over the conversation drawer. It blocks clicks through to covered controls; clicks outside dismiss it without blocking the clicked control. Clicking the model button again also dismisses it.
 
 The catalog is fetched once per connection with `explicit_only: true`, `include_unconfigured: false`, and `refresh: false`, and is dropped when the connection closes so a reconnect cannot show another connection's rows.
 

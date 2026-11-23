@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, FocusHandle, FontWeight, KeyBinding,
     KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PlatformInput, ScrollDelta, ScrollHandle, ScrollWheelEvent, TitlebarOptions, Window, WindowBounds,
-    WindowDecorations, WindowOptions, actions, div, point, prelude::*, px, rgb, size,
+    PlatformInput, ScrollDelta, ScrollHandle, ScrollWheelEvent, TitlebarOptions, Window,
+    WindowBounds, WindowDecorations, WindowOptions, actions, canvas, div, point, prelude::*, px,
+    rgb, size,
 };
 
 use crate::automation::{Automation, Request};
@@ -29,6 +30,10 @@ actions!(hermes, [NewConversation]);
 
 const APP_ID: &str = "io.github.hermes_native.Client";
 const WINDOW_TITLE: &str = "Hermes Native";
+const SIDEBAR_WIDTH: f32 = 280.;
+const INSPECTOR_WIDTH: f32 = 320.;
+const MIN_CHAT_WIDTH: f32 = 320.;
+const COMPACT_FOOTER_HEIGHT: f32 = 560.;
 
 pub struct Launch {
     pub config: Result<Config, String>,
@@ -152,7 +157,9 @@ impl Preview {
 
 pub struct Root {
     desk: Desk,
+    sidebar_was_open: bool,
     composer_focus: FocusHandle,
+    turn_controls_focus: FocusHandle,
     search_focus: FocusHandle,
     clarify_focus: FocusHandle,
     session_focus: FocusHandle,
@@ -162,12 +169,16 @@ pub struct Root {
     sheet: chrome::Sheet,
     sheet_text: String,
     sheet_index: usize,
+    sheet_scroll: ScrollHandle,
     slash_index: usize,
     slash_hidden: bool,
     side_text: String,
     jump_to: Option<usize>,
+    revealed_find_match: Option<usize>,
     answer_qid: Option<String>,
     transcript: ScrollHandle,
+    draft_scroll: ScrollHandle,
+    reveal_draft_caret: bool,
     cursor: usize,
     anchor: usize,
     seen_generation: u64,
@@ -194,7 +205,9 @@ impl Root {
     ) -> Self {
         Self {
             desk: Desk::new(config),
+            sidebar_was_open: true,
             composer_focus: cx.focus_handle(),
+            turn_controls_focus: cx.focus_handle(),
             search_focus: cx.focus_handle(),
             clarify_focus: cx.focus_handle(),
             session_focus: cx.focus_handle(),
@@ -204,12 +217,16 @@ impl Root {
             sheet: chrome::Sheet::None,
             sheet_text: String::new(),
             sheet_index: 0,
+            sheet_scroll: ScrollHandle::new(),
             slash_index: 0,
             slash_hidden: false,
             side_text: String::new(),
             jump_to: None,
+            revealed_find_match: None,
             answer_qid: None,
             transcript: ScrollHandle::new(),
+            draft_scroll: ScrollHandle::new(),
+            reveal_draft_caret: false,
             cursor: 0,
             anchor: 0,
             seen_generation: 0,
@@ -263,9 +280,48 @@ impl Root {
 
     fn prepare(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         self.agent_window = Some(window.window_handle());
+        self.fit_side_panels(window);
         self.sync_cursor();
         self.claim_focus(window);
+        self.sync_turn_focus(window);
+        self.sync_find_match();
         self.follow_transcript();
+    }
+
+    fn sync_turn_focus(&mut self, window: &mut Window) {
+        if self.compact_turn_controls(window) {
+            if self.composer_focus.is_focused(window) || self.search_focus.is_focused(window) {
+                self.desk.close_picker();
+                self.turn_controls_focus.focus(window);
+            }
+        } else if self.turn_controls_focus.is_focused(window)
+            || (open_interaction(&self.desk).is_none() && self.clarify_focus.is_focused(window))
+        {
+            self.composer_focus.focus(window);
+        }
+    }
+
+    fn compact_turn_controls(&self, window: &Window) -> bool {
+        window.viewport_size().height < px(COMPACT_FOOTER_HEIGHT)
+            && open_interaction(&self.desk).is_some()
+    }
+
+    fn fit_side_panels(&mut self, window: &Window) {
+        let min_split_width = px(SIDEBAR_WIDTH + MIN_CHAT_WIDTH + INSPECTOR_WIDTH);
+        if window.viewport_size().width < min_split_width
+            && self.desk.sidebar_open
+            && self.desk.state.inspector_open
+        {
+            // A newly opened panel takes over from the one already visible.
+            self.desk.sidebar_open = !self.sidebar_was_open;
+            self.desk.state.inspector_open = self.sidebar_was_open;
+        }
+        self.sidebar_was_open = self.desk.sidebar_open;
+        if (!self.desk.sidebar_open && self.session_focus.is_focused(window))
+            || (!self.desk.state.inspector_open && self.side_focus.is_focused(window))
+        {
+            self.pending_focus.get_or_insert(Focus::Composer);
+        }
     }
 
     fn sync_cursor(&mut self) {
@@ -276,6 +332,7 @@ impl Root {
         let len = self.desk.draft().len();
         self.cursor = len;
         self.anchor = len;
+        self.reveal_draft_caret = true;
     }
 
     fn claim_focus(&mut self, window: &mut Window) {
@@ -362,11 +419,7 @@ impl Root {
 
     fn escape(&mut self) -> bool {
         if self.sheet != chrome::Sheet::None {
-            self.sheet = chrome::Sheet::None;
-            return true;
-        }
-        if self.desk.state.transcript_find.open {
-            self.desk.close_find();
+            self.close_sheet();
             return true;
         }
         if self.desk.confirm.is_some() {
@@ -376,6 +429,10 @@ impl Root {
         if self.desk.picker_open {
             self.desk.close_picker();
             self.pending_focus = Some(Focus::Composer);
+            return true;
+        }
+        if self.desk.state.transcript_find.open {
+            self.close_find();
             return true;
         }
         false
@@ -498,6 +555,7 @@ impl Root {
         };
         self.anchor = anchor;
         self.cursor = cursor;
+        self.reveal_draft_caret = true;
         true
     }
 
@@ -542,6 +600,7 @@ impl Root {
                     self.sheet_text = query;
                 }
             }
+            Some(crate::desk::ComposerFollow::Find) => self.focus_find(),
             None => {}
         }
     }
@@ -553,8 +612,6 @@ impl Root {
         let draft = self.desk.draft();
         let (start, end) = selection_of(&draft, self.anchor, self.cursor);
         self.replace(&draft, start, end, extra);
-        self.slash_hidden = false;
-        self.slash_index = 0;
     }
 
     fn backspace(&mut self) {
@@ -592,12 +649,17 @@ impl Root {
         next.push_str(&draft[end..]);
         self.cursor = start + extra.len();
         self.anchor = self.cursor;
+        self.reveal_draft_caret = true;
+        let (index, hidden) = chrome::slash_state_after_edit(self.slash_hidden, &next);
+        self.slash_index = index;
+        self.slash_hidden = hidden;
         self.desk.set_draft(next);
     }
 
     fn select_all(&mut self) {
         self.anchor = 0;
         self.cursor = self.desk.draft().len();
+        self.reveal_draft_caret = true;
     }
 
     fn copy_selection(&self, cx: &mut Context<Self>) {
@@ -631,7 +693,13 @@ impl gpui::Render for Root {
         self.prepare(window, cx);
         let controls = self.desk.controls();
         let connection = self.desk.connection();
-        shell(self, &controls, &connection, cx)
+        let viewport = window.viewport_size();
+        let compact_header = viewport.width < px(760.);
+        let find_focused =
+            self.desk.state.transcript_find.open && self.find_focus.is_focused(window);
+        let compact_footer = self.compact_turn_controls(window)
+            || (viewport.height < px(COMPACT_FOOTER_HEIGHT) && find_focused);
+        shell(self, &controls, &connection, compact_header, compact_footer, cx)
     }
 }
 
@@ -639,6 +707,8 @@ fn shell(
     root: &mut Root,
     controls: &present::Controls,
     connection: &present::ConnectionView,
+    compact_header: bool,
+    compact_footer: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
@@ -654,8 +724,16 @@ fn shell(
         .on_key_down(
             cx.listener(|root, event: &KeyDownEvent, window, cx| root.on_key(event, window, cx)),
         )
-        .child(header(root, controls, connection, cx))
-        .child(body(root, controls, cx))
+        .child(header(root, controls, connection, compact_header, cx))
+        .child(body(root, controls, compact_footer, cx))
+        // Keep a keyboard target mounted while the editor is temporarily absent.
+        .child(
+            div()
+                .id("turn-controls-focus")
+                .absolute()
+                .size(px(0.))
+                .track_focus(&root.turn_controls_focus),
+        )
         .children(overlay(root, cx))
 }
 
@@ -663,19 +741,50 @@ fn header(
     root: &mut Root,
     controls: &present::Controls,
     connection: &present::ConnectionView,
+    compact: bool,
     cx: &mut Context<Root>,
 ) -> gpui::Div {
-    div()
+    let sidebar = conversations_button(cx).flex_shrink_0();
+    let title = header_title(root, controls);
+    let tools = chrome::header_tools(root, cx).flex_shrink_0();
+    let status = connection_label(connection, controls.reconnect, cx).flex_shrink_0();
+    let bar = div()
         .flex()
-        .items_center()
-        .justify_between()
+        .flex_shrink_0()
         .px(px(16.))
-        .min_h(px(56.))
         .bg(rgb(0x1e1e24))
         .border_b_1()
-        .border_color(rgb(0x34343c))
-        .child(header_start(root, controls, cx))
-        .child(connection_label(connection, controls.reconnect, cx))
+        .border_color(rgb(0x34343c));
+    if compact {
+        return bar
+            .flex_col()
+            .gap(px(4.))
+            .py(px(4.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(title.flex_1())
+                    .child(status),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(sidebar)
+                    .child(tools),
+            );
+    }
+    bar.items_center()
+        .gap(px(12.))
+        .min_h(px(56.))
+        .child(sidebar)
+        .child(title)
+        .child(tools)
+        .child(div().flex_1())
+        .child(status)
 }
 
 fn lineage_caption(desk: &Desk) -> gpui::Div {
@@ -687,43 +796,38 @@ fn lineage_caption(desk: &Desk) -> gpui::Div {
         .map(|(_, title)| format!("Branched from {title}"))
         .unwrap_or_default();
     div()
+        .truncate()
         .text_size(px(11.))
         .text_color(rgb(0x9a9aa3))
         .child(text)
 }
 
-fn header_start(
-    root: &mut Root,
-    controls: &present::Controls,
-    cx: &mut Context<Root>,
-) -> gpui::Div {
+fn conversations_button(cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    text_button(
+        "toggle-sidebar",
+        "Conversations",
+        true,
+        false,
+        cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+            root.desk.toggle_sidebar();
+            cx.notify();
+        }),
+    )
+}
+
+fn header_title(root: &Root, controls: &present::Controls) -> gpui::Div {
     div()
         .flex()
-        .items_center()
-        .gap(px(12.))
-        .child(text_button(
-            "toggle-sidebar",
-            "Conversations",
-            true,
-            false,
-            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
-                root.desk.toggle_sidebar();
-                cx.notify();
-            }),
-        ))
+        .flex_col()
+        .min_w(px(0.))
         .child(
             div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(px(16.))
-                        .font_weight(FontWeight(700.))
-                        .child(controls.title.clone()),
-                )
-                .child(lineage_caption(&root.desk)),
+                .truncate()
+                .text_size(px(16.))
+                .font_weight(FontWeight(700.))
+                .child(controls.title.clone()),
         )
-        .child(chrome::header_tools(root, cx))
+        .child(lineage_caption(&root.desk))
 }
 
 fn connection_label(
@@ -761,7 +865,12 @@ fn tone_color(tone: Tone) -> gpui::Rgba {
     }
 }
 
-fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+fn body(
+    root: &mut Root,
+    controls: &present::Controls,
+    compact_footer: bool,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
     div()
         .flex()
         .flex_1()
@@ -770,7 +879,11 @@ fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -
         .when(root.desk.sidebar_open, |row| {
             row.child(sidebar(root, controls, cx))
         })
-        .child(main_column(root, controls, cx).flex_1().min_w(px(0.)))
+        .child(
+            main_column(root, controls, compact_footer, cx)
+                .flex_1()
+                .min_w(px(0.)),
+        )
         .when(root.desk.state.inspector_open, |row| {
             row.child(chrome::inspector(root, cx))
         })
@@ -778,7 +891,7 @@ fn body(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -
 
 fn sidebar(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
     div()
-        .w(px(280.))
+        .w(px(SIDEBAR_WIDTH))
         .h_full()
         .flex()
         .flex_col()
@@ -956,7 +1069,12 @@ fn session_row(
     row
 }
 
-fn main_column(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Div {
+fn main_column(
+    root: &mut Root,
+    controls: &present::Controls,
+    compact_footer: bool,
+    cx: &mut Context<Root>,
+) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -970,7 +1088,32 @@ fn main_column(root: &mut Root, controls: &present::Controls, cx: &mut Context<R
         })
         .child(history_bar(controls, cx))
         .child(transcript(root, controls, cx).flex_1())
-        .child(footer(root, controls, cx))
+        .when(!compact_footer, |column| column.child(footer(root, controls, cx)))
+        .when(compact_footer, |column| {
+            column
+                .when_some(interaction(root, cx), |column, panel| {
+                    column.child(
+                        div()
+                            .id("compact-interaction")
+                            .min_h(px(0.))
+                            .max_h(px(208.))
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .child(panel.flex_shrink_0()),
+                    )
+                })
+                .when(controls.stop_visible, |column| {
+                    column.child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .justify_end()
+                            .p(px(12.))
+                            .child(stop_button(controls, cx)),
+                    )
+                })
+        })
 }
 
 fn notice(text: &str) -> gpui::Div {
@@ -1036,7 +1179,7 @@ fn transcript(
     controls: &present::Controls,
     cx: &mut Context<Root>,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
+    let viewport = div()
         .id("transcript")
         .flex_1()
         .min_h(px(0.))
@@ -1046,19 +1189,11 @@ fn transcript(
             if wheel_up(&event.delta) {
                 root.desk.follow_bottom = false;
             }
-        }))
-        .child(transcript_body(root, controls, cx))
-}
-
-fn transcript_body(
-    root: &mut Root,
-    controls: &present::Controls,
-    cx: &mut Context<Root>,
-) -> gpui::Div {
+        }));
     if controls.show_messages {
-        message_column(root, cx)
+        message_column(viewport, root, cx)
     } else {
-        empty_state()
+        viewport.child(empty_state())
     }
 }
 
@@ -1089,28 +1224,36 @@ fn empty_state() -> gpui::Div {
         )
 }
 
-fn message_column(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+fn message_column(
+    viewport: gpui::Stateful<gpui::Div>,
+    root: &Root,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
     let messages = root
         .desk
         .state
         .selected
         .as_ref()
         .and_then(|id| root.desk.state.conversations.get(id))
-        .map(|chat| chat.messages.clone())
-        .unwrap_or_default();
-    let mut column = div()
+        .map_or(&[][..], |chat| chat.messages.as_slice());
+    let mut column = viewport
         .flex()
         .flex_col()
         .gap(px(12.))
-        .p(px(24.))
-        .w_full()
-        .max_w(px(860.))
-        .mx_auto();
+        .px(px(24.));
     let active = root
         .jump_to
         .or_else(|| root.desk.state.transcript_find.active_message_index());
-    for (index, message) in messages.into_iter().enumerate() {
-        column = column.child(message_card(&message, index, active == Some(index), cx));
+    for (index, message) in messages.iter().enumerate() {
+        column = column.child(
+            message_card(message, index, active == Some(index), cx)
+                .flex_shrink_0()
+                .w_full()
+                .max_w(px(812.))
+                .mx_auto()
+                .when(index == 0, |card| card.mt(px(24.)))
+                .when(index + 1 == messages.len(), |card| card.mb(px(24.))),
+        );
     }
     column
 }
@@ -1246,12 +1389,14 @@ fn footer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>)
         .w_full()
         .max_w(px(900.))
         .mx_auto()
-        .child(interaction(root, cx))
+        .children(interaction(root, cx))
         .when(chrome::slash_open(root), |column| {
             column.child(chrome::slash_row(root, cx))
         })
         .child(chrome::attachment_row(root, cx))
-        .child(activity_row(controls, root.spin))
+        .when(controls.spinning || !controls.activity.is_empty(), |column| {
+            column.child(activity_row(controls, root.spin))
+        })
         .child(composer(root, controls, cx))
 }
 
@@ -1276,11 +1421,9 @@ fn spin_mark(spinning: bool, tick: u8) -> &'static str {
     }
 }
 
-fn interaction(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+fn interaction(root: &mut Root, cx: &mut Context<Root>) -> Option<gpui::Div> {
     root.desk.sync_questions();
-    let Some(kind) = interaction_kind(&root.desk) else {
-        return div();
-    };
+    let kind = interaction_kind(&root.desk)?;
     let mut panel = div()
         .flex()
         .flex_col()
@@ -1303,7 +1446,7 @@ fn interaction(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                 .child(root.desk.form_note.clone()),
         );
     }
-    panel
+    Some(panel)
 }
 
 fn interaction_kind(desk: &Desk) -> Option<InteractionKind> {
@@ -1507,7 +1650,9 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
         .child(composer_input(root, controls, cx))
         .child(
             div()
+                .relative()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap(px(8.))
                 .child(model_trigger(root, controls, cx))
@@ -1523,7 +1668,10 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
                     "Regenerate",
                     crate::model::RewindMode::Regenerate,
                     cx,
-                )),
+                ))
+                .when(root.desk.picker_open, |row| {
+                    row.child(picker_anchor(root, cx))
+                }),
         )
         .child(composer_actions(controls, cx))
 }
@@ -1536,6 +1684,12 @@ fn composer_input(
     div()
         .id("composer")
         .min_h(px(60.))
+        .max_h(px(128.))
+        .flex()
+        .flex_col()
+        .overflow_y_scroll()
+        .track_scroll(&root.draft_scroll)
+        .pr(px(2.))
         .track_focus(&root.composer_focus)
         .on_mouse_down(
             MouseButton::Left,
@@ -1547,7 +1701,8 @@ fn composer_input(
         .child(composer_text(root, controls.readonly.is_some()))
 }
 
-fn composer_text(root: &Root, read_only: bool) -> gpui::Div {
+fn composer_text(root: &mut Root, read_only: bool) -> gpui::Div {
+    let reveal = std::mem::take(&mut root.reveal_draft_caret);
     let draft = root.desk.draft();
     if draft.is_empty() {
         return div().text_color(rgb(0x8a8a92)).child(if read_only {
@@ -1557,25 +1712,69 @@ fn composer_text(root: &Root, read_only: bool) -> gpui::Div {
         });
     }
     let (start, end) = selection_of(&draft, root.anchor, root.cursor);
-    if start != end {
-        return selected_text(&draft, start, end);
-    }
     let cursor = floor_boundary(&draft, root.cursor.min(draft.len()));
+    let mut text = gpui::StyledText::new(draft);
+    if start != end {
+        let selection = gpui::HighlightStyle {
+            background_color: Some(rgb(0x3d7eff).into()),
+            ..Default::default()
+        };
+        text = text.with_highlights([(start..end, selection)]);
+    }
+    let caret = composer_caret(
+        text.layout().clone(),
+        cursor,
+        start == end,
+        reveal.then(|| root.draft_scroll.clone()),
+    );
     div()
-        .flex()
-        .flex_wrap()
-        .child(draft[..cursor].to_string())
-        .child(div().w(px(1.)).h(px(18.)).bg(rgb(0xffffff)))
-        .child(draft[cursor..].to_string())
+        .relative()
+        .w_full()
+        .flex_shrink_0()
+        .child(text)
+        .child(caret)
 }
 
-fn selected_text(draft: &str, start: usize, end: usize) -> gpui::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .child(draft[..start].to_string())
-        .child(div().bg(rgb(0x3d7eff)).child(draft[start..end].to_string()))
-        .child(draft[end..].to_string())
+fn composer_caret(
+    layout: gpui::TextLayout,
+    cursor: usize,
+    visible: bool,
+    scroll: Option<ScrollHandle>,
+) -> impl IntoElement {
+    canvas(
+        move |_, window, _| {
+            let origin = layout.position_for_index(cursor)?;
+            let caret = Bounds::new(origin, size(px(1.), layout.line_height()));
+            if let Some(scroll) = scroll {
+                reveal_caret(scroll, caret, window);
+            }
+            visible.then_some(caret)
+        },
+        |_, caret, window, _| {
+            if let Some(caret) = caret {
+                window.paint_quad(gpui::fill(caret, rgb(0xffffff)));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+fn reveal_caret(scroll: ScrollHandle, caret: Bounds<gpui::Pixels>, window: &Window) {
+    let viewport = scroll.bounds();
+    let dy = if caret.top() < viewport.top() {
+        viewport.top() - caret.top()
+    } else {
+        (viewport.bottom() - caret.bottom()).min(px(0.))
+    };
+    if dy != px(0.) {
+        let offset = scroll.offset() + point(px(0.), dy);
+        // Child positions have already been laid out with this frame's scroll offset.
+        window.on_next_frame(move |window, _| {
+            scroll.set_offset(offset);
+            window.refresh();
+        });
+    }
 }
 
 fn model_trigger(
@@ -1590,29 +1789,35 @@ fn model_trigger(
         .id("model-trigger")
         .flex()
         .flex_col()
+        .max_w_full()
         .px(px(8.))
         .py(px(4.))
         .rounded(px(8.))
         .cursor_pointer()
         .opacity(if controls.model_enabled { 1. } else { 0.45 })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| {
-                root.desk.open_picker();
-                if root.desk.picker_open {
-                    root.search_focus.focus(window);
-                }
-                cx.notify();
-            }),
-        )
+        // When open, the picker's outside-click handler owns clicks on the trigger too.
+        .when(!root.desk.picker_open, |trigger| {
+            trigger.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                    root.desk.open_picker();
+                    if root.desk.picker_open {
+                        root.search_focus.focus(window);
+                    }
+                    cx.notify();
+                }),
+            )
+        })
         .child(
             div()
+                .truncate()
                 .text_size(px(12.))
                 .font_weight(FontWeight(600.))
                 .child(caption),
         )
         .child(
             div()
+                .truncate()
                 .text_size(px(10.))
                 .text_color(rgb(0x9a9aa3))
                 .child(provider),
@@ -1636,33 +1841,40 @@ fn composer_actions(controls: &present::Controls, cx: &mut Context<Root>) -> gpu
         .child(
             div()
                 .flex_1()
+                .min_w(px(0.))
                 .text_size(px(11.))
                 .text_color(rgb(0x8a8a92))
                 .child("Enter to send · Shift+Enter for a new line"),
         )
-        .when(controls.stop_visible, |row| {
-            row.child(text_button(
-                "stop",
-                "Stop",
-                controls.stop_enabled,
-                false,
+        .when(controls.stop_visible, |row| row.child(stop_button(controls, cx)))
+        .child(
+            text_button(
+                "send",
+                "Send",
+                controls.send,
+                true,
                 cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
-                    root.desk.stop();
+                    root.desk.submit();
+                    root.take_composer_follow();
                     cx.notify();
                 }),
-            ))
-        })
-        .child(text_button(
-            "send",
-            "Send",
-            controls.send,
-            true,
-            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
-                root.desk.submit();
-                root.take_composer_follow();
-                cx.notify();
-            }),
-        ))
+            )
+            .flex_shrink_0(),
+        )
+}
+
+fn stop_button(controls: &present::Controls, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    text_button(
+        "stop",
+        "Stop",
+        controls.stop_enabled,
+        false,
+        cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+            root.desk.stop();
+            cx.notify();
+        }),
+    )
+    .flex_shrink_0()
 }
 
 fn rewind_button(
@@ -1699,13 +1911,29 @@ fn overlay(root: &mut Root, cx: &mut Context<Root>) -> Vec<gpui::AnyElement> {
         }
         chrome::Sheet::None => {}
     }
-    if root.desk.picker_open {
-        layers.push(picker(root, cx).into_any_element());
-    }
     if root.desk.confirm.is_some() {
         layers.push(confirm_dialog(root, cx));
     }
     layers
+}
+
+fn picker_anchor(root: &mut Root, cx: &mut Context<Root>) -> impl IntoElement {
+    let panel = picker(root, cx);
+    // Measure against the composer row, not the window: the drawer is outside this space.
+    canvas(
+        move |bounds, window, cx| {
+            let bottom = (bounds.top() - px(6.)).max(px(0.));
+            let width = bounds.size.width.min(px(380.));
+            let mut panel = panel.w(width).max_h(bottom).into_any_element();
+            let measured = panel.layout_as_root(size(width, bottom).into(), window, cx);
+            window.defer_draw(panel, point(bounds.left(), bottom - measured.height), 0);
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .w_full()
 }
 
 fn picker(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
@@ -1717,10 +1945,14 @@ fn picker(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
         root.desk.picker_note.clone()
     };
     div()
-        .absolute()
-        .bottom(px(120.))
-        .left(px(24.))
-        .w(px(380.))
+        .occlude()
+        .on_mouse_down_out(cx.listener(|root, _: &MouseDownEvent, window, cx| {
+            root.desk.close_picker();
+            if root.search_focus.is_focused(window) {
+                root.composer_focus.focus(window);
+            }
+            cx.notify();
+        }))
         .flex()
         .flex_col()
         .gap(px(8.))
@@ -1780,6 +2012,7 @@ fn model_list(
         .flex()
         .flex_col()
         .gap(px(4.))
+        .min_h(px(0.))
         .max_h(px(320.))
         .overflow_y_scroll();
     for (index, option) in rows.iter().enumerate() {
@@ -2025,31 +2258,26 @@ fn line_end(text: &str, cursor: usize) -> usize {
 }
 
 fn move_vertical(text: &str, cursor: usize, down: bool) -> usize {
+    let cursor = floor_boundary(text, cursor.min(text.len()));
     let start = line_start(text, cursor);
-    let end = line_end(text, cursor);
-    let column = cursor.saturating_sub(start);
-    if down {
-        return lower_line(text, end, column);
-    }
-    upper_line(text, start, column)
-}
-
-fn lower_line(text: &str, end: usize, column: usize) -> usize {
-    if end >= text.len() {
-        return text.len();
-    }
-    let next_start = end + 1;
-    let next_end = line_end(text, next_start);
-    next_start + column.min(next_end.saturating_sub(next_start))
-}
-
-fn upper_line(text: &str, start: usize, column: usize) -> usize {
-    if start == 0 {
-        return 0;
-    }
-    let prev_end = start - 1;
-    let prev_start = line_start(text, prev_end);
-    prev_start + column.min(prev_end.saturating_sub(prev_start))
+    let target = if down {
+        let end = line_end(text, cursor);
+        if end == text.len() {
+            return end;
+        }
+        end + 1
+    } else {
+        if start == 0 {
+            return 0;
+        }
+        line_start(text, start - 1)
+    };
+    let end = line_end(text, target);
+    let column = text[start..cursor].chars().count();
+    text[target..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(byte, _)| target + byte)
 }
 
 impl Root {
@@ -2540,6 +2768,8 @@ impl Root {
     fn focused_name(&self, window: &Window) -> &'static str {
         if self.composer_focus.is_focused(window) {
             "composer"
+        } else if self.turn_controls_focus.is_focused(window) {
+            "turn-controls"
         } else if self.search_focus.is_focused(window) {
             "search"
         } else if self.find_focus.is_focused(window) {
@@ -3867,6 +4097,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn vertical_caret_keeps_character_columns_across_utf8_lines() {
+        assert_eq!(caret_move("a\né", 1, 1, "down", false), Some((4, 4)));
+        assert_eq!(caret_move("éx\nabc", 2, 2, "down", false), Some((5, 5)));
+        assert_eq!(caret_move("éx\nabc", 5, 5, "up", true), Some((5, 2)));
+    }
 
     struct UnlinkPark {
         entered: mpsc::Sender<()>,

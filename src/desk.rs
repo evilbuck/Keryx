@@ -61,6 +61,7 @@ pub struct Desk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerFollow {
     Attach,
+    Find,
     Workspace(Option<String>),
 }
 
@@ -1187,7 +1188,7 @@ impl Desk {
 
     fn dispatch_command(&mut self, intent: ComposerIntent) -> bool {
         match intent {
-            ComposerIntent::FindInTranscript(query) => self.open_find(query.as_deref()),
+            ComposerIntent::FindInTranscript(query) => self.follow_find(query.as_deref()),
             ComposerIntent::TogglePin => self.toggle_pin(),
             ComposerIntent::Rename(title) => self.rename_to(title),
             ComposerIntent::Archive => self.archive_current(),
@@ -1215,6 +1216,14 @@ impl Desk {
         }
         self.open_chat()
             .is_some_and(|chat| !chat.attachments.is_empty())
+    }
+
+    fn follow_find(&mut self, query: Option<&str>) -> bool {
+        if !self.open_find(query) {
+            return false;
+        }
+        self.composer_follow = Some(ComposerFollow::Find);
+        true
     }
 
     fn follow_attach(&mut self) -> bool {
