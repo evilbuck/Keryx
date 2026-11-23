@@ -612,8 +612,6 @@ impl Root {
         let draft = self.desk.draft();
         let (start, end) = selection_of(&draft, self.anchor, self.cursor);
         self.replace(&draft, start, end, extra);
-        self.slash_hidden = false;
-        self.slash_index = 0;
     }
 
     fn backspace(&mut self) {
@@ -652,6 +650,9 @@ impl Root {
         self.cursor = start + extra.len();
         self.anchor = self.cursor;
         self.reveal_draft_caret = true;
+        let (index, hidden) = chrome::slash_state_after_edit(self.slash_hidden, &next);
+        self.slash_index = index;
+        self.slash_hidden = hidden;
         self.desk.set_draft(next);
     }
 

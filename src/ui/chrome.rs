@@ -225,12 +225,14 @@ pub fn find_bar(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
 }
 
 pub fn slash_row(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+    let candidates = slash_candidates(root);
+    let selected_index = slash_selection(root.slash_index, candidates.len());
     let mut row = div().flex().flex_col().gap(px(4.));
-    for (index, candidate) in slash_candidates(root).into_iter().enumerate() {
+    for (index, candidate) in candidates.into_iter().enumerate() {
         let token = candidate.token.clone();
         let insert = candidate.insert_text.clone();
         let execute = candidate.zero_arg_execute;
-        let selected = index == root.slash_index;
+        let selected = index == selected_index;
         row = row.child(
             div()
                 .id(SharedString::new(format!("slash-{token}")))
@@ -254,6 +256,22 @@ pub fn slash_row(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
         );
     }
     row
+}
+
+/// Selection state for the slash suggestion menu after the draft is edited.
+///
+/// Every edit restarts the selection at the top. A menu dismissed with Escape
+/// stays hidden while the draft still holds a slash token; removing the token
+/// re-arms the menu.
+pub(super) fn slash_state_after_edit(hidden: bool, next_draft: &str) -> (usize, bool) {
+    let hidden = hidden && crate::studio::active_slash_prefix(next_draft).is_some();
+    (0, hidden)
+}
+
+/// Clamps the slash selection so a shrunk candidate list still highlights a
+/// row and Enter accepts it.
+pub(super) fn slash_selection(index: usize, count: usize) -> usize {
+    index.min(count.saturating_sub(1))
 }
 
 pub fn slash_open(root: &Root) -> bool {
@@ -773,6 +791,7 @@ impl Root {
             return false;
         }
         let count = slash_candidates(self).len();
+        self.slash_index = slash_selection(self.slash_index, count);
         match key {
             "up" => self.slash_index = self.slash_index.saturating_sub(1),
             "down" => self.slash_index = (self.slash_index + 1).min(count.saturating_sub(1)),
@@ -785,7 +804,9 @@ impl Root {
     }
 
     fn accept_selected_slash(&mut self, execute: bool) {
-        let Some(candidate) = slash_candidates(self).get(self.slash_index).cloned() else {
+        let candidates = slash_candidates(self);
+        let index = slash_selection(self.slash_index, candidates.len());
+        let Some(candidate) = candidates.get(index).cloned() else {
             return;
         };
         self.accept_slash(
@@ -1089,4 +1110,31 @@ fn push_text(text: &mut String, event: &KeyDownEvent) -> bool {
     }
     text.push_str(typed);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_edit_resets_selection_to_top() {
+        assert_eq!(slash_state_after_edit(false, "/wo"), (0, false));
+        assert_eq!(slash_state_after_edit(false, "plain text"), (0, false));
+    }
+
+    #[test]
+    fn slash_escape_stays_hidden_while_token_remains() {
+        // Typing more filter characters must not reopen a dismissed menu.
+        assert_eq!(slash_state_after_edit(true, "/work"), (0, true));
+        // Removing the slash token re-arms the menu.
+        assert_eq!(slash_state_after_edit(true, "hello"), (0, false));
+        assert_eq!(slash_state_after_edit(true, ""), (0, false));
+    }
+
+    #[test]
+    fn slash_selection_clamps_to_candidate_count() {
+        assert_eq!(slash_selection(0, 0), 0);
+        assert_eq!(slash_selection(4, 2), 1);
+        assert_eq!(slash_selection(1, 3), 1);
+    }
 }
