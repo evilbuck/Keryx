@@ -27,6 +27,9 @@ pub enum Sheet {
     Workspace,
 }
 
+const PALETTE_ROWS: usize = 12;
+const WORKSPACE_ROWS: usize = 8;
+
 pub fn header_tools(_root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     div()
         .flex()
@@ -528,8 +531,8 @@ fn outline_row(entry: crate::model::OutlineEntry, cx: &mut Context<Root>) -> gpu
 
 pub fn palette(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let entries = build_palette_entries(&root.desk.state, &root.sheet_text, now_epoch_secs());
-    let mut list = div().flex().flex_col().gap(px(4.));
-    for (index, entry) in entries.iter().take(12).enumerate() {
+    let mut list = sheet_list(root);
+    for (index, entry) in entries.iter().take(PALETTE_ROWS).enumerate() {
         let action = entry.action.clone();
         let selected = index == root.sheet_index;
         list = list.child(
@@ -548,6 +551,7 @@ pub fn palette(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                     MouseButton::Left,
                     cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
                         root.activate_palette(action.clone(), cx);
+                        cx.notify();
                     }),
                 )
                 .child(entry.title.clone())
@@ -579,9 +583,20 @@ pub fn text_sheet(
         .py(px(6.))
         .rounded(px(8.))
         .bg(rgb(0x2c2c34))
-        .track_focus(&root.sheet_focus)
+        .min_h(px(0.))
         .child(text);
     sheet_frame(root, title, body, cx)
+}
+
+fn sheet_list(root: &Root) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("sheet-list")
+        .min_h(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .overflow_y_scroll()
+        .track_scroll(&root.sheet_scroll)
 }
 
 fn sheet_frame(
@@ -590,12 +605,12 @@ fn sheet_frame(
     body: impl IntoElement,
     cx: &mut Context<Root>,
 ) -> gpui::Div {
-    let _ = root;
-    div()
-        .absolute()
-        .top(px(80.))
-        .left(px(280.))
-        .w(px(460.))
+    let panel = div()
+        .id("sheet")
+        .track_focus(&root.sheet_focus)
+        .w_full()
+        .max_w(px(460.))
+        .max_h_full()
         .flex()
         .flex_col()
         .gap(px(8.))
@@ -604,18 +619,38 @@ fn sheet_frame(
         .bg(rgb(0x24242c))
         .border_1()
         .border_color(rgb(0x3a3a42))
-        .child(div().font_weight(FontWeight(700.)).child(title.to_string()))
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_weight(FontWeight(700.))
+                .child(title.to_string()),
+        )
         .child(body)
-        .child(tool_button("sheet-close", "Close", cx, |root, _, cx| {
-            root.sheet = Sheet::None;
-            cx.notify();
-        }))
+        .child(div().flex_shrink_0().child(tool_button(
+            "sheet-close",
+            "Close",
+            cx,
+            |root, _, cx| {
+                root.close_sheet();
+                cx.notify();
+            },
+        )));
+    div()
+        .absolute()
+        .top(px(80.))
+        .bottom(px(12.))
+        .left(px(12.))
+        .right(px(12.))
+        .flex()
+        .justify_center()
+        .items_start()
+        .child(panel)
 }
 
 pub fn workspace_sheet(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let options = root.desk.state.workspaces.search(&root.sheet_text);
-    let mut list = div().flex().flex_col().gap(px(4.));
-    for (index, option_index) in options.iter().take(8).enumerate() {
+    let mut list = sheet_list(root);
+    for (index, option_index) in options.iter().take(WORKSPACE_ROWS).enumerate() {
         let Some(option) = root
             .desk
             .state
@@ -643,7 +678,7 @@ pub fn workspace_sheet(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                     MouseButton::Left,
                     cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
                         root.desk.choose_workspace(Some(cwd.clone()));
-                        root.sheet = Sheet::None;
+                        root.close_sheet();
                         cx.notify();
                     }),
                 )
@@ -656,7 +691,7 @@ pub fn workspace_sheet(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
 impl Root {
     pub(super) fn toggle_palette(&mut self) {
         if self.sheet == Sheet::Palette {
-            self.sheet = Sheet::None;
+            self.close_sheet();
             return;
         }
         self.open_sheet(Sheet::Palette);
@@ -666,7 +701,13 @@ impl Root {
         self.sheet = sheet;
         self.sheet_text.clear();
         self.sheet_index = 0;
+        self.sheet_scroll.set_offset(Default::default());
         self.pending_focus = Some(Focus::Sheet);
+    }
+
+    pub(super) fn close_sheet(&mut self) {
+        self.sheet = Sheet::None;
+        self.pending_focus = Some(Focus::Composer);
     }
 
     pub(super) fn global_chord(&mut self, event: &KeyDownEvent) -> bool {
@@ -750,10 +791,6 @@ impl Root {
 
     pub(super) fn on_sheet_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
-        if key == "escape" {
-            self.sheet = Sheet::None;
-            return true;
-        }
         if self.sheet == Sheet::Palette {
             return self.palette_key(key, event, cx);
         }
@@ -764,44 +801,71 @@ impl Root {
     }
 
     fn palette_key(&mut self, key: &str, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let count =
-            build_palette_entries(&self.desk.state, &self.sheet_text, now_epoch_secs()).len();
+        let count = build_palette_entries(&self.desk.state, &self.sheet_text, now_epoch_secs())
+            .len()
+            .min(PALETTE_ROWS);
         match key {
             "up" => {
-                self.sheet_index = self.sheet_index.saturating_sub(1);
+                self.move_sheet_index(count, false);
                 true
             }
             "down" => {
-                self.sheet_index = (self.sheet_index + 1).min(count.saturating_sub(1));
+                self.move_sheet_index(count, true);
                 true
             }
             "enter" => {
                 self.activate_index(cx);
                 true
             }
-            "backspace" => pop_text(&mut self.sheet_text),
-            _ => push_text(&mut self.sheet_text, event),
+            _ => self.edit_sheet_query(key, event),
         }
     }
 
     fn workspace_key(&mut self, key: &str, event: &KeyDownEvent) -> bool {
-        let count = self.desk.state.workspaces.search(&self.sheet_text).len();
+        let count = self
+            .desk
+            .state
+            .workspaces
+            .search(&self.sheet_text)
+            .len()
+            .min(WORKSPACE_ROWS);
         match key {
             "up" => {
-                self.sheet_index = self.sheet_index.saturating_sub(1);
+                self.move_sheet_index(count, false);
                 true
             }
             "down" => {
-                self.sheet_index = (self.sheet_index + 1).min(count.saturating_sub(1));
+                self.move_sheet_index(count, true);
                 true
             }
             "enter" => {
                 self.commit_workspace();
                 true
             }
-            "backspace" => pop_text(&mut self.sheet_text),
-            _ => push_text(&mut self.sheet_text, event),
+            _ => self.edit_sheet_query(key, event),
         }
+    }
+
+    fn move_sheet_index(&mut self, count: usize, forward: bool) {
+        self.sheet_index = if forward {
+            (self.sheet_index + 1).min(count.saturating_sub(1))
+        } else {
+            self.sheet_index.saturating_sub(1)
+        };
+        self.sheet_scroll.scroll_to_item(self.sheet_index);
+    }
+
+    fn edit_sheet_query(&mut self, key: &str, event: &KeyDownEvent) -> bool {
+        let changed = if key == "backspace" {
+            pop_text(&mut self.sheet_text)
+        } else {
+            push_text(&mut self.sheet_text, event)
+        };
+        if changed {
+            self.sheet_index = 0;
+            self.sheet_scroll.set_offset(Default::default());
+        }
+        changed
     }
 
     fn field_key(&mut self, key: &str, event: &KeyDownEvent) -> bool {
@@ -842,9 +906,13 @@ impl Root {
                 self.sheet = Sheet::None;
                 self.pending_focus = Some(Focus::Session);
             }
+            PaletteAction::FindInTranscript => {
+                self.close_sheet();
+                self.open_find_chord();
+            }
             other => {
                 self.desk.run_palette(other);
-                self.sheet = Sheet::None;
+                self.close_sheet();
             }
         }
     }
@@ -854,7 +922,7 @@ impl Root {
             cx.write_to_clipboard(ClipboardItem::new_string(markdown));
             self.desk.state.notice = "Copied the conversation as Markdown.".into();
         }
-        self.sheet = Sheet::None;
+        self.close_sheet();
     }
 
     fn export_transcript(&mut self, cx: &mut Context<Self>) {
@@ -867,7 +935,7 @@ impl Root {
             Err(error) => format!("Export failed: {error}"),
         };
         cx.write_to_clipboard(ClipboardItem::new_string(markdown));
-        self.sheet = Sheet::None;
+        self.close_sheet();
     }
 
     fn commit_workspace(&mut self) {
@@ -877,7 +945,7 @@ impl Root {
             .and_then(|index| self.desk.state.workspaces.options.get(*index))
             .map(|option| option.root.clone());
         self.desk.choose_workspace(chosen);
-        self.sheet = Sheet::None;
+        self.close_sheet();
     }
 
     fn commit_field(&mut self) {
@@ -893,7 +961,7 @@ impl Root {
             }
             _ => {}
         }
-        self.sheet = Sheet::None;
+        self.close_sheet();
     }
 
     pub(super) fn on_find_key(&mut self, event: &KeyDownEvent) -> bool {

@@ -163,6 +163,7 @@ pub struct Root {
     sheet: chrome::Sheet,
     sheet_text: String,
     sheet_index: usize,
+    sheet_scroll: ScrollHandle,
     slash_index: usize,
     slash_hidden: bool,
     side_text: String,
@@ -205,6 +206,7 @@ impl Root {
             sheet: chrome::Sheet::None,
             sheet_text: String::new(),
             sheet_index: 0,
+            sheet_scroll: ScrollHandle::new(),
             slash_index: 0,
             slash_hidden: false,
             side_text: String::new(),
@@ -363,7 +365,7 @@ impl Root {
 
     fn escape(&mut self) -> bool {
         if self.sheet != chrome::Sheet::None {
-            self.sheet = chrome::Sheet::None;
+            self.close_sheet();
             return true;
         }
         if self.desk.state.transcript_find.open {
