@@ -168,6 +168,7 @@ pub struct Root {
     slash_hidden: bool,
     side_text: String,
     jump_to: Option<usize>,
+    revealed_find_match: Option<usize>,
     answer_qid: Option<String>,
     transcript: ScrollHandle,
     cursor: usize,
@@ -211,6 +212,7 @@ impl Root {
             slash_hidden: false,
             side_text: String::new(),
             jump_to: None,
+            revealed_find_match: None,
             answer_qid: None,
             transcript: ScrollHandle::new(),
             cursor: 0,
@@ -268,6 +270,7 @@ impl Root {
         self.agent_window = Some(window.window_handle());
         self.sync_cursor();
         self.claim_focus(window);
+        self.sync_find_match();
         self.follow_transcript();
     }
 
@@ -368,10 +371,6 @@ impl Root {
             self.close_sheet();
             return true;
         }
-        if self.desk.state.transcript_find.open {
-            self.desk.close_find();
-            return true;
-        }
         if self.desk.confirm.is_some() {
             self.desk.answer_confirm(false);
             return true;
@@ -379,6 +378,10 @@ impl Root {
         if self.desk.picker_open {
             self.desk.close_picker();
             self.pending_focus = Some(Focus::Composer);
+            return true;
+        }
+        if self.desk.state.transcript_find.open {
+            self.close_find();
             return true;
         }
         false
@@ -1067,7 +1070,7 @@ fn transcript(
     controls: &present::Controls,
     cx: &mut Context<Root>,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
+    let viewport = div()
         .id("transcript")
         .flex_1()
         .min_h(px(0.))
@@ -1077,19 +1080,11 @@ fn transcript(
             if wheel_up(&event.delta) {
                 root.desk.follow_bottom = false;
             }
-        }))
-        .child(transcript_body(root, controls, cx))
-}
-
-fn transcript_body(
-    root: &mut Root,
-    controls: &present::Controls,
-    cx: &mut Context<Root>,
-) -> gpui::Div {
+        }));
     if controls.show_messages {
-        message_column(root, cx)
+        message_column(viewport, root, cx)
     } else {
-        empty_state()
+        viewport.child(empty_state())
     }
 }
 
@@ -1120,28 +1115,34 @@ fn empty_state() -> gpui::Div {
         )
 }
 
-fn message_column(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+fn message_column(
+    viewport: gpui::Stateful<gpui::Div>,
+    root: &Root,
+    cx: &mut Context<Root>,
+) -> gpui::Stateful<gpui::Div> {
     let messages = root
         .desk
         .state
         .selected
         .as_ref()
         .and_then(|id| root.desk.state.conversations.get(id))
-        .map(|chat| chat.messages.clone())
-        .unwrap_or_default();
-    let mut column = div()
+        .map_or(&[][..], |chat| chat.messages.as_slice());
+    let mut column = viewport
         .flex()
         .flex_col()
         .gap(px(12.))
-        .p(px(24.))
-        .w_full()
-        .max_w(px(860.))
-        .mx_auto();
+        .p(px(24.));
     let active = root
         .jump_to
         .or_else(|| root.desk.state.transcript_find.active_message_index());
-    for (index, message) in messages.into_iter().enumerate() {
-        column = column.child(message_card(&message, index, active == Some(index), cx));
+    for (index, message) in messages.iter().enumerate() {
+        column = column.child(
+            message_card(message, index, active == Some(index), cx)
+                .flex_shrink_0()
+                .w_full()
+                .max_w(px(812.))
+                .mx_auto(),
+        );
     }
     column
 }

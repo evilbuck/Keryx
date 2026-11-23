@@ -30,16 +30,21 @@ pub enum Sheet {
 const PALETTE_ROWS: usize = 12;
 const WORKSPACE_ROWS: usize = 8;
 
-pub fn header_tools(_root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
+pub fn header_tools(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     div()
         .flex()
         .items_center()
         .gap(px(8.))
-        .child(tool_button("find-chat", "Find", cx, |root, _, cx| {
-            root.desk.open_find(None);
-            root.pending_focus = Some(Focus::Find);
-            cx.notify();
-        }))
+        .child(text_button(
+            "find-chat",
+            "Find",
+            root.desk.state.selected.is_some(),
+            false,
+            cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+                root.open_find_chord();
+                cx.notify();
+            }),
+        ))
         .child(tool_button("palette", "Commands", cx, |root, _, cx| {
             root.toggle_palette();
             cx.notify();
@@ -187,6 +192,8 @@ pub fn find_bar(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
             div()
                 .id("find-query")
                 .flex_1()
+                .min_w(px(0.))
+                .truncate()
                 .track_focus(&root.find_focus)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -204,15 +211,15 @@ pub fn find_bar(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
                 .child(count),
         )
         .child(tool_button("find-prev", "Prev", cx, |root, _, cx| {
-            root.desk.step_find(-1);
+            root.move_find_match(-1);
             cx.notify();
         }))
         .child(tool_button("find-next", "Next", cx, |root, _, cx| {
-            root.desk.step_find(1);
+            root.move_find_match(1);
             cx.notify();
         }))
         .child(tool_button("find-close", "Close", cx, |root, _, cx| {
-            root.desk.close_find();
+            root.close_find();
             cx.notify();
         }))
 }
@@ -514,6 +521,7 @@ fn outline_row(entry: crate::model::OutlineEntry, cx: &mut Context<Root>) -> gpu
             false,
             cx.listener(move |root, _: &gpui::MouseDownEvent, _, cx| {
                 root.jump_to = Some(index);
+                root.scroll_to_message(index);
                 cx.notify();
             }),
         ))
@@ -732,8 +740,9 @@ impl Root {
     }
 
     fn open_find_chord(&mut self) {
-        self.desk.open_find(None);
-        self.pending_focus = Some(Focus::Find);
+        if self.desk.open_find(None) {
+            self.pending_focus = Some(Focus::Find);
+        }
     }
 
     pub(super) fn try_recall(&mut self, key: &str, mods: &gpui::Modifiers) -> bool {
@@ -964,19 +973,45 @@ impl Root {
         self.close_sheet();
     }
 
+    pub(super) fn close_find(&mut self) {
+        self.desk.close_find();
+        self.pending_focus = Some(Focus::Composer);
+    }
+
+    fn move_find_match(&mut self, delta: isize) {
+        let active = self.desk.step_find(delta);
+        self.reveal_find_match(active);
+    }
+
+    pub(super) fn sync_find_match(&mut self) {
+        let active = self.desk.state.transcript_find.active_message_index();
+        if active != self.revealed_find_match {
+            self.reveal_find_match(active);
+        }
+    }
+
+    fn reveal_find_match(&mut self, active: Option<usize>) {
+        self.revealed_find_match = active;
+        self.jump_to = None;
+        if let Some(index) = active {
+            self.scroll_to_message(index);
+        }
+    }
+
+    fn scroll_to_message(&mut self, index: usize) {
+        self.desk.follow_bottom = false;
+        self.transcript.scroll_to_top_of_item(index);
+    }
+
     pub(super) fn on_find_key(&mut self, event: &KeyDownEvent) -> bool {
         let key = event.keystroke.key.as_str();
-        if key == "escape" {
-            self.desk.close_find();
-            return true;
-        }
         if key == "enter" {
             let delta = if event.keystroke.modifiers.shift {
                 -1
             } else {
                 1
             };
-            self.desk.step_find(delta);
+            self.move_find_match(delta);
             return true;
         }
         if key == "backspace" {
