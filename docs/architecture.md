@@ -26,7 +26,7 @@ The composer is a multiline editor anchored at the bottom. Enter sends. Shift+En
 
 The composer's bottom-left trigger names the model and its provider, and opens a popover with a search field over the server's configured catalog. Rows keep provider and model together: the same model name under two providers is two rows, and a row whose name cannot be sent to the gateway (whitespace, or a leading `-`) is shown as unavailable instead of being silently rewritten. Search is local: it never sends a request and never selects anything. Hover does not commit; only an explicit row activation or Enter inside the search field does. Enter in the picker never submits the draft, and Escape returns focus to the editor.
 
-The popover is anchored above the model button and follows it when the layout changes. Clicking outside it dismisses it without blocking the clicked control. Clicking the model button again also dismisses it.
+The popover opens above the model button and shrinks to the composer width instead of sliding over the conversation drawer. It blocks clicks through to covered controls; clicks outside dismiss it without blocking the clicked control. Clicking the model button again also dismisses it.
 
 The catalog is fetched once per connection with `explicit_only: true`, `include_unconfigured: false`, and `refresh: false`, and is dropped when the connection closes so a reconnect cannot show another connection's rows.
 

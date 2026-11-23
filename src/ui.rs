@@ -13,8 +13,8 @@ use gpui::{
     App, Application, Bounds, ClipboardItem, Context, FocusHandle, FontWeight, KeyBinding,
     KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PlatformInput, ScrollDelta, ScrollHandle, ScrollWheelEvent, TitlebarOptions, Window,
-    WindowBounds, WindowDecorations, WindowOptions, actions, anchored, deferred, div, point,
-    prelude::*, px, rgb, size,
+    WindowBounds, WindowDecorations, WindowOptions, actions, canvas, div, point, prelude::*, px,
+    rgb, size,
 };
 
 use crate::automation::{Automation, Request};
@@ -1508,6 +1508,7 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
         .child(composer_input(root, controls, cx))
         .child(
             div()
+                .relative()
                 .flex()
                 .items_center()
                 .gap(px(8.))
@@ -1524,7 +1525,10 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
                     "Regenerate",
                     crate::model::RewindMode::Regenerate,
                     cx,
-                )),
+                ))
+                .when(root.desk.picker_open, |row| {
+                    row.child(picker_anchor(root, cx))
+                }),
         )
         .child(composer_actions(controls, cx))
 }
@@ -1589,7 +1593,6 @@ fn model_trigger(
     let provider = present::model_provider_line(&model, &root.desk.state.catalog);
     div()
         .id("model-trigger")
-        .relative()
         .flex()
         .flex_col()
         .px(px(8.))
@@ -1622,15 +1625,6 @@ fn model_trigger(
                 .text_color(rgb(0x9a9aa3))
                 .child(provider),
         )
-        .when(root.desk.picker_open, |trigger| {
-            trigger.child(deferred(
-                anchored()
-                    .anchor(gpui::Corner::BottomLeft)
-                    .offset(point(px(0.), px(-6.)))
-                    .snap_to_window()
-                    .child(picker(root, cx)),
-            ))
-        })
 }
 
 fn open_model(desk: &Desk) -> ModelState {
@@ -1719,6 +1713,25 @@ fn overlay(root: &mut Root, cx: &mut Context<Root>) -> Vec<gpui::AnyElement> {
     layers
 }
 
+fn picker_anchor(root: &mut Root, cx: &mut Context<Root>) -> impl IntoElement {
+    let panel = picker(root, cx);
+    // Measure against the composer row, not the window: the drawer is outside this space.
+    canvas(
+        move |bounds, window, cx| {
+            let bottom = (bounds.top() - px(6.)).max(px(0.));
+            let width = bounds.size.width.min(px(380.));
+            let mut panel = panel.w(width).max_h(bottom).into_any_element();
+            let measured = panel.layout_as_root(size(width, bottom).into(), window, cx);
+            window.defer_draw(panel, point(bounds.left(), bottom - measured.height), 0);
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .w_full()
+}
+
 fn picker(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
     let rows = root.desk.picker_rows();
     let status = present::picker_status(&root.desk.state.catalog, rows.len());
@@ -1736,7 +1749,6 @@ fn picker(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
             }
             cx.notify();
         }))
-        .w(px(380.))
         .flex()
         .flex_col()
         .gap(px(8.))
@@ -1796,6 +1808,7 @@ fn model_list(
         .flex()
         .flex_col()
         .gap(px(4.))
+        .min_h(px(0.))
         .max_h(px(320.))
         .overflow_y_scroll();
     for (index, option) in rows.iter().enumerate() {

@@ -12,3 +12,13 @@ In `hermes-native --preview --agent-socket PATH`, acknowledge the `sidebar` phas
 The local GPUI preview passed search interaction, dismissal on a blank area, Commands opening and Conversations toggling on the same outside click, trigger re-click, reopening after sidebar reflow, and Escape returning focus to the composer. A compositor capture confirmed that the panel sits above the trigger. No live gateway was needed. Keep the separate model-switch backend acceptance item open.
 
 The deterministic guardrails verdict was `pass`: unit tests, lint, coverage ratchet (62.6% vs. 43.2%), and complexity passed. The optional live-gateway smoke was pointed at a closed loopback endpoint to avoid remote mutations; it reported the expected connection failure.
+
+## Narrow-window follow-up
+
+At the minimum 640×480 window size, the first fix still shifted the 380-pixel picker left to fit the window. The picker background began at x=261; the conversation drawer ended at x=280. This reproduced the visual overlap on the anchored build. The pre-existing release executable was older still and did not recognize `--agent-socket`.
+
+The anchor now uses the composer action row's measured bounds. It constrains the picker to that width and to the height above the row, then defers painting and hit-testing together. The picker still blocks clicks through its panel and dismisses on outside presses without consuming them.
+
+Verified with the rebuilt `target/release/hermes-native --preview` at 640×480 on Hyprland. The picker began at x=308 and ended at x=612. Clicking its search field kept the picker open; clicking the `other` model closed it, registered picker index 1, and left Design notes selected. Reopening the picker and clicking Kanban board in the drawer intentionally selected that conversation and dismissed the picker.
+
+Required guardrails passed (including lint and 62.5% coverage against the 43.2% baseline). The advisory gateway smoke was kept off the real gateway.
