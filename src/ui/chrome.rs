@@ -1031,6 +1031,9 @@ impl Root {
     }
 
     pub(super) fn on_find_key(&mut self, event: &KeyDownEvent) -> bool {
+        if is_chord(event) {
+            return false;
+        }
         let key = event.keystroke.key.as_str();
         if key == "enter" {
             let delta = if event.keystroke.modifiers.shift {
@@ -1057,6 +1060,9 @@ impl Root {
     }
 
     pub(super) fn on_session_key(&mut self, event: &KeyDownEvent) -> bool {
+        if is_chord(event) {
+            return false;
+        }
         let key = event.keystroke.key.as_str();
         if key == "escape" {
             self.pending_focus = Some(Focus::Composer);
@@ -1078,6 +1084,9 @@ impl Root {
     }
 
     pub(super) fn on_side_key(&mut self, event: &KeyDownEvent) -> bool {
+        if is_chord(event) {
+            return false;
+        }
         let key = event.keystroke.key.as_str();
         if key == "enter" {
             let question = std::mem::take(&mut self.side_text);
@@ -1096,9 +1105,42 @@ impl Root {
     }
 }
 
+/// True for key events that belong to a shortcut chord (Ctrl/Alt/Cmd), so
+/// plain-text fields never swallow them as typed letters.
+fn is_chord(event: &KeyDownEvent) -> bool {
+    let mods = &event.keystroke.modifiers;
+    mods.control || mods.alt || mods.platform
+}
+
 fn pop_text(text: &mut String) -> bool {
     text.pop();
     true
+}
+#[cfg(test)]
+mod chord_tests {
+    use super::*;
+    use gpui::{KeyDownEvent, Keystroke, Modifiers};
+
+    fn event(key: &str, key_char: Option<&str>, control: bool) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    control,
+                    ..Default::default()
+                },
+                key: key.into(),
+                key_char: key_char.map(String::from),
+            },
+            is_held: false,
+        }
+    }
+
+    #[test]
+    fn chorded_keys_are_ignored_by_text_fields() {
+        // Ctrl+V must not type a literal "v" into find, session, or side fields.
+        assert!(is_chord(&event("v", Some("v"), true)));
+        assert!(!is_chord(&event("v", Some("v"), false)));
+    }
 }
 
 fn push_text(text: &mut String, event: &KeyDownEvent) -> bool {

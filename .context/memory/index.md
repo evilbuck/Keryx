@@ -7,7 +7,7 @@ status: active
 
 # Memory index
 
-- [gpui-rust-compat-2026-11-22.md](gpui-rust-compat-2026-11-22.md) — explicit `f32` grid literals and a `stacksafe` upgrade remove the reported Rust future-incompatibility warnings.
+- [chord-guard-fields-2026-11-23.md](chord-guard-fields-2026-11-23.md) — find/session/side text fields ignore Ctrl/Alt/Cmd chords; UI bug-hunt loop 2.
 - [slash-menu-state-2026-11-23.md](slash-menu-state-2026-11-23.md) — slash suggestion menu: shared-edit-path selection reset, Escape dismissal persistence, count clamp; UI bug-hunt loop 1.
 - [transcript-role-styling-2026-11-11.md](transcript-role-styling-2026-11-11.md) — per-role transcript styling (user/assistant/tool/system) with tool chips; complexity refactor of steering hotspots; ratchet baselines updated (coverage 43.2, 12 hotspots).
 - [model-picker-2026-11-10.md](model-picker-2026-11-10.md) — composer model picker; provider-less prime; empty-chat ACK is not proof after a grok-4.7 inference mismatch.
