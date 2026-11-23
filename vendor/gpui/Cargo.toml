@@ -375,7 +375,8 @@ features = ["union"]
 version = "2.0"
 
 [dependencies.stacksafe]
-version = "0.1"
+# 1.0.2 dropped proc-macro-error2, which re-exports a private extern crate.
+version = "1.0.2"
 
 [dependencies.strum]
 version = "0.27.2"
