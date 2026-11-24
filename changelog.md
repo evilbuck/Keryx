@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- The attach affordance is now a small paperclip icon sitting on the composer input row, just left of the message box, instead of a standalone **Attach** button row above the composer. Staged-file chips still appear above the composer when attachments are pending.
 - The message input shows a blue outline and a blinking caret when focused, even before you type.
 
 - Shortcut chords no longer type letters into the find bar, session search, and side-ask fields: Ctrl/Alt/Cmd-modified keys (e.g. Ctrl+V) were being inserted as literal characters ("v") into the query text.

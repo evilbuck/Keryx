@@ -1431,7 +1431,9 @@ fn footer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>)
         .when(chrome::slash_open(root), |column| {
             column.child(chrome::slash_row(root, cx))
         })
-        .child(chrome::attachment_row(root, cx))
+        .when(!root.desk.state.active_attachments().is_empty(), |column| {
+            column.child(chrome::attachment_row(root, cx))
+        })
         .when(controls.spinning || !controls.activity.is_empty(), |column| {
             column.child(activity_row(controls, root.spin))
         })
@@ -1685,7 +1687,14 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
         .border_1()
         .border_color(rgb(0x3a3a42))
         .bg(rgb(0x1c1c22))
-        .child(composer_input(root, controls, cx))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(chrome::paperclip_button(cx))
+                .child(composer_input(root, controls, cx).flex_1()),
+        )
         .child(
             div()
                 .relative()
