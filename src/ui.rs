@@ -34,6 +34,7 @@ const SIDEBAR_WIDTH: f32 = 280.;
 const INSPECTOR_WIDTH: f32 = 320.;
 const MIN_CHAT_WIDTH: f32 = 320.;
 const COMPACT_FOOTER_HEIGHT: f32 = 560.;
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Launch {
     pub config: Result<Config, String>,
@@ -155,6 +156,11 @@ impl Preview {
     }
 }
 
+struct CaretBlink {
+    next_toggle: Instant,
+    visible: bool,
+}
+
 pub struct Root {
     desk: Desk,
     sidebar_was_open: bool,
@@ -179,6 +185,7 @@ pub struct Root {
     transcript: ScrollHandle,
     draft_scroll: ScrollHandle,
     reveal_draft_caret: bool,
+    caret_blink: Option<CaretBlink>,
     cursor: usize,
     anchor: usize,
     seen_generation: u64,
@@ -227,6 +234,7 @@ impl Root {
             transcript: ScrollHandle::new(),
             draft_scroll: ScrollHandle::new(),
             reveal_draft_caret: false,
+            caret_blink: None,
             cursor: 0,
             anchor: 0,
             seen_generation: 0,
@@ -272,10 +280,39 @@ impl Root {
             });
         }
         self.spin = self.spin.wrapping_add(1);
-        if changed || stepped || queued || self.pending_agent.is_some() {
+        let caret_changed = self.tick_caret();
+        if changed || stepped || queued || caret_changed || self.pending_agent.is_some() {
             cx.notify();
         }
         self.arm(cx);
+    }
+
+    fn tick_caret(&mut self) -> bool {
+        let Some(blink) = &mut self.caret_blink else {
+            return false;
+        };
+        let now = Instant::now();
+        if now < blink.next_toggle {
+            return false;
+        }
+        blink.visible = !blink.visible;
+        blink.next_toggle = now + CARET_BLINK_INTERVAL;
+        true
+    }
+
+    fn sync_caret_blink(&mut self, window: &Window, editable: bool) {
+        if !editable
+            || !window.is_window_active()
+            || !self.composer_focus.is_focused(window)
+            || self.anchor != self.cursor
+        {
+            self.caret_blink = None;
+        } else if self.caret_blink.is_none() || self.reveal_draft_caret {
+            self.caret_blink = Some(CaretBlink {
+                next_toggle: Instant::now() + CARET_BLINK_INTERVAL,
+                visible: true,
+            });
+        }
     }
 
     fn prepare(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
@@ -699,6 +736,7 @@ impl gpui::Render for Root {
             self.desk.state.transcript_find.open && self.find_focus.is_focused(window);
         let compact_footer = self.compact_turn_controls(window)
             || (viewport.height < px(COMPACT_FOOTER_HEIGHT) && find_focused);
+        self.sync_caret_blink(window, !compact_footer && controls.readonly.is_none());
         shell(self, &controls, &connection, compact_header, compact_footer, cx)
     }
 }
@@ -1643,9 +1681,9 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
         .flex_col()
         .gap(px(8.))
         .p(px(10.))
+        .rounded(px(14.))
+        .border_1()
         .border_color(rgb(0x3a3a42))
-        .track_focus(&root.composer_focus)
-        .focus(|style| style.border_color(rgb(0x6f8cff)))
         .bg(rgb(0x1c1c22))
         .child(composer_input(root, controls, cx))
         .child(
@@ -1689,12 +1727,21 @@ fn composer_input(
         .flex_col()
         .overflow_y_scroll()
         .track_scroll(&root.draft_scroll)
-        .pr(px(2.))
+        .px(px(8.))
+        .py(px(5.))
+        .rounded(px(8.))
+        .border_2()
+        .border_color(rgb(0x45454f))
+        .bg(rgb(0x18181e))
         .track_focus(&root.composer_focus)
+        .when(controls.readonly.is_none(), |input| {
+            input.focus(|style| style.border_color(rgb(0x7ab0ff)).bg(rgb(0x222b3b)))
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| {
                 root.composer_focus.focus(window);
+                root.caret_blink = None;
                 cx.notify();
             }),
         )
@@ -1703,16 +1750,13 @@ fn composer_input(
 
 fn composer_text(root: &mut Root, read_only: bool) -> gpui::Div {
     let reveal = std::mem::take(&mut root.reveal_draft_caret);
-    let draft = root.desk.draft();
-    if draft.is_empty() {
-        return div().text_color(rgb(0x8a8a92)).child(if read_only {
-            "Read only"
-        } else {
-            "Message"
-        });
-    }
+    let mut draft = root.desk.draft();
+    let placeholder = draft.is_empty();
     let (start, end) = selection_of(&draft, root.anchor, root.cursor);
     let cursor = floor_boundary(&draft, root.cursor.min(draft.len()));
+    if placeholder {
+        draft = if read_only { "Read only" } else { "Message" }.into();
+    }
     let mut text = gpui::StyledText::new(draft);
     if start != end {
         let selection = gpui::HighlightStyle {
@@ -1724,13 +1768,14 @@ fn composer_text(root: &mut Root, read_only: bool) -> gpui::Div {
     let caret = composer_caret(
         text.layout().clone(),
         cursor,
-        start == end,
+        root.caret_blink.as_ref().is_some_and(|blink| blink.visible),
         reveal.then(|| root.draft_scroll.clone()),
     );
     div()
         .relative()
         .w_full()
         .flex_shrink_0()
+        .when(placeholder, |line| line.text_color(rgb(0x8a8a92)))
         .child(text)
         .child(caret)
 }
@@ -1744,7 +1789,7 @@ fn composer_caret(
     canvas(
         move |_, window, _| {
             let origin = layout.position_for_index(cursor)?;
-            let caret = Bounds::new(origin, size(px(1.), layout.line_height()));
+            let caret = Bounds::new(origin, size(px(2.), layout.line_height()));
             if let Some(scroll) = scroll {
                 reveal_caret(scroll, caret, window);
             }
@@ -1752,7 +1797,7 @@ fn composer_caret(
         },
         |_, caret, window, _| {
             if let Some(caret) = caret {
-                window.paint_quad(gpui::fill(caret, rgb(0xffffff)));
+                window.paint_quad(gpui::fill(caret, rgb(0x7ab0ff)));
             }
         },
     )
