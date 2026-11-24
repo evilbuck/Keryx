@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- **Choose a model** works in a new conversation before the first message. The first send creates the session with the chosen model and provider instead of trying to switch an already-created empty session.
 - The attach affordance is now a small paperclip icon sitting on the composer input row, just left of the message box, instead of a standalone **Attach** button row above the composer. Staged-file chips still appear above the composer when attachments are pending.
 - The message input shows a blue outline and a blinking caret when focused, even before you type.
 

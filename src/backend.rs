@@ -312,11 +312,16 @@ fn undo_rpc_params(runtime_id: &str, mode: RewindMode) -> Value {
     })
 }
 
-fn create_rpc_params(title: &str, cwd: Option<&str>) -> Value {
+fn create_rpc_params(title: &str, cwd: Option<&str>, model: Option<ModelIdentity>) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("title".into(), Value::String(title.to_string()));
     if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
         map.insert("cwd".into(), Value::String(dir.to_string()));
+    }
+    if let Some(model) = model {
+        map.insert("model".into(), Value::String(model.model));
+        map.insert("provider".into(), Value::String(model.provider));
+        map.insert("follow_profile_config".into(), Value::Bool(true));
     }
     Value::Object(map)
 }
@@ -1394,7 +1399,7 @@ impl Link {
             | Command::SearchSessions { .. }
             | Command::MutateSession { .. }
             | Command::FetchStudio => self.http_command(command).await,
-            Command::Create { title, cwd } => self.begin_create(title, cwd).await,
+            Command::Create { title, cwd, model } => self.begin_create(title, cwd, model).await,
             Command::Resume { stored_id } => self.begin_resume(stored_id).await,
             Command::Submit {
                 runtime_id,
@@ -1499,8 +1504,13 @@ impl Link {
             .await;
     }
 
-    async fn begin_create(&mut self, title: String, cwd: Option<String>) {
-        let params = create_rpc_params(&title, cwd.as_deref());
+    async fn begin_create(
+        &mut self,
+        title: String,
+        cwd: Option<String>,
+        model: Option<ModelIdentity>,
+    ) {
+        let params = create_rpc_params(&title, cwd.as_deref(), model);
         if let Err(fault) = self
             .send_rpc(
                 "session.create",
@@ -10415,12 +10425,23 @@ mod tests {
     #[test]
     fn studio_http_helpers_create_params_and_compress_noop_roundtrip() {
         assert_eq!(
-            create_rpc_params("Work", Some(" /home/alice/repo ")),
+            create_rpc_params("Work", Some(" /home/alice/repo "), None),
             json!({"title": "Work", "cwd": "/home/alice/repo"})
         );
         assert_eq!(
-            create_rpc_params("Work", Some("  ")),
+            create_rpc_params("Work", Some("  "), None),
             json!({"title": "Work"})
+        );
+        let model = ModelIdentity::parse(Some("custom:acme"), Some("other")).unwrap();
+        assert_eq!(
+            create_rpc_params("Work", Some("/repo"), Some(model)),
+            json!({
+                "title": "Work",
+                "cwd": "/repo",
+                "model": "other",
+                "provider": "custom:acme",
+                "follow_profile_config": true
+            })
         );
         assert!(is_queueable_while_connecting(&Command::FetchStudio));
         assert_eq!(

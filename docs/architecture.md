@@ -16,7 +16,7 @@ The UI entity is `ui::Root`. It reads `desk::Desk` and paints with `div` element
 
 ## Window
 
-The sidebar lists server session metadata and offers **New conversation** (also Ctrl+N). Rows show the server title, source, and a read-only mark when resume is refused. Selecting a row does not create another chat.
+The sidebar lists server session metadata and offers **New conversation** (also Ctrl+N). New conversation opens the local draft composer; the client creates a server session when the first message is sent. Rows show the server title, source, and a read-only mark when resume is refused. Selecting a row does not create another chat.
 
 At narrow widths the header puts conversation tools on a second row, leaving connection status and Reconnect beside the title. Long titles truncate rather than pushing controls out of the window.
 
@@ -44,13 +44,15 @@ The popover opens above the model button and shrinks to the composer width inste
 
 The catalog is fetched once per connection with `explicit_only: true`, `include_unconfigured: false`, and `refresh: false`, and is dropped when the connection closes so a reconnect cannot show another connection's rows.
 
+In the new-chat composer, a model pick stays with the local draft. The first send passes the chosen `model` and `provider` to `session.create` with `follow_profile_config: true`, then submits the prompt to the returned session. With no pick, creation uses the server default. A failed create keeps both the draft and its model pick.
+
 A switch is `config.set` with `session_id`, `key: "model"`, and the value `<model> --provider <provider> --session`. `--session` is mandatory: without it the gateway may persist the choice as the profile default, and a reply whose `scope` is not `session` is treated as a refusal. A value with quoted tokens is rejected by the gateway's `split()` tokenizer, which is why unrepresentable catalog rows are disabled rather than quoted.
 
-A chat that has never run has no agent yet. The client sends a provider-less prime first, then the scoped switch. That acknowledgement is not treated as proof: a repeat against this gateway has had the first inference report a different model. The trigger stays on "Switching to …" until the completion's `usage.model` arrives, and a different reported model replaces the selection. A chat that has already run switches directly, and a session-scoped acknowledgement confirms that pair.
+An already-created chat that has never run has no agent yet. Switching it still sends a provider-less prime first, then the scoped switch. That acknowledgement is not treated as proof: a repeat against this gateway has had the first inference report a different model. The trigger stays on "Switching to …" until the completion's `usage.model` arrives, and a different reported model replaces the selection. A chat that has already run switches directly, and a session-scoped acknowledgement confirms that pair.
 
 A switch made while a turn streams is answered `deferred: true`. It applies from the next turn: the running turn keeps the model it started with, and the trigger says so. A deferred reply is the only queued state the client shows.
 
-The displayed model is never inferred from the catalog. It comes from create and cold-resume metadata, or from the completion's `usage.model` for an inference that actually ran. A pending switch reads "Switching to …", a deferred one reads "… · next turn", and a request that never answered reads "unconfirmed" and is not retried. A definite refusal or a cancelled confirmation keeps the previous selection and the draft. When the gateway returns `confirm_required` the client asks explicitly and only then repeats the same target with `confirm_expensive_model: true`.
+Outside the local new-chat draft, the displayed model is never inferred from the catalog. It comes from create and cold-resume metadata, or from the completion's `usage.model` for an inference that actually ran. A pending switch reads "Switching to …", a deferred one reads "… · next turn", and a request that never answered reads "unconfirmed" and is not retried. A definite refusal or a cancelled confirmation keeps the previous selection and the draft. When the gateway returns `confirm_required` the client asks explicitly and only then repeats the same target with `confirm_expensive_model: true`.
 
 Lazy `model.options` is not used as evidence of a chat's effective model: for an uninitialized session it reports the profile default.
 

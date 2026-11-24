@@ -788,6 +788,7 @@ pub enum Command {
     Create {
         title: String,
         cwd: Option<String>,
+        model: Option<ModelIdentity>,
     },
     Resume {
         stored_id: String,
@@ -2634,6 +2635,7 @@ pub struct AppState {
     pub workspaces: WorkspaceCatalog,
     pub skills: Vec<SkillSummary>,
     pub launch_cwd: Option<String>,
+    pub launch_model: Option<ModelIdentity>,
     pub launch_attachments: Vec<StagedImage>,
     pub session_filter: SessionFilter,
     pub session_query: String,
@@ -2912,6 +2914,23 @@ impl AppState {
         }
     }
 
+    pub(crate) fn launch_ready(&self) -> bool {
+        self.connection == Some(ConnectionState::Connected)
+            && self.selected.is_none()
+            && !self.creating
+            && self.pending_launch.is_none()
+    }
+
+    pub(crate) fn model_picker_enabled(&self, conversation: Option<&Conversation>) -> bool {
+        self.launch_ready()
+            || (self.connection == Some(ConnectionState::Connected)
+                && conversation.is_some_and(|chat| {
+                    chat.runtime_id.is_some()
+                        && chat.read_only_reason.is_none()
+                        && !chat.model.switching()
+                }))
+    }
+
     /// Begin creating a conversation from the launch composer (`selected == None`).
     /// Keeps `launch_draft` and `launch_attachments` intact until `Created` succeeds so a failure never loses input.
     pub fn begin_launch_submit(&mut self) -> Option<(String, String)> {
@@ -2937,6 +2956,7 @@ impl AppState {
     pub fn take_pending_launch(&mut self) -> Option<String> {
         let prompt = self.pending_launch.take()?;
         self.launch_draft.clear();
+        self.launch_model = None;
         Some(prompt)
     }
 
@@ -2944,20 +2964,6 @@ impl AppState {
         let prompt = self.take_pending_launch()?;
         let attachments = std::mem::take(&mut self.launch_attachments);
         Some((prompt, attachments))
-    }
-
-    pub fn take_launch_draft_for_blank_chat(&mut self) -> String {
-        if self.pending_launch.is_some() {
-            return String::new();
-        }
-        std::mem::take(&mut self.launch_draft)
-    }
-
-    pub fn take_launch_attachments_for_blank_chat(&mut self) -> Vec<StagedImage> {
-        if self.pending_launch.is_some() {
-            return Vec::new();
-        }
-        std::mem::take(&mut self.launch_attachments)
     }
 
     pub fn allocate_attachment_id(&mut self) -> u64 {
@@ -3173,7 +3179,7 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
             PaletteAction::NewChat,
             "list-add-symbolic",
             "New conversation",
-            "Create a fresh server-owned chat",
+            "Open the composer for a new chat",
             "Ctrl+N",
         ));
     }
@@ -3190,7 +3196,7 @@ fn palette_commands(state: &AppState) -> Vec<PaletteEntry> {
         connected,
         writable,
     ));
-    if writable && conversation.is_some_and(|c| !c.model.switching()) {
+    if state.model_picker_enabled(conversation) {
         out.push(PaletteEntry::command(
             PaletteAction::SwitchModel,
             "preferences-system-symbolic",
@@ -4518,6 +4524,8 @@ mod tests {
 
         let mut state = AppState::default();
         state.set_active_draft("  Ship command palette  ".into());
+        let model = ModelIdentity::parse(Some("custom:acme"), Some("other")).unwrap();
+        state.launch_model = Some(model.clone());
         assert_eq!(state.active_draft(), "  Ship command palette  ");
         let (title, prompt) = state.begin_launch_submit().expect("launch submit");
         assert_eq!(title, "Ship command palette");
@@ -4530,6 +4538,7 @@ mod tests {
         assert!(!state.creating);
         assert!(state.pending_launch.is_none());
         assert_eq!(state.launch_draft, "  Ship command palette  ");
+        assert_eq!(state.launch_model.as_ref(), Some(&model));
 
         let _ = state.begin_launch_submit().expect("retry launch submit");
         assert_eq!(
@@ -4537,6 +4546,7 @@ mod tests {
             Some("Ship command palette")
         );
         assert!(state.launch_draft.is_empty());
+        assert!(state.launch_model.is_none());
     }
 
     #[test]

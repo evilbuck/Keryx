@@ -208,20 +208,20 @@ impl Desk {
         self.sidebar_open = !self.sidebar_open;
     }
 
-    pub fn create(&mut self) -> bool {
+    pub fn new_chat(&mut self) -> bool {
         if !self.controls().new_chat {
             return false;
         }
-        self.select_created = true;
-        self.state.creating = true;
-        if !self.command(Command::Create {
-            title: "New conversation".into(),
-            cwd: self.state.launch_cwd.clone(),
-        }) {
-            self.state.creating = false;
-            self.select_created = false;
-            return false;
-        }
+        self.state.selected = None;
+        self.state.notice.clear();
+        self.state.pending_find_query = None;
+        self.state.pending_find_session = None;
+        self.close_find();
+        self.close_picker();
+        self.follow_bottom = true;
+        self.recall = PromptRecall::default();
+        self.bump_draft();
+        self.sync_questions();
         true
     }
 
@@ -352,6 +352,9 @@ impl Desk {
     }
 
     pub fn commit_picker_index(&mut self, index: usize) -> bool {
+        if !self.state.model_picker_enabled(self.open_chat()) {
+            return false;
+        }
         let rows = self.picker_rows();
         let Some(option) = rows.get(index) else {
             return false;
@@ -634,10 +637,11 @@ impl Desk {
     }
 
     fn choose_model(&mut self, target: ModelIdentity, confirm: bool) {
-        let Some(stored) = self.state.selected.clone() else {
-            return;
-        };
-        self.choose_for(&stored, target, confirm);
+        if let Some(stored) = self.state.selected.clone() {
+            self.choose_for(&stored, target, confirm);
+        } else {
+            self.state.launch_model = Some(target);
+        }
     }
 
     fn choose_for(&mut self, stored: &str, target: ModelIdentity, confirm: bool) {
@@ -921,16 +925,13 @@ impl Desk {
         runtime_id: String,
         model: Option<ModelIdentity>,
     ) -> Option<(String, Vec<StagedImage>)> {
-        let draft = self.state.take_launch_draft_for_blank_chat();
-        let attachments = self.state.take_launch_attachments_for_blank_chat();
         let bundle = self.state.take_pending_launch_bundle();
         let cwd = self.state.launch_cwd.clone().unwrap_or_default();
         let id = session.stored_id.clone();
         self.state.sessions.insert(0, session);
-        self.state.conversations.insert(
-            id,
-            created_conversation(runtime_id, draft, attachments, cwd, model),
-        );
+        self.state
+            .conversations
+            .insert(id, created_conversation(runtime_id, cwd, model));
         bundle
     }
 
@@ -1266,8 +1267,11 @@ impl Desk {
             return false;
         };
         self.select_created = true;
-        let cwd = self.state.launch_cwd.clone();
-        if !self.command(Command::Create { title, cwd }) {
+        if !self.command(Command::Create {
+            title,
+            cwd: self.state.launch_cwd.clone(),
+            model: self.state.launch_model.clone(),
+        }) {
             self.state.cancel_pending_launch();
             self.select_created = false;
             return false;
@@ -1571,9 +1575,8 @@ impl Desk {
 
     pub fn choose_workspace(&mut self, cwd: Option<String>) -> bool {
         let chosen = blank_to_none(cwd);
-        if workspace_starts_new(&self.state, chosen.as_deref()) {
-            self.state.launch_cwd = chosen;
-            return self.create();
+        if workspace_starts_new(&self.state, chosen.as_deref()) && !self.new_chat() {
+            return false;
         }
         self.apply_cwd(chosen);
         true
@@ -1622,7 +1625,7 @@ impl Desk {
 
     fn run_navigation(&mut self, action: &PaletteAction) -> Option<bool> {
         match action {
-            PaletteAction::NewChat => Some(self.create()),
+            PaletteAction::NewChat => Some(self.new_chat()),
             PaletteAction::ToggleSidebar => {
                 self.toggle_sidebar();
                 Some(true)
@@ -1976,16 +1979,12 @@ fn submit_activity(has_attachments: bool) -> &'static str {
 
 fn created_conversation(
     runtime_id: String,
-    draft: String,
-    attachments: Vec<StagedImage>,
     cwd: String,
     model: Option<ModelIdentity>,
 ) -> Conversation {
     let mut chat = Conversation {
         runtime_id: Some(runtime_id),
         loaded: true,
-        draft,
-        attachments,
         ..Conversation::default()
     };
     if !cwd.is_empty() {

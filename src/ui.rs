@@ -130,7 +130,6 @@ struct Preview {
     step: PreviewStep,
     published: Option<String>,
     since: Instant,
-    asked_create: bool,
     sent_reply: bool,
     sent_approval: bool,
     picked_notes: bool,
@@ -147,7 +146,6 @@ impl Preview {
             step: PreviewStep::Sidebar,
             published: None,
             since: Instant::now(),
-            asked_create: false,
             sent_reply: false,
             sent_approval: false,
             picked_notes: false,
@@ -402,7 +400,7 @@ impl Root {
     }
 
     fn on_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.desk.create() {
+        if self.desk.new_chat() {
             self.composer_focus.focus(window);
             cx.notify();
         }
@@ -1879,6 +1877,13 @@ fn model_trigger(
 }
 
 fn open_model(desk: &Desk) -> ModelState {
+    if desk.state.selected.is_none() {
+        return desk
+            .state
+            .launch_model
+            .clone()
+            .map_or(ModelState::Unknown, ModelState::Confirmed);
+    }
     desk.state
         .selected
         .as_ref()
@@ -2412,12 +2417,7 @@ impl Root {
             self.begin_step(PreviewStep::Quote);
             return true;
         }
-        if !self.preview_flag(|preview| preview.asked_create) {
-            self.desk.create();
-            self.set_preview(|preview| preview.asked_create = true);
-            return true;
-        }
-        if new_chat_ready(&self.desk) && !self.preview_flag(|preview| preview.sent_reply) {
+        if !self.preview_flag(|preview| preview.sent_reply) && self.desk.new_chat() {
             self.desk.set_draft("Show a markdown reply".into());
             self.desk.submit();
             self.set_preview(|preview| preview.sent_reply = true);
