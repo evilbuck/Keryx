@@ -4,6 +4,7 @@
 //! ticket, session pages, history pages, and the JSON-RPC methods the client
 //! sends after `gateway.ready`. Nothing here is a real Hermes.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -359,12 +360,17 @@ struct Hub {
     next: u64,
     approval: Option<String>,
     approval_runtime: Option<String>,
+    models: HashMap<String, String>,
 }
 
 impl Hub {
     fn create(&mut self) -> (String, String) {
         self.next = self.next.saturating_add(1);
         (format!("stored-{}", self.next), format!("rt-{}", self.next))
+    }
+
+    fn model(&self, runtime: &str) -> &str {
+        self.models.get(runtime).map_or("demo", String::as_str)
     }
 }
 
@@ -378,6 +384,7 @@ async fn talk(mut socket: tokio_tungstenite::WebSocketStream<TcpStream>) {
         next: 0,
         approval: None,
         approval_runtime: None,
+        models: HashMap::new(),
     };
     while let Some(frame) = socket.next().await {
         let Ok(frame) = frame else { break };
@@ -430,7 +437,7 @@ fn approval_result(hub: &mut Hub, value: &Value) -> Vec<Value> {
     vec![event(
         "message.complete",
         &runtime,
-        json!({"status": "complete", "text": "Approved.\n\nThe preview tool did not run.", "usage": {"model": "demo"}}),
+        json!({"status": "complete", "text": "Approved.\n\nThe preview tool did not run.", "usage": {"model": hub.model(&runtime)}}),
     )]
 }
 
@@ -449,7 +456,7 @@ fn method_frames(hub: &mut Hub, method: &str, id: &Value, params: &Value) -> Vec
 
 fn session_frame(hub: &mut Hub, method: &str, id: &Value, params: &Value) -> Option<Vec<Value>> {
     match method {
-        "session.create" => Some(vec![create_result(hub, id)]),
+        "session.create" => Some(vec![create_result(hub, id, params)]),
         "session.resume" => Some(vec![resume_result(id, params)]),
         _ => None,
     }
@@ -466,15 +473,26 @@ fn catalog_frame(method: &str, id: &Value, _params: &Value) -> Option<Vec<Value>
     }
 }
 
-fn create_result(hub: &mut Hub, id: &Value) -> Value {
+fn create_result(hub: &mut Hub, id: &Value, params: &Value) -> Value {
     let (stored, runtime) = hub.create();
+    let mut model = "demo";
+    let mut provider = "custom:acme";
+    if let (Some(requested_model), Some(requested_provider), Some(true)) = (
+        params["model"].as_str(),
+        params["provider"].as_str(),
+        params["follow_profile_config"].as_bool(),
+    ) {
+        model = requested_model;
+        provider = requested_provider;
+        hub.models.insert(runtime.clone(), model.to_string());
+    }
     ok_result(
         id,
         json!({
             "session_id": runtime,
             "stored_session_id": stored,
-            "provider": "custom:acme",
-            "model": "demo"
+            "provider": provider,
+            "model": model
         }),
     )
 }
@@ -514,7 +532,7 @@ fn submit_frames(hub: &mut Hub, id: &Value, params: &Value) -> Vec<Value> {
     if text.to_ascii_lowercase().contains("approve") {
         frames.extend(approval_request(hub, &runtime));
     } else {
-        frames.extend(markdown_reply(&runtime));
+        frames.extend(markdown_reply(&runtime, hub.model(&runtime)));
     }
     frames
 }
@@ -542,7 +560,7 @@ fn approval_request(hub: &mut Hub, runtime: &str) -> Vec<Value> {
     ]
 }
 
-fn markdown_reply(runtime: &str) -> Vec<Value> {
+fn markdown_reply(runtime: &str, model: &str) -> Vec<Value> {
     vec![
         event(
             "message.delta",
@@ -552,7 +570,7 @@ fn markdown_reply(runtime: &str) -> Vec<Value> {
         event(
             "message.complete",
             runtime,
-            json!({"status": "complete", "text": REPLY_MARKDOWN, "usage": {"model": "demo"}}),
+            json!({"status": "complete", "text": REPLY_MARKDOWN, "usage": {"model": model}}),
         ),
     ]
 }
@@ -647,6 +665,7 @@ mod tests {
             next: 0,
             approval: None,
             approval_runtime: None,
+            models: HashMap::new(),
         };
         let frames = frames(
             &mut hub,

@@ -34,6 +34,7 @@ const SIDEBAR_WIDTH: f32 = 280.;
 const INSPECTOR_WIDTH: f32 = 320.;
 const MIN_CHAT_WIDTH: f32 = 320.;
 const COMPACT_FOOTER_HEIGHT: f32 = 560.;
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Launch {
     pub config: Result<Config, String>,
@@ -129,7 +130,6 @@ struct Preview {
     step: PreviewStep,
     published: Option<String>,
     since: Instant,
-    asked_create: bool,
     sent_reply: bool,
     sent_approval: bool,
     picked_notes: bool,
@@ -146,13 +146,17 @@ impl Preview {
             step: PreviewStep::Sidebar,
             published: None,
             since: Instant::now(),
-            asked_create: false,
             sent_reply: false,
             sent_approval: false,
             picked_notes: false,
             picked_board: false,
         }
     }
+}
+
+struct CaretBlink {
+    next_toggle: Instant,
+    visible: bool,
 }
 
 pub struct Root {
@@ -179,6 +183,7 @@ pub struct Root {
     transcript: ScrollHandle,
     draft_scroll: ScrollHandle,
     reveal_draft_caret: bool,
+    caret_blink: Option<CaretBlink>,
     cursor: usize,
     anchor: usize,
     seen_generation: u64,
@@ -227,6 +232,7 @@ impl Root {
             transcript: ScrollHandle::new(),
             draft_scroll: ScrollHandle::new(),
             reveal_draft_caret: false,
+            caret_blink: None,
             cursor: 0,
             anchor: 0,
             seen_generation: 0,
@@ -272,10 +278,39 @@ impl Root {
             });
         }
         self.spin = self.spin.wrapping_add(1);
-        if changed || stepped || queued || self.pending_agent.is_some() {
+        let caret_changed = self.tick_caret();
+        if changed || stepped || queued || caret_changed || self.pending_agent.is_some() {
             cx.notify();
         }
         self.arm(cx);
+    }
+
+    fn tick_caret(&mut self) -> bool {
+        let Some(blink) = &mut self.caret_blink else {
+            return false;
+        };
+        let now = Instant::now();
+        if now < blink.next_toggle {
+            return false;
+        }
+        blink.visible = !blink.visible;
+        blink.next_toggle = now + CARET_BLINK_INTERVAL;
+        true
+    }
+
+    fn sync_caret_blink(&mut self, window: &Window, editable: bool) {
+        if !editable
+            || !window.is_window_active()
+            || !self.composer_focus.is_focused(window)
+            || self.anchor != self.cursor
+        {
+            self.caret_blink = None;
+        } else if self.caret_blink.is_none() || self.reveal_draft_caret {
+            self.caret_blink = Some(CaretBlink {
+                next_toggle: Instant::now() + CARET_BLINK_INTERVAL,
+                visible: true,
+            });
+        }
     }
 
     fn prepare(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
@@ -365,7 +400,7 @@ impl Root {
     }
 
     fn on_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.desk.create() {
+        if self.desk.new_chat() {
             self.composer_focus.focus(window);
             cx.notify();
         }
@@ -699,6 +734,7 @@ impl gpui::Render for Root {
             self.desk.state.transcript_find.open && self.find_focus.is_focused(window);
         let compact_footer = self.compact_turn_controls(window)
             || (viewport.height < px(COMPACT_FOOTER_HEIGHT) && find_focused);
+        self.sync_caret_blink(window, !compact_footer && controls.editable);
         shell(self, &controls, &connection, compact_header, compact_footer, cx)
     }
 }
@@ -1393,7 +1429,9 @@ fn footer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root>)
         .when(chrome::slash_open(root), |column| {
             column.child(chrome::slash_row(root, cx))
         })
-        .child(chrome::attachment_row(root, cx))
+        .when(!root.desk.state.active_attachments().is_empty(), |column| {
+            column.child(chrome::attachment_row(root, cx))
+        })
         .when(controls.spinning || !controls.activity.is_empty(), |column| {
             column.child(activity_row(controls, root.spin))
         })
@@ -1647,7 +1685,14 @@ fn composer(root: &mut Root, controls: &present::Controls, cx: &mut Context<Root
         .border_1()
         .border_color(rgb(0x3a3a42))
         .bg(rgb(0x1c1c22))
-        .child(composer_input(root, controls, cx))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(chrome::paperclip_button(cx))
+                .child(composer_input(root, controls, cx).flex_1()),
+        )
         .child(
             div()
                 .relative()
@@ -1689,12 +1734,21 @@ fn composer_input(
         .flex_col()
         .overflow_y_scroll()
         .track_scroll(&root.draft_scroll)
-        .pr(px(2.))
+        .px(px(8.))
+        .py(px(5.))
+        .rounded(px(8.))
+        .border_2()
+        .border_color(rgb(0x45454f))
+        .bg(rgb(0x18181e))
         .track_focus(&root.composer_focus)
+        .when(controls.editable, |input| {
+            input.focus(|style| style.border_color(rgb(0x7ab0ff)).bg(rgb(0x222b3b)))
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|root, _: &gpui::MouseDownEvent, window, cx| {
                 root.composer_focus.focus(window);
+                root.caret_blink = None;
                 cx.notify();
             }),
         )
@@ -1703,16 +1757,13 @@ fn composer_input(
 
 fn composer_text(root: &mut Root, read_only: bool) -> gpui::Div {
     let reveal = std::mem::take(&mut root.reveal_draft_caret);
-    let draft = root.desk.draft();
-    if draft.is_empty() {
-        return div().text_color(rgb(0x8a8a92)).child(if read_only {
-            "Read only"
-        } else {
-            "Message"
-        });
-    }
+    let mut draft = root.desk.draft();
+    let placeholder = draft.is_empty();
     let (start, end) = selection_of(&draft, root.anchor, root.cursor);
     let cursor = floor_boundary(&draft, root.cursor.min(draft.len()));
+    if placeholder {
+        draft = if read_only { "Read only" } else { "Message" }.into();
+    }
     let mut text = gpui::StyledText::new(draft);
     if start != end {
         let selection = gpui::HighlightStyle {
@@ -1724,13 +1775,14 @@ fn composer_text(root: &mut Root, read_only: bool) -> gpui::Div {
     let caret = composer_caret(
         text.layout().clone(),
         cursor,
-        start == end,
+        root.caret_blink.as_ref().is_some_and(|blink| blink.visible),
         reveal.then(|| root.draft_scroll.clone()),
     );
     div()
         .relative()
         .w_full()
         .flex_shrink_0()
+        .when(placeholder, |line| line.text_color(rgb(0x8a8a92)))
         .child(text)
         .child(caret)
 }
@@ -1744,7 +1796,7 @@ fn composer_caret(
     canvas(
         move |_, window, _| {
             let origin = layout.position_for_index(cursor)?;
-            let caret = Bounds::new(origin, size(px(1.), layout.line_height()));
+            let caret = Bounds::new(origin, size(px(2.), layout.line_height()));
             if let Some(scroll) = scroll {
                 reveal_caret(scroll, caret, window);
             }
@@ -1752,7 +1804,7 @@ fn composer_caret(
         },
         |_, caret, window, _| {
             if let Some(caret) = caret {
-                window.paint_quad(gpui::fill(caret, rgb(0xffffff)));
+                window.paint_quad(gpui::fill(caret, rgb(0x7ab0ff)));
             }
         },
     )
@@ -1825,6 +1877,13 @@ fn model_trigger(
 }
 
 fn open_model(desk: &Desk) -> ModelState {
+    if desk.state.selected.is_none() {
+        return desk
+            .state
+            .launch_model
+            .clone()
+            .map_or(ModelState::Unknown, ModelState::Confirmed);
+    }
     desk.state
         .selected
         .as_ref()
@@ -2358,12 +2417,7 @@ impl Root {
             self.begin_step(PreviewStep::Quote);
             return true;
         }
-        if !self.preview_flag(|preview| preview.asked_create) {
-            self.desk.create();
-            self.set_preview(|preview| preview.asked_create = true);
-            return true;
-        }
-        if new_chat_ready(&self.desk) && !self.preview_flag(|preview| preview.sent_reply) {
+        if !self.preview_flag(|preview| preview.sent_reply) && self.desk.new_chat() {
             self.desk.set_draft("Show a markdown reply".into());
             self.desk.submit();
             self.set_preview(|preview| preview.sent_reply = true);

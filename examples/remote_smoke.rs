@@ -678,6 +678,7 @@ fn create_in_workspace(
     harness.send(Command::Create {
         title: title.into(),
         cwd,
+        model: None,
     })?;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {

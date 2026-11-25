@@ -317,10 +317,23 @@ pub fn attachment_row(root: &mut Root, cx: &mut Context<Root>) -> gpui::Div {
             }),
         ));
     }
-    row.child(tool_button("add-file", "Attach", cx, |root, _, cx| {
-        root.open_sheet(Sheet::Attach);
-        cx.notify();
-    }))
+    row
+}
+
+/// Paperclip affordance for the attach sheet, rendered beside the composer input.
+pub fn paperclip_button(cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    text_button(
+        "add-file",
+        "📎",
+        true,
+        false,
+        cx.listener(|root, _: &gpui::MouseDownEvent, _, cx| {
+            root.open_sheet(Sheet::Attach);
+            cx.notify();
+        }),
+    )
+    .text_size(px(15.))
+    .line_height(px(18.))
 }
 
 pub fn workspace_button(root: &mut Root, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {

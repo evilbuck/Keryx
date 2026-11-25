@@ -98,10 +98,11 @@ pub fn controls(state: &AppState, pending: &HashSet<String>, configured: bool) -
     let reload = reloading(state, pending);
     let write = writable(connected, conversation);
     Controls {
-        send: send_enabled(write, reload, conversation) || launch_send(state, connected),
+        send: send_enabled(write, reload, conversation)
+            || (state.launch_ready() && launch_has_input(state)),
         stop_visible: conversation.is_some_and(|chat| chat.status.busy()),
         stop_enabled: stop_enabled(connected, conversation),
-        editable: chat_editable(conversation) || launch_ready(state, connected),
+        editable: chat_editable(conversation) || state.launch_ready(),
         new_chat: connected && !state.creating,
         more_visible: state.list_has_more,
         more_enabled: connected && !state.list_loading,
@@ -110,7 +111,7 @@ pub fn controls(state: &AppState, pending: &HashSet<String>, configured: bool) -
         older_enabled: older_enabled(conversation),
         latest_visible: state.selected.is_some(),
         latest_enabled: connected && !reload,
-        model_enabled: write && !switching(conversation),
+        model_enabled: state.model_picker_enabled(conversation),
         activity: activity_text(conversation, reload),
         spinning: spinning(conversation, reload),
         title: window_title(state),
@@ -155,14 +156,6 @@ fn chat_editable(conversation: Option<&Conversation>) -> bool {
     conversation.is_some_and(|chat| chat.read_only_reason.is_none() && !chat.rewinding)
 }
 
-fn launch_ready(state: &AppState, connected: bool) -> bool {
-    connected && state.selected.is_none() && !state.creating && state.pending_launch.is_none()
-}
-
-fn launch_send(state: &AppState, connected: bool) -> bool {
-    launch_ready(state, connected) && launch_has_input(state)
-}
-
 fn launch_has_input(state: &AppState) -> bool {
     !state.launch_draft.trim().is_empty() || !state.launch_attachments.is_empty()
 }
@@ -200,10 +193,6 @@ fn connecting(state: &AppState) -> bool {
 
 fn older_enabled(conversation: Option<&Conversation>) -> bool {
     conversation.is_some_and(|chat| !chat.status.busy() && !chat.history_loading)
-}
-
-fn switching(conversation: Option<&Conversation>) -> bool {
-    conversation.is_some_and(|chat| chat.model.switching())
 }
 
 fn spinning(conversation: Option<&Conversation>, reload: bool) -> bool {
