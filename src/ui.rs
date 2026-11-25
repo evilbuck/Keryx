@@ -734,7 +734,7 @@ impl gpui::Render for Root {
             self.desk.state.transcript_find.open && self.find_focus.is_focused(window);
         let compact_footer = self.compact_turn_controls(window)
             || (viewport.height < px(COMPACT_FOOTER_HEIGHT) && find_focused);
-        self.sync_caret_blink(window, !compact_footer && controls.readonly.is_none());
+        self.sync_caret_blink(window, !compact_footer && controls.editable);
         shell(self, &controls, &connection, compact_header, compact_footer, cx)
     }
 }
@@ -1741,7 +1741,7 @@ fn composer_input(
         .border_color(rgb(0x45454f))
         .bg(rgb(0x18181e))
         .track_focus(&root.composer_focus)
-        .when(controls.readonly.is_none(), |input| {
+        .when(controls.editable, |input| {
             input.focus(|style| style.border_color(rgb(0x7ab0ff)).bg(rgb(0x222b3b)))
         })
         .on_mouse_down(
